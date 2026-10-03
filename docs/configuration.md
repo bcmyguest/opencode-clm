@@ -28,8 +28,11 @@ Values keep their case (paths), names do not. Relative paths resolve against the
 | `reminders`      | budget fractions at which a `[CLM BUDGET]` note reaches the model; `off` also drops the budget − reserve one | `25/50/75%`, `50/75/90%`, `75/90%`, `90%`, `off`           | `25/50/75%` |
 | `gate`           | edits that grow the context: `fit` accepts them within budget − reserve, `shrink` never, `none` without a check | `fit`, `shrink`, `none`                                  | `fit`       |
 | `guard`          | overflow guard: above budget − reserve, withhold the oldest tool results                                 | `on`, `off`                                                   | `on`        |
+| `compaction`     | OpenCode's automatic compaction: `off` turns it off; `auto` and `on` keep your `compaction.auto` (see Notes) | `auto`, `off`, `on`                                       | `auto`      |
 | `cap`            | max characters kept per tool result (head + tail), at least 200                                          | `10k`, `10000`, `10k:0.5` (head fraction), `off`              | off         |
 | `steering`       | markdown file with your context-management strategy, appended to the system prompt                      | `house` (the bundled `steering/house-brief.md`), a path, `none` | none      |
+| `one-tool`       | run only the first tool call of each model response; later ones fail with a note to repeat them          | `on`, `off`                                                   | `off`       |
+| `trailer`        | end each successful tool result with `[context: ~N of B tokens after this result]`                      | `on`, `off`                                                   | `off`       |
 | `compact-prompt` | markdown template `/clm-compact` sends instead of the built-in prompt                                    | a path, `default`                                             | built in    |
 | `reasoning`      | show the assistant's reasoning in the mirror                                                             | `on`, `off`                                                   | `on`        |
 
@@ -48,6 +51,9 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
 | `remindAt`       | `CLM_REMIND_AT`       | fractions or percentages separated by commas, spaces or `/`, e.g. `0.25,0.5,0.75` or `25/50/75%`; `off` or `none` for no reminders | `reminders` |
 | `gate`           | `CLM_EDIT_GATE`       | `fit`, `shrink` or `none`                                                                            | `gate`           |
 | `guard`          | `CLM_OVERFLOW`        | `withhold`, `on` or `true`; `off` or `false`                                                         | `guard`          |
+| `compaction`     | `CLM_NATIVE_COMPACTION` | `auto`, `off` or `on`                                                                              | `compaction`     |
+| `oneTool`        | `CLM_ONE_TOOL_PER_TURN` | a flag (default off)                                                                               | `one-tool`       |
+| `trailer`        | `CLM_SIZE_TRAILER`    | a flag (default off)                                                                                 | `trailer`        |
 | `observationCap` | `CLM_OBSERVATION_CAP` | a number of characters, e.g. `10000` (no `k`), or `10000:0.5` with the head fraction (default 0.8); `off` or `0` | `cap` |
 | `steering`       | `CLM_STEERING`        | a path to a markdown file, or `house`; `none` or `off`                                               | `steering`       |
 | `compactPrompt`  | `CLM_COMPACT_PROMPT`  | a path to a markdown template; `default`, `none` or `off` for the built-in prompt                    | `compact-prompt` |
@@ -72,6 +78,14 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
 - **Steering.** The harness text stays protocol-only; a steering document is the one place
   for strategy. `/clm status` shows the document's name and SHA-256 prefix, so an
   experiment can record which brief was used.
+- **Compaction.** OpenCode has one instance-wide flag, `compaction.auto`, for threshold
+  compaction and for recovery from a provider overflow error. Before each request the
+  plugin sets it from that session's setting, so sessions served by one OpenCode process at
+  the same time overwrite each other's value. `off` also turns off overflow recovery: the
+  error is shown and the model is told to shrink its context. `auto` and `on` change
+  nothing (pi's `auto` pauses threshold compaction; here the overflow guard already keeps
+  requests below OpenCode's threshold). Manual `/compact`
+  always works.
 - **Compact prompt.** A template may use `{{mirror}}`, `{{current}}`, `{{budget}}` and
   `{{instructions}}`; unknown placeholders stay as written, and text typed after
   `/clm-compact` is always included. The plugin rereads the template on every use.

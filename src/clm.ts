@@ -62,6 +62,7 @@ import { classifyMirrorToolCall } from "./mirror-guard.ts";
 import { MirrorDirectoryError, MirrorStore } from "./mirror-store.ts";
 import { capObservations } from "./observation.ts";
 import { flatten, noteMessage, unflatten, withoutReasoning, type OcInfo, type OcMessage } from "./opencode.ts";
+import { sizeTrailer } from "./compaction.ts";
 import { applyOverflowGuard, overflowGuardLimit, overflowNoticeText } from "./overflow.ts";
 import type { ClmStatus } from "./presentation.ts";
 import { applyProjection, createProjectionCheckpoint, digestSourceContent, type ProjectionCheckpoint } from "./projection.ts";
@@ -591,6 +592,34 @@ export class ClmSession {
 			: `[CLM] Mirror edit would be refused: ${check.message} Correct the file before this step ends, or the context stays as it is.`;
 	}
 
+	/**
+	 * `setting trailer`: the size trailer for one tool result (the last reading plus the
+	 * result's calibrated estimate, against the budget in force); undefined when off.
+	 */
+	sizeTrailer(output: string): string | undefined {
+		if (!this.settings.enabled || !this.enabled || !this.settings.trailer) return undefined;
+		const budget = this.resolvedBudget()?.budget;
+		if (!budget) return undefined;
+		return sizeTrailer(this.lastReading?.estimated ?? 0, this.calibrator.apply(this.textTokens(output)), budget);
+	}
+
+	/**
+	 * Before an OpenCode compaction (`experimental.session.compacting`): commit the edit the
+	 * model made in its final step. No request followed that step (e.g. the user typed
+	 * /compact next), so the commit at the start of a transform has not run; without this the
+	 * compaction would summarize the pre-edit context and the edit would be lost.
+	 */
+	async commitBeforeCompaction(): Promise<void> {
+		await this.refreshSettings();
+		if (!this.settings.enabled || !this.enabled) return;
+		await this.commit();
+	}
+
+	/** Adds a notice to the next request (e.g. from a bus event). */
+	queueNotice(text: string): void {
+		this.pendingNotices.push(text);
+	}
+
 	/** The mirror block the model last saw, for continuity annotations. */
 	blockSource(blockId: string): ContinuityBlockSource | undefined {
 		const snapshot = this.lastSnapshot;
@@ -981,6 +1010,7 @@ export class ClmSession {
 		// OpenCode's compaction passes a head slice of the history through this hook. Apply
 		// the accepted revision when it still covers that slice; never commit, render,
 		// notify or reset (the slice is shorter than the history the checkpoint covers).
+		// A pending edit was committed by `commitBeforeCompaction` just before.
 		if (this.compacting) {
 			this.compacting = false;
 			const projection = applyProjection(flatten(raw.slice(pinned)), this.state.checkpoint);

@@ -503,6 +503,9 @@ come from `events.jsonl`, so the panel works on resume without extra persistence
 - Editing the body of an assistant message turns its tool results into notes; the
   structured tool calls are not kept.
 - Accept and reject notices are shown to the model for one request only.
+- `trailer` covers successful tool calls only: OpenCode runs `tool.execute.after` after a
+  successful execute (`session/tools.ts:105-123`). `one-tool` counts calls in arrival
+  order, and child calls of OpenCode's experimental code mode count as calls too.
 - Model limits and the system-prompt size reach the plugin one request late. On the first
   request of a process the model window does not yet cap the budget and the estimate omits
   the system prompt; with `budget: "window"` that request has no budget reading.

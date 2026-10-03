@@ -34,6 +34,7 @@ import { tool, type Hooks, type Plugin, type PluginInput, type PluginOptions } f
 
 import { ClmSession } from "./src/clm.ts";
 import { MirrorDirectoryError } from "./src/mirror-store.ts";
+import { applyCompactionMode, nativeCompactionText, oneToolText, overflowNotCompactedText, ToolCallCounter } from "./src/compaction.ts";
 import { buildCompactPrompt, loadCompactPrompt } from "./src/compact.ts";
 import { continuityTools } from "./src/continuity.ts";
 import { replaceInPlace, type OcMessage } from "./src/opencode.ts";
@@ -119,6 +120,17 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			.then(() => input.client?.app?.log?.({ body: { service: PLUGIN_ID, level, message } }))
 			.catch(() => undefined);
 	};
+	/**
+	 * The live config object from the `config` hook, and the user's own `compaction.auto`
+	 * (undefined = not set) for the `compaction` setting. See src/compaction.ts.
+	 */
+	let liveConfig: { compaction?: { auto?: boolean } } | undefined;
+	let userAutoCompaction: boolean | undefined;
+	/** Sessions whose newest transform was OpenCode's compaction request (no overflow notice for it). */
+	const compactionRequests = new Set<string>();
+	/** Tool calls per session since its last model request (`one-tool`). */
+	const toolCalls = new ToolCallCounter();
+
 	/** Command names this plugin defined; a user's own `clm` / `clm-compact` stays theirs. */
 	const ownCommands = new Set<string>();
 
@@ -423,6 +435,12 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 
 	const hooks: Hooks = {
 		async config(config) {
+			liveConfig = config as { compaction?: { auto?: boolean } };
+			const auto = liveConfig.compaction?.auto;
+			userAutoCompaction = typeof auto === "boolean" ? auto : undefined;
+			// `enabled: false` returns no hooks at all (above), so this runs only with CLM enabled;
+			// the guard keeps it that way if that early return ever moves.
+			if (settings.enabled && settings.compaction !== "auto") applyCompactionMode(liveConfig, settings.compaction, userAutoCompaction);
 			if (settings.commands) {
 				const commands = (config.command ??= {});
 				const ours = {
@@ -479,6 +497,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			const raw = output.messages as unknown as OcMessage[];
 			const sessionID = raw[0]?.info?.sessionID;
 			if (!sessionID) return;
+			// A new model request: `one-tool` counts its tool calls from zero.
+			toolCalls.reset(sessionID);
 			let clm: ClmSession;
 			try {
 				clm = await session(sessionID);
@@ -502,9 +522,19 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			}
 			const tools = toolTokens();
 			if (tools !== undefined) clm.scope = { ...clm.scope, toolTokens: tools };
+			const compaction = clm.compacting;
+			if (compaction) compactionRequests.add(sessionID);
+			else compactionRequests.delete(sessionID);
 			try {
 				const result = await clm.transform(raw);
 				replaceInPlace(raw, result.messages);
+				// Instance-wide flag, set per request from this session's setting: OpenCode reads
+				// it after this step and before the next one (src/compaction.ts). Sessions running
+				// concurrently in one server overwrite each other's value.
+				if (!compaction && liveConfig) {
+					const mode = clm.settings.enabled && clm.enabled ? clm.settings.compaction : "auto";
+					applyCompactionMode(liveConfig, mode, userAutoCompaction);
+				}
 				if (result.alert) {
 					toast(result.alert, "warning");
 					log("warn", result.alert);
@@ -523,6 +553,11 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		async "experimental.session.compacting"(hookInput, output) {
 			const clm = await opened(hookInput.sessionID);
 			if (!clm) return;
+			try {
+				await clm.commitBeforeCompaction();
+			} catch (error) {
+				await clm.log({ event: "error", message: `commit before compaction: ${describe(error)}` });
+			}
 			clm.compacting = true;
 			try {
 				const context = await clm.compactionContext();
@@ -534,7 +569,13 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 
 		async "experimental.compaction.autocontinue"(hookInput) {
 			const clm = await opened(hookInput.sessionID);
-			if (clm) clm.compacted = true;
+			if (!clm) return;
+			clm.compacted = true;
+			if (!clm.settings.enabled || !clm.enabled) return;
+			// Automatic compaction only (manual /compact does not reach this hook).
+			const overflow = hookInput.overflow === true;
+			await clm.log({ event: "native-compaction", reason: overflow ? "overflow" : "threshold", setting: clm.settings.compaction });
+			toast(nativeCompactionText(overflow, clm.settings.compaction));
 		},
 
 		async event({ event }) {
@@ -550,6 +591,21 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 					log("warn", `channel ${request.op} for ${request.session}: ${answer.text}`);
 				}
 				reply({ ...answer, v: CHANNEL_VERSION, id: request.id });
+				return;
+			}
+			if (event.type === "session.error") {
+				const { sessionID, error } = event.properties as { sessionID?: string; error?: { name?: string } };
+				if (!sessionID || error?.name !== "ContextOverflowError") return;
+				const clm = await opened(sessionID);
+				if (!clm || !clm.settings.enabled || !clm.enabled) return;
+				// OpenCode surfaced the overflow instead of compacting when the flag it read was
+				// false (processor.ts:620-628). The event follows that read synchronously, so the
+				// live flag, not this session's setting, says what happened (another session may
+				// have set it). An overflow of the compaction request itself is not this case.
+				if (liveConfig?.compaction?.auto !== false || compactionRequests.has(sessionID)) return;
+				clm.queueNotice(overflowNotCompactedText(clm.mirrorPath));
+				await clm.log({ event: "overflow-not-compacted", setting: clm.settings.compaction });
+				toast("The provider rejected the request as too long, and OpenCode's automatic compaction is off. Edit the mirror or run /compact.", "warning");
 				return;
 			}
 			if (event.type !== "session.compacted") return;
@@ -572,6 +628,17 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			toolSizes.set(hookInput.toolID, Math.ceil((size / 4) * settings.estimateFactor));
 		},
 
+		async "tool.execute.before"(hookInput) {
+			// Counted before any await: parallel calls of one response arrive concurrently.
+			const position = toolCalls.next(hookInput.sessionID);
+			if (position < 2) return;
+			const clm = await opened(hookInput.sessionID);
+			if (!clm || !clm.settings.enabled || !clm.enabled || !clm.settings.oneTool) return;
+			await clm.log({ event: "tool-blocked", tool: hookInput.tool, position });
+			// OpenCode turns the throw into the call's error result, which the model sees.
+			throw new Error(oneToolText(hookInput.tool, position));
+		},
+
 		async "tool.execute.after"(hookInput, output) {
 			const clm = await opened(hookInput.sessionID);
 			if (!clm || typeof output.output !== "string") return;
@@ -581,10 +648,12 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				receipt = clm.receipt(hookInput.tool, hookInput.args, input.directory);
 			} catch (error) {
 				await clm.log({ event: "receipt-error", tool: hookInput.tool, message: describe(error) });
-				return;
 			}
-			if (!receipt) return;
-			output.output = output.output ? `${output.output}${output.output.endsWith("\n") ? "\n" : "\n\n"}${receipt}` : receipt;
+			if (receipt) output.output = output.output ? `${output.output}${output.output.endsWith("\n") ? "\n" : "\n\n"}${receipt}` : receipt;
+			// Last, so it measures the result as the model gets it. Not for failed calls:
+			// OpenCode runs this hook only after a successful execute (session/tools.ts:105-123).
+			const trailer = clm.sizeTrailer(output.output);
+			if (trailer) output.output = `${output.output}${trailer}`;
 		},
 
 		async "command.execute.before"(hookInput, output) {

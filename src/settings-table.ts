@@ -13,10 +13,11 @@ import { basename, resolve } from "node:path";
 import { resolveBudgetPolicy } from "./budget.ts";
 import { MIN_OBSERVATION_CAP, resolveObservationCap } from "./observation.ts";
 import { toEditGate, type EditGate } from "./policy.ts";
-import { HOUSE_STEERING, parseFlag, parseFractions, parseTokens, type ClmSettings } from "./settings.ts";
+import { HOUSE_STEERING, parseCompaction, parseFlag, parseFractions, parseTokens, type ClmSettings, type CompactionMode } from "./settings.ts";
 
 export type SettingKey =
-	| "editing" | "budget" | "reserve" | "reminders" | "gate" | "guard" | "cap" | "steering" | "compactPrompt" | "reasoning";
+	| "editing" | "budget" | "reserve" | "reminders" | "gate" | "guard" | "compaction" | "cap" | "steering" | "oneTool" | "trailer"
+	| "compactPrompt" | "reasoning";
 
 /**
  * Per-session changes, as stored in overrides.json. Only keys that differ from the base are
@@ -31,6 +32,7 @@ export interface ClmOverrides {
 	reminders?: number[];
 	gate?: EditGate;
 	guard?: "withhold" | "off";
+	compaction?: CompactionMode;
 	cap?: number | null;
 	capHead?: number;
 	/** Absolute path. */
@@ -38,6 +40,8 @@ export interface ClmOverrides {
 	/** Absolute path. */
 	compactPrompt?: string | null;
 	reasoning?: boolean;
+	oneTool?: boolean;
+	trailer?: boolean;
 }
 
 /** Settings in force for one session: the resolved settings plus whether edits apply. */
@@ -186,6 +190,15 @@ export const SETTINGS_TABLE: readonly SettingDescriptor[] = [
 		parse: (text) => ({ guard: parseFlag(text.trim().toLowerCase() === "withhold" ? "on" : text, "guard") ? "withhold" : "off" }),
 	},
 	{
+		key: "compaction",
+		name: "compaction",
+		label: "OC compaction",
+		description: "OpenCode's automatic compaction: off turns it off (a provider overflow is then reported, not compacted); auto and on leave your config's compaction.auto (under auto the overflow guard keeps requests below OpenCode's threshold). Manual /compact always works. The flag is shared by every session of the server. Env: CLM_NATIVE_COMPACTION.",
+		choices: ["auto", "off", "on"],
+		format: (values) => values.settings.compaction,
+		parse: (text) => ({ compaction: parseCompaction(text) }),
+	},
+	{
 		key: "cap",
 		name: "cap",
 		label: "Observation cap",
@@ -209,6 +222,24 @@ export const SETTINGS_TABLE: readonly SettingDescriptor[] = [
 			if (["house", "house-brief", "house-brief.md"].includes(value)) return { steering: HOUSE_STEERING };
 			return { steering: parsePathSetting(text, context.directory, ["none", "off", ""]) };
 		},
+	},
+	{
+		key: "oneTool",
+		name: "one-tool",
+		label: "One tool per turn",
+		description: "Paper-harness parity: run only the first tool call of each model response; later calls in it fail with a note to repeat them. Env: CLM_ONE_TOOL_PER_TURN.",
+		choices: ["off", "on"],
+		format: (values) => onOff(values.settings.oneTool),
+		parse: (text) => ({ oneTool: parseFlag(text, "one-tool") }),
+	},
+	{
+		key: "trailer",
+		name: "trailer",
+		label: "Size trailer",
+		description: "Paper-harness parity: end every successful tool result with \"[context: ~N of B tokens after this result]\". Env: CLM_SIZE_TRAILER.",
+		choices: ["off", "on"],
+		format: (values) => onOff(values.settings.trailer),
+		parse: (text) => ({ trailer: parseFlag(text, "trailer") }),
 	},
 	{
 		key: "compactPrompt",
@@ -243,11 +274,19 @@ const ALIASES: Record<string, SettingKey> = {
 	"edit-gate": "gate",
 	guard: "guard",
 	overflow: "guard",
+	compaction: "compaction",
+	"native-compaction": "compaction",
 	cap: "cap",
 	observation: "cap",
 	"observation-cap": "cap",
 	observationcap: "cap",
 	steering: "steering",
+	"one-tool": "oneTool",
+	onetool: "oneTool",
+	"one-tool-per-turn": "oneTool",
+	trailer: "trailer",
+	"size-trailer": "trailer",
+	sizetrailer: "trailer",
 	"compact-prompt": "compactPrompt",
 	compactprompt: "compactPrompt",
 	reasoning: "reasoning",
@@ -288,6 +327,9 @@ export function applyOverrides(base: ClmSettings, overrides: ClmOverrides): ClmS
 		budget,
 		gate: overrides.gate ?? base.gate,
 		guard: overrides.guard ?? base.guard,
+		compaction: overrides.compaction ?? base.compaction,
+		oneTool: overrides.oneTool ?? base.oneTool,
+		trailer: overrides.trailer ?? base.trailer,
 		observationCap,
 		steeringPath: overrides.steering === null ? undefined : overrides.steering ?? base.steeringPath,
 		compactPromptPath: overrides.compactPrompt === null ? undefined : overrides.compactPrompt ?? base.compactPromptPath,
@@ -305,6 +347,9 @@ function baseValue(key: keyof ClmOverrides, values: SettingsValues): unknown {
 		case "reminders": return settings.budget.remindAtReserve || settings.budget.remindAtFractions.length > 0 ? [...settings.budget.remindAtFractions] : [];
 		case "gate": return settings.gate;
 		case "guard": return settings.guard;
+		case "compaction": return settings.compaction;
+		case "oneTool": return settings.oneTool;
+		case "trailer": return settings.trailer;
 		case "cap": return settings.observationCap.maxCharacters ?? null;
 		case "capHead": return settings.observationCap.headFraction;
 		case "steering": return settings.steeringPath ?? null;
@@ -321,7 +366,7 @@ function baseValue(key: keyof ClmOverrides, values: SettingsValues): unknown {
  */
 export function settingsAsOverrides(settings: ClmSettings): ClmOverrides {
 	const values: SettingsValues = { editing: true, settings };
-	const keys: Array<keyof ClmOverrides> = ["budget", "reserve", "reminders", "gate", "guard", "cap", "capHead", "steering", "compactPrompt", "reasoning"];
+	const keys: Array<keyof ClmOverrides> = ["budget", "reserve", "reminders", "gate", "guard", "compaction", "cap", "capHead", "steering", "oneTool", "trailer", "compactPrompt", "reasoning"];
 	return Object.fromEntries(keys.map((key) => [key, baseValue(key, values)])) as ClmOverrides;
 }
 
@@ -345,6 +390,9 @@ const VALID: Record<keyof ClmOverrides, (value: unknown) => boolean> = {
 	reminders: (value) => Array.isArray(value) && value.every((fraction) => isNumber(fraction) && fraction > 0 && fraction < 1),
 	gate: (value) => value === "fit" || value === "shrink" || value === "none",
 	guard: (value) => value === "withhold" || value === "off",
+	compaction: (value) => value === "auto" || value === "off" || value === "on",
+	oneTool: (value) => typeof value === "boolean",
+	trailer: (value) => typeof value === "boolean",
 	cap: (value) => value === null || (isNumber(value) && value >= MIN_OBSERVATION_CAP),
 	capHead: (value) => isNumber(value) && value > 0 && value <= 1,
 	steering: isPath,

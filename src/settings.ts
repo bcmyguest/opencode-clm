@@ -37,6 +37,23 @@ export interface ClmSettings {
 	commands: boolean;
 	/** Write every transformed request to `<session dir>/requests/nN.json` (debugging). */
 	dumpRequests: boolean;
+	/**
+	 * OpenCode's automatic compaction (`compaction.auto`): `off` turns it off; `auto` and
+	 * `on` leave the user's config value (pi's names). Manual /compact always works.
+	 */
+	compaction: CompactionMode;
+	/** Run only the first tool call of each model response (paper-harness parity). */
+	oneTool: boolean;
+	/** Append `[context: ~N of B tokens after this result]` to tool results (paper-harness parity). */
+	trailer: boolean;
+}
+
+export type CompactionMode = "auto" | "off" | "on";
+
+export function parseCompaction(value: unknown, name = "compaction"): CompactionMode {
+	const text = String(value).trim().toLowerCase();
+	if (text === "auto" || text === "off" || text === "on") return text;
+	throw new Error(`${name} must be auto, off or on, got ${JSON.stringify(value)}`);
 }
 
 export const PACKAGE_DIR = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -123,6 +140,9 @@ export function resolveSettings(options: Record<string, unknown> = {}, env: Env 
 	const factorRaw = pick(options, "estimateFactor", env, "CLM_ESTIMATE_FACTOR");
 	const reasoningRaw = pick(options, "reasoning", env, "CLM_REASONING");
 	const dumpRaw = pick(options, "dumpRequests", env, "CLM_DUMP_REQUESTS");
+	const compactionRaw = pick(options, "compaction", env, "CLM_NATIVE_COMPACTION");
+	const oneToolRaw = pick(options, "oneTool", env, "CLM_ONE_TOOL_PER_TURN");
+	const trailerRaw = pick(options, "trailer", env, "CLM_SIZE_TRAILER");
 
 	const overrides: Partial<BudgetPolicyConfig> = {};
 	if (budgetRaw !== undefined) {
@@ -189,5 +209,8 @@ export function resolveSettings(options: Record<string, unknown> = {}, env: Env 
 		skill: options.skill === undefined ? true : parseFlag(options.skill, "skill"),
 		commands: options.commands === undefined ? true : parseFlag(options.commands, "commands"),
 		dumpRequests: dumpRaw === undefined ? false : parseFlag(dumpRaw, "dumpRequests"),
+		compaction: compactionRaw === undefined ? "auto" : parseCompaction(compactionRaw),
+		oneTool: oneToolRaw === undefined ? false : parseFlag(oneToolRaw, "oneTool"),
+		trailer: trailerRaw === undefined ? false : parseFlag(trailerRaw, "trailer"),
 	};
 }

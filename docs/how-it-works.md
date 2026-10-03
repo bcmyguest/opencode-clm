@@ -55,10 +55,10 @@ outrun any reminder:
 An optional observation cap (off by default) also trims each tool result in the sent
 context to a set number of characters.
 
-OpenCode's compaction summarizes the raw history with a separate model call; set
-`"compaction": { "auto": false }` in `opencode.json` while CLM is on. If OpenCode compacts
-anyway, opencode-clm hands it the edited context, asks the summary to carry pinned and
-continuity annotations verbatim, and rebases its revisions on the summary.
+OpenCode's compaction summarizes the raw history with a separate model call; the
+`compaction` setting (`/clm config compaction off`) turns its automatic compaction off. If
+OpenCode compacts anyway, opencode-clm hands it the edited context, asks the summary to
+carry pinned and continuity annotations verbatim, and rebases its revisions on the summary.
 `/clm-compact [instructions]` instead asks the model to compact by editing its mirror, with
 a fixed prompt you can replace.
 
