@@ -73,10 +73,10 @@ one-line note, mirroring a CLM edit. Temperature 0, thinking off.
 
 | | reuse after the edit | full prefill |
 |---|---|---|
-| accuracy | 47/50 | 49/50 |
+| accuracy | 48/50 | 49/50 |
 | median tokens prefilled | 23 | 1,362 |
-| median prompt time | 0.51 s | 4.93 s |
-| median request time | 2.7 s | 6.9 s |
+| median prompt time | 0.51 s | 5.02 s |
+| median request time | 3.1 s | 7.2 s |
 
 **A live OpenCode session** with opencode-clm 0.2 (48k budget, auto-compaction off),
 reading and summarising this repository's files: 6 accepted edits, 0 rejected. After
