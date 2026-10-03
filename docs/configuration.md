@@ -17,7 +17,9 @@ request, and `/clm config reset` drops them.
 
 ## Settings
 
-`/clm config <setting> <value>` changes one setting; `/clm config <setting>` shows it.
+`/clm config <setting> <value>` changes one setting; `/clm config <setting>` shows it;
+`/clm budget [value]` is short for `/clm config budget [value]`, and `/clm on|off` for
+`/clm config editing on|off`.
 Values keep their case (paths), names do not. Relative paths resolve against the project.
 
 | setting          | what it controls                                                                                         | `/clm config` values                                          | default     |

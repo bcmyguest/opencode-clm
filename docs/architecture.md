@@ -294,9 +294,9 @@ capped block is persisted in its capped form when an edit is accepted.
 
 `src/settings.ts` resolves the plugin options (the `plugin` entry in `opencode.json`), then
 environment variables, then defaults, once at load; an invalid value fails the plugin with
-the setting's name. `src/settings-table.ts` is the one table of the ten settings a session
-can change — editing, budget, reserve, reminders, edit gate, overflow guard, observation
-cap, steering, compact prompt, reasoning — with each one's label, description, choices,
+the setting's name. `src/settings-table.ts` is the one table of the thirteen settings a session
+can change — editing, budget, reserve, reminders, edit gate, overflow guard, compaction,
+observation cap, steering, one-tool, trailer, compact prompt, reasoning — with each one's label, description, choices,
 formatting and parsing; values parse with the same functions as options and environment
 variables. `enabled`, `mirrorDir`, `estimateFactor`, `skill`, `commands` and
 `dumpRequests` are load-time only.
@@ -384,7 +384,7 @@ same pages and `/clm status` as text. Four pages:
   the display is bounded (400 rows for edited messages, 60 for removed or added, 2,000
   characters per line) with an explicit "diff preview truncated" row.
 - **settings** — sizes, calibration, the guard limit, the steering document and the
-  annotation counts (from `annotations.jsonl`) above the ten settings of §7c and a Reset
+  annotation counts (from `annotations.jsonl`) above the thirteen settings of §7c and a Reset
   row (`Enter` cycles it to "reset now", which resets at once): `Enter` cycles a setting's choices or opens a text prompt; rejected values show a
   warning and keep the value in effect.
 
@@ -476,7 +476,7 @@ src/atomic.ts                atomic 0600 writes
 src/commands.ts              command names and templates shared by server and TUI
 src/session-files.ts         read-only access to a session directory
 src/panel/                   pure panel code: model, timeline, diff, view, keys, command parser
-src/tui/                     opentui adapter, route, Enter intercept, host data
+src/tui/                     opentui adapter, route, Enter intercept, Tab completion, host data
 skills/clm-context/          editing recipes, registered as an OpenCode skill
 test/                        unit tests; test/e2e/ drives a real OpenCode against a mock provider
 ```
@@ -531,7 +531,7 @@ come from `events.jsonl`, so the panel works on resume without extra persistence
   structured tool calls are not kept.
 - Accept and reject notices are shown to the model for one request only.
 - `trailer` covers successful tool calls only: OpenCode runs `tool.execute.after` after a
-  successful execute (`session/tools.ts:105-123`). `one-tool` counts calls in arrival
+  successful execute (`session/tools.ts:111-125`). `one-tool` counts calls in arrival
   order, and child calls of OpenCode's experimental code mode count as calls too.
 - Model limits and the system-prompt size reach the plugin one request late. On the first
   request of a process the model window does not yet cap the budget and the estimate omits
@@ -549,3 +549,17 @@ come from `events.jsonl`, so the panel works on resume without extra persistence
   Enter is handled by the TUI either way.
 - Tool backends on another machine or in a container cannot see the mirror. Under
   `opencode attach` the panel reads through the server (§9).
+- A fork restores the origin's revision but not its continuity annotations (§6); pi-clm
+  branches share them.
+- With `compaction: auto`, OpenCode's threshold compaction stays as configured; pi-clm
+  pauses it while the guard is on. The guard keeps requests below OpenCode's threshold
+  unless the budget exceeds it (e.g. `budget: window`). `compaction: off` gives no notice
+  when it suppresses a threshold compaction: OpenCode emits no signal for it.
+- `/clm` arguments get no completion menu: the TUI closes slash autocomplete at the first
+  space (`tui/src/component/prompt/autocomplete.tsx:681`). Tab on a `/clm …` line completes
+  inline (`src/tui/complete.ts`) and lists the choices in a toast when several match.
+- Not needed under OpenCode (pi-clm works around Pi behaviour OpenCode lacks): the
+  `max_tokens` clamp lift, because OpenCode sends `min(model output limit, 32000)`
+  (`provider/transform.ts:1481`); retry-error recovery, because OpenCode retries inside one
+  assistant message and drops failed ones from the model input
+  (`session/processor.ts:674`, `session/message-v2.ts:252`).
