@@ -260,7 +260,8 @@ export class ClmSession {
 
 	/**
 	 * Open (or resume) the session directory `<mirrorDir>/clm-<sessionID>/`. `steering` is the
-	 * document the base settings name, already loaded (the plugin loads it strictly at start).
+	 * document the base settings name, already loaded; undefined when it failed to load at start
+	 * (each session then retries the path and records the error in `settingsWarning`).
 	 */
 	static async open(sessionID: string, settings: ClmSettings, options: { steering?: SteeringDocument } = {}): Promise<ClmSession> {
 		if (!SESSION_ID_RE.test(sessionID)) throw new Error(`Invalid session id for CLM: ${JSON.stringify(sessionID)}`);
@@ -327,7 +328,8 @@ export class ClmSession {
 		} catch (error) {
 			warnings.push(`ignored saved settings: ${describe(error)}`);
 			overrides = {};
-			staged = { settings: this.baseSettings, ...(this.baseSteering ? { steering: this.baseSteering } : {}) };
+			// The base settings resolved at load; staging them again keeps a base steering error.
+			staged = stageSettings(this.baseSettings, {}, { strict: false, loaded: this.baseSteering });
 		}
 		if (staged.steeringError) warnings.push(`steering document not loaded: ${staged.steeringError}`);
 		this.steeringError = staged.steeringError;

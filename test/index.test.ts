@@ -96,8 +96,12 @@ describe("module shape", () => {
 		expect(Object.keys(hooks)).toEqual([]);
 	});
 
-	test("an unreadable steering file fails the plugin load with its path", async () => {
-		await expect(load({ steering: "/nonexistent/brief.md" })).rejects.toThrow("/nonexistent/brief.md");
+	test("an unreadable steering file leaves the plugin running and names the path", async () => {
+		const harness = await load({ steering: "/nonexistent/brief.md" });
+		expect(Object.keys(harness.hooks)).toContain("experimental.chat.messages.transform");
+		await Bun.sleep(1);
+		expect(harness.toasts.map((toast) => toast.message).join("\n")).toContain("/nonexistent/brief.md");
+		expect(harness.logs.join("\n")).toContain("/nonexistent/brief.md");
 	});
 });
 

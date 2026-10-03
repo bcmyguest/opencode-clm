@@ -3,7 +3,7 @@
  * like clm.e2e.test.ts (OPENCODE_CLM_E2E=1).
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { Case, CASE_TIMEOUT_MS, cleanup, ENABLED, mirrorEdit, toolTexts } from "./harness.ts";
@@ -12,6 +12,16 @@ import { bash, steps, text } from "./mock-server.ts";
 afterAll(cleanup);
 
 describe.skipIf(!ENABLED)("opencode-clm robustness", () => {
+	test("a steering file that does not load: CLM still runs, protocol only", async () => {
+		const c = new Case("robust-steering", steps(text("E2E_DONE")), { plugin: { steering: "/nonexistent/brief.md" } });
+		// `run` fails unless a request carried the CLM system prompt.
+		await c.run(["Run the e2e script."]);
+		const [request] = c.mock.main();
+		expect(request!.system).toContain("## Editable context");
+		expect(request!.system).not.toContain("Context-management guidance");
+		expect(existsSync(join(c.sessionDir(), "LIVE_CONTEXT.md"))).toBe(true);
+	}, CASE_TIMEOUT_MS);
+
 	test("an explicit mirrorDir that cannot be created: the session uses the project default, and the model can edit there", async () => {
 		const c = new Case("robust-mirror-dir", steps(
 			bash("echo FALLBACK_$((3+4))", "fallback"),

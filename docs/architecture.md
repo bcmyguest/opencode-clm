@@ -274,7 +274,8 @@ on chars/4.
 `src/steering.ts`: an optional markdown document (`CLM_STEERING`; `house` names the
 shipped `steering/house-brief.md`) appended to the system prompt after the protocol
 section as `## Context-management guidance (<name>)`. The base document is loaded when the
-plugin loads (a missing or empty file fails the plugin with its path); a per-session
+plugin loads (a missing or empty file leaves sessions protocol-only, with an error toast,
+a log line and a warning in `/clm status`); a per-session
 change is loaded when the setting is applied. It is hashed (SHA-256 prefix shown in
 `/clm status`) and never part of the mirror. This is the only sanctioned channel for
 strategy; the protocol text stays protocol-only.

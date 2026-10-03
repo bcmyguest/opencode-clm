@@ -105,6 +105,33 @@ describe("T4/R6: failures reach the user, not only the model", () => {
 	});
 });
 
+describe("S7: a steering file that does not load", () => {
+	test("the plugin keeps running protocol-only and says why", async () => {
+		const h = await load({ steering: "/nonexistent/brief.md" });
+		expect(h.toasts.map((toast) => toast.message).join("\n")).toContain("/nonexistent/brief.md");
+		expect(h.logs.join("\n")).toContain("steering document not loaded");
+		const prompt = await systemPrompt(h.hooks);
+		expect(prompt).toContain("Editable context");
+		expect(prompt).not.toContain("Context-management guidance");
+		await transform(h.hooks, structuredClone(conversation()));
+		expect(readFileSync(join(h.directory, "mirrors", `clm-${SESSION}`, "LIVE_CONTEXT.md"), "utf8")).toContain("LIVE_CONTEXT");
+		expect(await status(h.hooks)).toContain("steering document not loaded");
+	});
+});
+
+describe("S7 review fixes", () => {
+	test("`/clm config steering <path>` recovers a session whose base file did not load", async () => {
+		const h = await load({ steering: "/nonexistent/brief.md" });
+		await transform(h.hooks, structuredClone(conversation()));
+		const brief = join(h.directory, "brief.md");
+		writeFileSync(brief, "# Brief\n\nKeep the newest test output.\n");
+		const output = { parts: [{ type: "text", text: "template" }] } as never as { parts: Array<{ text: string }> };
+		await h.hooks["command.execute.before"]!({ command: STATUS_COMMAND, sessionID: SESSION, arguments: `config steering ${brief}` }, output as never);
+		expect(await status(h.hooks)).not.toContain("steering document not loaded");
+		expect(await systemPrompt(h.hooks)).toContain("Keep the newest test output.");
+	});
+});
+
 describe("M1: a mirror directory that cannot be created", () => {
 	test("an explicit mirrorDir that fails: the session uses the project default and says so", async () => {
 		const blocked = join(tempDir("clm-blocked-"), "file");
@@ -216,5 +243,19 @@ describe("block 5 review fixes", () => {
 		writeFileSync(join(directory, "overrides.json"), JSON.stringify({ version: 1, overrides: {} }));
 		await transform(h.hooks, structuredClone(conversation()));
 		expect(JSON.parse(readFileSync(join(directory, "snapshot.json"), "utf8")).steeringError).toBeUndefined();
+	});
+
+	test("the base steering error reaches snapshot.json and the panel's settings page", async () => {
+		const h = await load({ steering: "/nonexistent/brief.md" });
+		await systemPrompt(h.hooks);
+		await transform(h.hooks, structuredClone(conversation()));
+		const directory = join(h.directory, "mirrors", `clm-${SESSION}`);
+		const snapshot = JSON.parse(readFileSync(join(directory, "snapshot.json"), "utf8"));
+		expect(snapshot.steeringError).toContain("/nonexistent/brief.md");
+		const model = buildPanelModel(await readSessionDirectory(directory, SESSION));
+		expect(model.steeringError).toContain("/nonexistent/brief.md");
+		const page = settingsPage(model, initialPanelState("settings"), 100).lines.map((line) => line.map((part) => part.text).join("")).join("\n");
+		expect(page).toContain("steering document not loaded");
+		expect(page).toContain("/nonexistent/brief.md");
 	});
 });

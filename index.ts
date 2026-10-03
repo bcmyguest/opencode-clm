@@ -100,8 +100,18 @@ function relay(text: string): string {
 export const server: Plugin = async (input: PluginInput, options?: PluginOptions): Promise<Hooks> => {
 	const settings: ClmSettings = resolveSettings(options ?? {}, process.env, input.directory);
 	if (!settings.enabled) return {};
-	// Read once at load: a missing or empty steering file fails the plugin with its path.
-	const steering: SteeringDocument | undefined = settings.steeringPath ? loadSteeringDocument(settings.steeringPath) : undefined;
+	// Read once at load. A missing or empty steering file does not stop the plugin (OpenCode
+	// would drop it silently, plugin/index.ts:230-241): sessions run protocol-only, each one
+	// records the error in its settings warning (`/clm status`), and a toast says so.
+	let steering: SteeringDocument | undefined;
+	let steeringError: string | undefined;
+	if (settings.steeringPath) {
+		try {
+			steering = loadSteeringDocument(settings.steeringPath);
+		} catch (error) {
+			steeringError = describe(error);
+		}
+	}
 
 	const sessions = new Map<string, Promise<ClmSession>>();
 	/** Estimated tokens per tool schema, from `tool.definition` (no session id there). */
@@ -131,6 +141,11 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	/** Tool calls per session since its last model request (`one-tool`). */
 	const toolCalls = new ToolCallCounter();
 
+	if (steeringError) {
+		const message = `steering document not loaded, sessions run without it: ${steeringError}`;
+		log("error", message);
+		toast(message, "error");
+	}
 	/** Command names this plugin defined; a user's own `clm` / `clm-compact` stays theirs. */
 	const ownCommands = new Set<string>();
 
