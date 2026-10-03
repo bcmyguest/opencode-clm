@@ -238,6 +238,10 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			try {
 				const result = await clm.transform(raw);
 				replaceInPlace(raw, result.messages);
+				if (result.alert) {
+					toast(result.alert, "warning");
+					log("warn", result.alert);
+				}
 			} catch (error) {
 				// Fail open: the request goes out with the raw history.
 				await clm.log({ event: "error", message: describe(error), stack: error instanceof Error ? error.stack : undefined });

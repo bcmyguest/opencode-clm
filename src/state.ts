@@ -24,6 +24,24 @@ export interface LiveContextOutcome {
 	at: string;
 }
 
+/**
+ * The once-per-session measurement of OpenCode's fixed overhead (system prompt and tool
+ * schemas). Its presence means the budget-too-small check has run; the session then derives
+ * its effective budget from `overhead` (clm.ts), so a raise survives a restart.
+ */
+export interface BudgetCheck {
+	/** Fixed overhead per request, tokens. */
+	overhead: number;
+	/** `provider`: the provider's count minus the conversation estimate; `estimate`: chars/4 sizes. */
+	source: "provider" | "estimate";
+	/** Budget and reserve in force when the check ran, and what it decided. */
+	configured: number;
+	reserve: number;
+	effective: number;
+	raised: boolean;
+	at: string;
+}
+
 export interface LiveContextState {
 	version: 1;
 	enabled: boolean;
@@ -31,12 +49,15 @@ export interface LiveContextState {
 	revision: number;
 	checkpoint?: ProjectionCheckpoint;
 	lastOutcome?: LiveContextOutcome;
+	budgetCheck?: BudgetCheck;
 }
 
 export interface LoadedState {
 	state: LiveContextState;
 	/** Set when a state file existed but could not be used; the state is then initial. */
 	warning?: string;
+	/** Set when an invalid optional field was dropped and the rest of the state kept. */
+	repaired?: string;
 }
 
 const SOURCE_KINDS = new Set(["kept", "edited", "removed", "restored", "normalized"]);
@@ -137,6 +158,24 @@ function isOutcome(value: unknown): value is LiveContextOutcome {
 	);
 }
 
+function isBudgetCheck(value: unknown): value is BudgetCheck {
+	if (!isObject(value)) return false;
+	return (
+		isCount(value.overhead) &&
+		(value.source === "provider" || value.source === "estimate") &&
+		isCount(value.configured) &&
+		isCount(value.reserve) &&
+		isCount(value.effective) &&
+		typeof value.raised === "boolean" &&
+		typeof value.at === "string"
+	);
+}
+
+/** The fields every state rewrite carries over (revision changes keep the budget check). */
+export function keptFields(state: LiveContextState): Pick<LiveContextState, "budgetCheck"> {
+	return state.budgetCheck ? { budgetCheck: state.budgetCheck } : {};
+}
+
 export function isLiveContextState(value: unknown): value is LiveContextState {
 	if (!isObject(value)) return false;
 	const state = value as Partial<LiveContextState>;
@@ -147,7 +186,8 @@ export function isLiveContextState(value: unknown): value is LiveContextState {
 		// Accept writes the checkpoint and the state with the same revision; reset moves past it.
 		(state.checkpoint === undefined ||
 			(isProjectionCheckpoint(state.checkpoint) && state.checkpoint.revision === state.revision)) &&
-		(state.lastOutcome === undefined || isOutcome(state.lastOutcome))
+		(state.lastOutcome === undefined || isOutcome(state.lastOutcome)) &&
+		(state.budgetCheck === undefined || isBudgetCheck(state.budgetCheck))
 	);
 }
 
@@ -162,6 +202,7 @@ export function resetProjectionState(
 		enabled: state.enabled,
 		revision: state.revision + 1,
 		lastOutcome: { kind: "reset", message, at },
+		...keptFields(state),
 	};
 }
 
@@ -191,10 +232,16 @@ export async function loadLiveContextState(directory: string): Promise<LoadedSta
 			warning: `${path} has unsupported version ${JSON.stringify(parsed.version)}; starting clean.`,
 		};
 	}
+	// A malformed budget check costs only itself: the session re-measures the overhead.
+	let repaired: string | undefined;
+	if (isObject(parsed) && parsed.budgetCheck !== undefined && !isBudgetCheck(parsed.budgetCheck)) {
+		delete parsed.budgetCheck;
+		repaired = `${path} had an invalid budgetCheck; dropped it, the fixed overhead is measured again.`;
+	}
 	if (!isLiveContextState(parsed)) {
 		return { state: initialLiveContextState(), warning: `${path} has an invalid shape; starting clean.` };
 	}
-	return { state: parsed };
+	return repaired ? { state: parsed, repaired } : { state: parsed };
 }
 
 /**

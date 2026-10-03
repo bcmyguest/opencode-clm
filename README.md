@@ -56,6 +56,31 @@ option.
 
 Booleans accept `true/false`, `1/0`, `on/off` and `yes/no`.
 
+**Choosing `budget`.** The budget counts the whole request, OpenCode's system prompt and
+tool schemas included. With OpenCode 1.18 and its default tools those take about 17,000
+to 19,000 tokens of every request (measured with provider counts), before the
+conversation starts. A budget must hold that overhead, the `reserve`, and a working margin
+for the conversation; the plugin uses 8,000 tokens, room for the task, a few tool results
+and edits. With the default reserve that gives a minimum of about 19,000 + 2,048 + 8,000 ≈
+29,000 tokens; the default 32,000 clears it. More tools (MCP servers, plugins) or a
+steering document raise the overhead.
+
+When the budget is smaller, the session raises it. On the first request that follows a
+measured reply, the plugin takes the provider's input count minus its own conversation
+estimate as the fixed overhead. It measures only while the conversation is at most a
+quarter of that count, so the estimate's error stays small; a session resumed with a long
+history is measured once its context is short. If the provider reports no usage, the
+plugin's own size estimate stands in until a provider count arrives. If budget − reserve
+leaves less than 8,000 tokens after the overhead, the effective budget becomes overhead +
+8,000 + reserve, never above the model window minus its output limit (uncapped while the
+window is unknown). The plugin then logs a `budget-too-small` event, shows a warning
+toast, and tells the model once. When the window cap leaves less than the margin, the
+notice says so; lower `reserve` or use a model with a larger window. The overhead is
+stored in `state.json`, so the raise holds after a restart, and it is measured once per
+session: switching agent or model, or adding an MCP server, later does not update it.
+`/clm` shows the fixed overhead, the usable budget (budget − reserve − overhead) and the
+effective budget when raised.
+
 A steering document carries context-management strategy (when to compact, what to keep);
 the plugin itself states only the editing protocol. The plugin reads the document once at
 load and appends it to the system prompt; `/clm` shows its name and SHA-256 prefix.
@@ -179,7 +204,7 @@ Each session has a directory `<mirrorDir>/clm-<session id>/` (mode 0700; files 0
 | file | content |
 |---|---|
 | `LIVE_CONTEXT.md` | the mirror |
-| `state.json` | enabled flag, revision, active checkpoint |
+| `state.json` | enabled flag, revision, active checkpoint, measured fixed overhead and budget decision |
 | `annotations.jsonl` | continuity annotations |
 | `events.jsonl` | one line per request, edit, reset, notice and error |
 | `revisions/rN.md` | the mirror text of each accepted revision |

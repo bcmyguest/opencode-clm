@@ -8,7 +8,7 @@
  * document.
  */
 
-import { budgetSummaryLine, formatTokens, type BudgetReading } from "./budget.ts";
+import { budgetFitLine, budgetSummaryLine, formatTokens, type BudgetFit, type BudgetReading } from "./budget.ts";
 import type { EditGate } from "./policy.ts";
 import { steeringStatusLine, type SteeringDocument } from "./steering.ts";
 
@@ -86,6 +86,8 @@ export interface ClmStatus {
 	guard: "withhold" | "off";
 	/** Latest budget reading; undefined before the first request. */
 	reading?: BudgetReading;
+	/** Fixed overhead, usable and effective budget (`budgetFit`); undefined while the budget is unknown. */
+	fit?: BudgetFit;
 	/** Model context window in tokens, when known. */
 	modelWindow?: number;
 	/** The accepted revision now in effect, if any. */
@@ -112,6 +114,7 @@ export function statusText(status: ClmStatus): string {
 			? `${budgetSummaryLine(status.reading)} · model window ${status.modelWindow ? formatTokens(status.modelWindow) : "unknown"}`
 			: "budget: unknown until the first request",
 	];
+	if (status.fit) lines.push(budgetFitLine(status.fit));
 	const checkpoint = status.checkpoint;
 	lines.push(
 		checkpoint

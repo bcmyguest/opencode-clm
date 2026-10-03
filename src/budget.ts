@@ -39,6 +39,14 @@ export const DEFAULT_BUDGET_POLICY: BudgetPolicyConfig = {
 	remindAtReserve: true,
 };
 
+/**
+ * Room the conversation needs on top of OpenCode's fixed overhead (system prompt and tool
+ * schemas) and the reserve: the pinned task, a few tool results and the model's own edits.
+ * A budget with less room than this makes the overflow guard withhold nearly every tool
+ * result; `budgetFit` then raises the session's effective budget.
+ */
+export const WORKING_MARGIN = 8000;
+
 export interface BudgetReading {
 	/** Effective budget in tokens (config or model window). */
 	budget: number;
@@ -64,6 +72,8 @@ export interface BudgetReading {
 	observedStale?: boolean;
 	/** Where `budget` came from, for status text. */
 	source: "config" | "model-window";
+	/** Set when `budget` was raised above the configured value to cover the fixed overhead (see `budgetFit`). */
+	raisedFrom?: number;
 }
 
 /** A reminder threshold in absolute tokens plus a stable label for re-arming. */
@@ -110,6 +120,115 @@ export function resolveBudget(
 		return { budget: window, reserve: Math.min(policy.reserve, window), source: "model-window" };
 	}
 	return undefined;
+}
+
+/** Budget arithmetic for status text, the TUI panel and the budget-too-small check. */
+export interface BudgetFit {
+	/** Budget before any raise (configured, or the model window). */
+	configured: number;
+	reserve: number;
+	/** OpenCode's fixed overhead per request in tokens; undefined until measured. */
+	overhead?: number;
+	/** configured − reserve − overhead: what the conversation gets without a raise (may be negative). */
+	usable?: number;
+	/** True when configured − reserve leaves less than `margin` after the overhead. */
+	tooSmall: boolean;
+	/** overhead + margin + reserve: the smallest budget that leaves the margin. */
+	minimum?: number;
+	/** The budget CLM applies: `configured`, or raised toward `minimum` (capped by `cap`). */
+	effective: number;
+	/** effective − reserve − overhead. */
+	effectiveUsable?: number;
+	raised: boolean;
+	/** True when `cap` stopped the raise short of `minimum`. */
+	capped: boolean;
+	margin: number;
+}
+
+/**
+ * Pure: how the budget compares with OpenCode's fixed overhead. When budget − reserve leaves
+ * less than `margin` after the overhead, the effective budget rises to overhead + margin +
+ * reserve, but never above `cap` (the model window minus its output limit) nor below the
+ * configured budget.
+ */
+export function budgetFit(
+	configured: number,
+	reserve: number,
+	overhead: number | undefined,
+	cap?: number,
+	margin = WORKING_MARGIN,
+): BudgetFit {
+	if (overhead === undefined) {
+		return { configured, reserve, tooSmall: false, effective: configured, raised: false, capped: false, margin };
+	}
+	const usable = configured - reserve - overhead;
+	const minimum = overhead + margin + reserve;
+	const tooSmall = usable < margin;
+	const limit = cap !== undefined && Number.isFinite(cap) && cap > 0 ? cap : Number.POSITIVE_INFINITY;
+	const effective = tooSmall ? Math.max(configured, Math.min(minimum, limit)) : configured;
+	return {
+		configured,
+		reserve,
+		overhead,
+		usable,
+		tooSmall,
+		minimum,
+		effective,
+		effectiveUsable: effective - reserve - overhead,
+		raised: effective > configured,
+		capped: tooSmall && minimum > limit,
+		margin,
+	};
+}
+
+/** Status line for `budgetFit`: fixed overhead, usable budget, and the raise if any. */
+export function budgetFitLine(fit: BudgetFit): string {
+	if (fit.overhead === undefined) return "fixed overhead (system prompt + tool schemas): not measured yet";
+	const parts = [
+		`fixed overhead (system prompt + tool schemas) ${formatTokens(fit.overhead)} tok`,
+		`usable ${formatTokens(fit.usable!)} tok (budget ${formatTokens(fit.configured)} − reserve ${formatTokens(fit.reserve)} − overhead)`,
+	];
+	if (fit.raised) {
+		parts.push(
+			`effective budget ${formatTokens(fit.effective)} tok (raised${fit.capped ? ", capped by the model window" : ""}; usable ${formatTokens(fit.effectiveUsable!)} tok)`,
+		);
+	} else if (fit.tooSmall) {
+		parts.push("too small, and the model window allows no raise");
+	}
+	return parts.join(" · ");
+}
+
+/**
+ * The one-time model notice for a budget that cannot hold OpenCode's fixed overhead plus a
+ * working margin. Text written for this package.
+ */
+export function budgetTooSmallNoticeText(fit: BudgetFit): string {
+	const head =
+		`[CLM BUDGET] The configured budget of ${formatTokens(fit.configured)} tokens is too small for this session: ` +
+		`OpenCode's system prompt and tool schemas take about ${formatTokens(fit.overhead ?? 0)} tokens of every request, ` +
+		`which leaves ${formatTokens(Math.max(0, fit.usable ?? 0))} tokens for the conversation after the ${formatTokens(fit.reserve)}-token reserve.`;
+	const left = formatTokens(Math.max(0, fit.effectiveUsable ?? 0));
+	if (fit.capped) {
+		const raise = fit.raised ? `CLM raised this session's budget to ${formatTokens(fit.effective)} tokens, the most the model window allows, ` : "The model window allows no larger budget, ";
+		return (
+			`${head} ${raise}which still leaves only ${left} tokens for the conversation. ` +
+			"The overflow guard will hold back most tool results: keep the context mirror short and read files in small parts."
+		);
+	}
+	return (
+		`${head} CLM raised this session's budget to ${formatTokens(fit.effective)} tokens, ` +
+		`about ${left} tokens for the conversation. ` +
+		"Budget reminders and the overflow guard count against the raised budget from now on."
+	);
+}
+
+/** The user-facing toast for the same case: what happened and what to change. */
+export function budgetTooSmallAlertText(fit: BudgetFit): string {
+	const head = `Budget ${formatTokens(fit.configured)} is too small: OpenCode's system prompt and tools take ~${formatTokens(fit.overhead ?? 0)} tokens.`;
+	if (fit.capped) {
+		return `${head} The model window limits this session to ${formatTokens(fit.effective)}, leaving ~${formatTokens(Math.max(0, fit.effectiveUsable ?? 0))} for the conversation; lower reserve, use fewer tools, or use a model with a larger context window.`;
+	}
+	return `${head} Raised to ${formatTokens(fit.effective)} for this session; set budget to at least ${formatTokens(fit.minimum!)}.`;
 }
 
 export function budgetTiers(policy: BudgetPolicyConfig, budget: number, reserve: number): BudgetTier[] {
@@ -176,8 +295,11 @@ function calibrated(reading: Pick<BudgetReading, "calibration">): boolean {
 
 /** One line for status text: budget, estimate, and observation, each labelled. */
 export function budgetSummaryLine(reading: BudgetReading): string {
+	const origin = reading.raisedFrom !== undefined
+		? `raised from ${formatTokens(reading.raisedFrom)} to cover the fixed overhead`
+		: reading.source === "config" ? "configured" : "model window";
 	const parts = [
-		`budget ${formatTokens(reading.budget)} tok (${reading.source === "config" ? "configured" : "model window"}, reserve ${formatTokens(reading.reserve)})`,
+		`budget ${formatTokens(reading.budget)} tok (${origin}, reserve ${formatTokens(reading.reserve)})`,
 		`estimated next request ${formatTokens(reading.estimated)}${calibrated(reading) ? ` (×${reading.calibration!.toFixed(2)} calibrated)` : ""}`,
 	];
 	parts.push(

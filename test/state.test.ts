@@ -233,3 +233,27 @@ describe("state.json persistence", () => {
 		expect(parsed.checkpoint.sourceDigest).toBe(checkpoint().sourceDigest);
 	});
 });
+
+describe("budgetCheck", () => {
+	const check = { overhead: 18_000, source: "provider" as const, configured: 12_000, reserve: 2048, effective: 28_048, raised: true, at: "2026-10-03T00:00:00.000Z" };
+
+	test("round-trips and survives a reset", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "clm-state-"));
+		const state = { ...initialLiveContextState(), budgetCheck: check };
+		await saveLiveContextState(directory, state);
+		expect(await loadLiveContextState(directory)).toEqual({ state });
+		expect(resetProjectionState(state, "x").budgetCheck).toEqual(check);
+		await rm(directory, { recursive: true, force: true });
+	});
+
+	test("a malformed check is dropped; the rest of the state is kept", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "clm-state-"));
+		const state = { ...initialLiveContextState(), revision: 4 };
+		await writeFile(join(directory, STATE_FILE), JSON.stringify({ ...state, budgetCheck: { ...check, overhead: -1 } }));
+		const loaded = await loadLiveContextState(directory);
+		expect(loaded.state).toEqual(state);
+		expect(loaded.warning).toBeUndefined();
+		expect(loaded.repaired).toContain("invalid budgetCheck");
+		await rm(directory, { recursive: true, force: true });
+	});
+});

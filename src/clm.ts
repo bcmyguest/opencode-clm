@@ -37,12 +37,16 @@ import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+	budgetFit,
 	budgetNoticeText,
 	budgetTiers,
+	budgetTooSmallAlertText,
+	budgetTooSmallNoticeText,
 	BudgetTracker,
 	EstimateCalibrator,
 	formatTokens,
 	resolveBudget,
+	type BudgetFit,
 	type BudgetReading,
 } from "./budget.ts";
 import { applyContextDocument, renderContextDocument, renderMessage } from "./context-document.ts";
@@ -63,9 +67,11 @@ import type { ClmStatus } from "./presentation.ts";
 import { applyProjection, createProjectionCheckpoint, type ProjectionCheckpoint } from "./projection.ts";
 import type { ClmSettings } from "./settings.ts";
 import {
+	keptFields,
 	loadLiveContextState,
 	resetProjectionState,
 	saveLiveContextState,
+	type BudgetCheck,
 	type LiveContextState,
 } from "./state.ts";
 import type { SteeringDocument } from "./steering.ts";
@@ -94,6 +100,8 @@ export interface TransformResult {
 	/** Calibrated estimate of this request, tokens (system prompt and tool schemas included when known); undefined when CLM did not run. */
 	estimated?: number;
 	reading?: BudgetReading;
+	/** User-facing warning for a toast (the budget-too-small check); set on one request only. */
+	alert?: string;
 }
 
 export interface MirrorCheck {
@@ -111,6 +119,12 @@ interface Baseline extends TurnBaseline {
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 const CHARS_PER_TOKEN = 4;
+
+/**
+ * Largest share of the provider count the conversation estimate may hold for an overhead
+ * measurement; above it the estimate's error would dominate the result.
+ */
+const MAX_CONVERSATION_SHARE = 0.25;
 
 /** Index after the pinned prefix: everything up to and including the first user message. */
 export function pinnedCount(raw: readonly OcMessage[]): number {
@@ -187,6 +201,8 @@ export class ClmSession {
 	requests = 0;
 
 	private pendingNotices: string[] = [];
+	/** Raw length and conversation estimate (calibrated, tokens) of the last request, for the overhead measurement. */
+	private previousRequest?: { rawCount: number; conversation: number };
 	private invalidationStreak = 0;
 	/**
 	 * Per-process seed of the stable document id. Fresh on every open, so a document id never
@@ -215,6 +231,7 @@ export class ClmSession {
 		const loaded = await loadLiveContextState(store.directory);
 		const session = new ClmSession(sessionID, store, settings, loaded);
 		if (loaded.warning) await session.log({ event: "state-warning", warning: loaded.warning });
+		if (loaded.repaired) await session.log({ event: "state-repaired", message: loaded.repaired });
 		return session;
 	}
 
@@ -250,14 +267,110 @@ export class ClmSession {
 		return notices.reduce((total, notice) => total + this.textTokens(notice), 0);
 	}
 
-	resolvedBudget() {
-		return resolveBudget(this.settings.budget, this.limits.context, this.limits.output);
+	/**
+	 * The budget in force: the configured one (or the model window), raised when the
+	 * session's budget check found it too small for OpenCode's fixed overhead (`budgetFit`).
+	 */
+	resolvedBudget(): Pick<BudgetReading, "budget" | "reserve" | "source" | "raisedFrom"> | undefined {
+		const base = resolveBudget(this.settings.budget, this.limits.context, this.limits.output);
+		if (!base) return undefined;
+		const fit = budgetFit(base.budget, base.reserve, this.state.budgetCheck?.overhead, this.windowCap());
+		return fit.raised ? { ...base, budget: fit.effective, raisedFrom: base.budget } : base;
+	}
+
+	/** Model window minus its output limit, when known: the ceiling for a raised budget. */
+	private windowCap(): number | undefined {
+		return resolveBudget({ ...this.settings.budget, contextBudget: undefined }, this.limits.context, this.limits.output)?.budget;
+	}
+
+	/**
+	 * Budget arithmetic for `/clm` and a TUI panel: fixed overhead, usable budget, effective
+	 * budget. Undefined while the budget is unknown; `overhead` is unset until measured.
+	 */
+	budgetFit(): BudgetFit | undefined {
+		const base = resolveBudget(this.settings.budget, this.limits.context, this.limits.output);
+		return base ? budgetFit(base.budget, base.reserve, this.state.budgetCheck?.overhead, this.windowCap()) : undefined;
 	}
 
 	/** budget − reserve, or undefined while the budget is unknown. */
 	guardLimit(): number | undefined {
 		const resolved = this.resolvedBudget();
 		return resolved ? overflowGuardLimit(resolved.budget, resolved.reserve) : undefined;
+	}
+
+	/**
+	 * Fixed overhead of a request (system prompt + tool schemas), measured once per session.
+	 *
+	 * Request 1 cannot measure it: OpenCode calls `experimental.chat.system.transform` after
+	 * this hook, and the provider count arrives with the reply. So a later transform measures
+	 * it: provider-reported input of the previous request minus that request's conversation
+	 * estimate. The estimate's error lands in the overhead, so the measurement waits for a
+	 * request whose conversation is at most MAX_CONVERSATION_SHARE of the provider count
+	 * (a restarted or upgraded session with a long history is measured after the model
+	 * shrinks its context, or not at all).
+	 *
+	 * Fallback: the chars/4 hook sizes, only when the provider answered without reporting
+	 * usage. They miss OpenCode's built-in tool schemas (Effect schemas, not measured;
+	 * several thousand tokens low), so a fallback result is replaced by the first provider
+	 * measurement.
+	 */
+	private measureOverhead(raw: readonly OcMessage[], observed: ObservedRequest | undefined): Pick<BudgetCheck, "overhead" | "source"> | undefined {
+		const previous = this.previousRequest;
+		if (!previous) return undefined;
+		if (observed && observed.index >= previous.rawCount) {
+			if (previous.conversation > observed.tokens * MAX_CONVERSATION_SHARE) return undefined;
+			return { overhead: Math.round(observed.tokens - previous.conversation), source: "provider" };
+		}
+		if (this.state.budgetCheck) return undefined; // an estimate never replaces a measurement
+		const answered = raw.slice(previous.rawCount)
+			.some((message) => message.info.role === "assistant" && !message.info.error && !message.info.summary);
+		const { systemTokens, toolTokens } = this.scope;
+		if (answered && systemTokens !== undefined && toolTokens !== undefined) {
+			return { overhead: this.calibrator.apply(systemTokens + toolTokens), source: "estimate" };
+		}
+		return undefined;
+	}
+
+	/**
+	 * The budget-too-small check, once per session (plus once more when a provider count
+	 * replaces a fallback estimate). Decision: raise the effective budget to overhead +
+	 * WORKING_MARGIN + reserve (capped by the model window) rather than switch the overflow
+	 * guard off. With the guard off, one large tool result can push the request past the
+	 * model window; with the budget raised, reminders, the fit gate and the guard keep
+	 * working, measured against a budget the conversation can actually use. The overhead is
+	 * persisted in `state.budgetCheck` and the raise is derived from it on every request, so
+	 * it survives a restart, and the event, toast and notice do not repeat.
+	 */
+	private async checkBudget(measured: Pick<BudgetCheck, "overhead" | "source">): Promise<string | undefined> {
+		const base = resolveBudget(this.settings.budget, this.limits.context, this.limits.output);
+		if (!base) return undefined;
+		const previous = this.state.budgetCheck;
+		const fit = budgetFit(base.budget, base.reserve, measured.overhead, this.windowCap());
+		const check: BudgetCheck = {
+			...measured,
+			configured: base.budget,
+			reserve: base.reserve,
+			effective: fit.effective,
+			raised: fit.raised,
+			at: new Date().toISOString(),
+		};
+		// activateOnFailure: a failed save still applies the raise in this process.
+		await this.updateState((state) => ({ ...state, budgetCheck: check }), true).catch(() => undefined);
+		// A replaced estimate that already reported "too small" does not warn again.
+		const warnedBefore = previous !== undefined && budgetFit(previous.configured, previous.reserve, previous.overhead).tooSmall;
+		const warn = fit.tooSmall && !warnedBefore;
+		await this.log({
+			event: warn ? "budget-too-small" : "budget-check",
+			...check,
+			usable: fit.usable,
+			margin: fit.margin,
+			minimum: fit.minimum,
+			capped: fit.capped,
+			...(previous ? { replaces: previous.source, previousOverhead: previous.overhead } : {}),
+		});
+		if (!warn) return undefined;
+		this.pendingNotices.push(budgetTooSmallNoticeText(fit));
+		return budgetTooSmallAlertText(fit);
 	}
 
 	// ---- persistence -------------------------------------------------------------------
@@ -420,6 +533,7 @@ export class ClmSession {
 					revision,
 					checkpoint,
 					lastOutcome: { kind: "applied", message: applied, ...sizes, at },
+					...keptFields(state),
 				};
 			});
 		} catch (error) {
@@ -489,6 +603,7 @@ export class ClmSession {
 			enabled: state.enabled,
 			revision: state.revision + 1,
 			lastOutcome: { kind: "compacted", message, at },
+			...keptFields(state),
 		}), true).catch(() => {
 			written = false;
 			return this.state;
@@ -536,6 +651,9 @@ export class ClmSession {
 		const source = flatten(raw.slice(pinned));
 		const observed = lastProviderReported(raw);
 		this.calibrator.observe(observed);
+		// Before the guard and the reading, so a raise applies to this request already.
+		const measured = this.state.budgetCheck?.source === "provider" ? undefined : this.measureOverhead(raw, observed);
+		const alert = measured ? await this.checkBudget(measured) : undefined;
 
 		let projection = applyProjection(source, this.state.checkpoint);
 		// A late or repeated compaction signal must not swallow a later revert: rebase only
@@ -675,6 +793,7 @@ export class ClmSession {
 			this.calibrator.record(systemTokens + toolTokens + conversation, raw.length);
 		}
 
+		this.previousRequest = { rawCount: raw.length, conversation: conversationTokens + this.calibrator.apply(this.noticeTokens(notices)) };
 		this.lastRequest = { rawMessages: raw.length, sentMessages: messages.length, mirrorBlocks: snapshot.blocks.length };
 		if (this.settings.dumpRequests) {
 			const directory = join(this.store.directory, "requests");
@@ -694,7 +813,7 @@ export class ClmSession {
 			calibration: this.calibrator.factor,
 			notices: notices.map((notice) => notice.slice(0, 80)),
 		});
-		return { messages, notices, estimated: reading?.estimated ?? requestTokens, reading };
+		return { messages, notices, estimated: reading?.estimated ?? requestTokens, reading, ...(alert ? { alert } : {}) };
 	}
 
 	/** Inputs for presentation.ts `statusText` / `statusLine`. */
@@ -709,6 +828,7 @@ export class ClmSession {
 			gate: this.settings.gate,
 			guard: this.settings.guard,
 			reading: this.lastReading,
+			fit: this.budgetFit(),
 			modelWindow: this.limits.context,
 			checkpoint: checkpoint
 				? {

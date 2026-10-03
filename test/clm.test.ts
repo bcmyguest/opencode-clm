@@ -386,3 +386,131 @@ describe("edit receipt", () => {
 		expect(clm.receipt("bash", { command: "ls" }, "/")).toBeUndefined();
 	});
 });
+
+describe("budget-too-small check", () => {
+	const events = (clm: ClmSession) =>
+		readFileSync(join(clm.store.directory, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+	/** Request 1, then request 2 after a reply the provider measured at `observed` input tokens. */
+	const measuredRaw = (observed: number) => [...conversation(), assistant("msg_a3", "ok", [], observed)];
+
+	test("a small budget is raised once: event, notice and alert on the measuring request only; it survives a restart", async () => {
+		const options = settings({ budget: 12_000 });
+		const clm = await ClmSession.open(SESSION, options);
+		const first = await clm.transform(conversation());
+		expect(first.alert).toBeUndefined();
+		expect(clm.state.budgetCheck).toBeUndefined();
+
+		const second = await clm.transform(measuredRaw(18_000));
+		const check = clm.state.budgetCheck!;
+		expect(check.source).toBe("provider");
+		// Provider count minus the first request's conversation estimate.
+		expect(check.overhead).toBeGreaterThan(17_000);
+		expect(check.overhead).toBeLessThan(18_000);
+		expect(check).toMatchObject({ configured: 12_000, reserve: 2048, raised: true, effective: check.overhead + 8000 + 2048 });
+		expect(second.alert).toContain("Budget 12,000 is too small");
+		expect(second.notices.filter((notice) => notice.includes("is too small for this session"))).toHaveLength(1);
+		expect(second.reading).toMatchObject({ budget: check.effective, raisedFrom: 12_000 });
+		expect(statusText(clm.status())).toContain(`effective budget ${check.effective.toLocaleString("en-US")} tok (raised`);
+
+		const third = await clm.transform([...measuredRaw(18_000), assistant("msg_a4", "more", [], 18_500)]);
+		expect(third.alert).toBeUndefined();
+		expect(third.notices.join("\n")).not.toContain("too small");
+		expect(events(clm).filter((event) => event.event === "budget-too-small")).toHaveLength(1);
+
+		// Restart: the persisted check keeps the raise and is not repeated.
+		const reopened = await ClmSession.open(SESSION, options);
+		expect(reopened.state.budgetCheck).toEqual(check);
+		expect(reopened.resolvedBudget()).toMatchObject({ budget: check.effective, raisedFrom: 12_000 });
+		await reopened.transform(measuredRaw(18_000));
+		const after = await reopened.transform([...measuredRaw(18_000), assistant("msg_a4", "more", [], 18_500)]);
+		expect(after.alert).toBeUndefined();
+		expect(after.reading?.budget).toBe(check.effective);
+		expect(events(reopened).filter((event) => event.event === "budget-too-small")).toHaveLength(1);
+	});
+
+	test("an accepted edit and a reset keep the check", async () => {
+		const clm = await ClmSession.open(SESSION, settings({ budget: 12_000 }));
+		await clm.transform(conversation());
+		await clm.transform(measuredRaw(18_000));
+		const check = clm.state.budgetCheck;
+		writeFileSync(clm.mirrorPath, replaceBody(readFileSync(clm.mirrorPath, "utf8"), blockId(clm.baseline!.snapshot, "toolResult", 0), "short"));
+		const applied = await clm.transform(measuredRaw(18_000));
+		expect(applied.notices.join("\n")).toContain("Applied revision 1");
+		expect(clm.state.budgetCheck).toEqual(check!);
+		await clm.resetProjection("test");
+		expect(clm.state.budgetCheck).toEqual(check!);
+	});
+
+	test("an adequate budget is not raised and gets no notice", async () => {
+		const clm = await ClmSession.open(SESSION, settings({ budget: 64_000 }));
+		await clm.transform(conversation());
+		const second = await clm.transform(measuredRaw(18_000));
+		expect(second.alert).toBeUndefined();
+		expect(second.notices.join("\n")).not.toContain("too small");
+		expect(clm.state.budgetCheck).toMatchObject({ raised: false, effective: 64_000, source: "provider" });
+		expect(second.reading?.budget).toBe(64_000);
+		expect(second.reading?.raisedFrom).toBeUndefined();
+		expect(events(clm).map((event) => event.event)).toContain("budget-check");
+		expect(events(clm).map((event) => event.event)).not.toContain("budget-too-small");
+		const status = statusText(clm.status());
+		expect(status).toContain("fixed overhead (system prompt + tool schemas)");
+		expect(status).not.toContain("effective budget");
+	});
+
+	test("without a provider count the hook estimate measures the overhead", async () => {
+		const clm = await ClmSession.open(SESSION, settings({ budget: 12_000 }));
+		clm.scope = { systemTokens: 9000, toolTokens: 6000 };
+		await clm.transform(conversation());
+		// The same history again: no reply yet, so nothing is measured.
+		await clm.transform(conversation());
+		expect(clm.state.budgetCheck).toBeUndefined();
+		const second = await clm.transform(measuredRaw(0));
+		expect(clm.state.budgetCheck).toMatchObject({ source: "estimate", overhead: 15_000, raised: true, effective: 15_000 + 8000 + 2048 });
+		expect(second.alert).toContain("too small");
+
+		// The first provider count replaces the estimate; the warning is not repeated.
+		const third = await clm.transform([...measuredRaw(0), assistant("msg_a4", "more", [], 20_000)]);
+		expect(clm.state.budgetCheck?.source).toBe("provider");
+		expect(clm.state.budgetCheck!.overhead).toBeGreaterThan(19_000);
+		expect(third.alert).toBeUndefined();
+		expect(third.notices.join("\n")).not.toContain("too small");
+		expect(clm.resolvedBudget()?.budget).toBe(clm.state.budgetCheck!.overhead + 8000 + 2048);
+		expect(events(clm).filter((event) => event.event === "budget-too-small")).toHaveLength(1);
+		expect(events(clm).find((event) => event.replaces === "estimate")).toMatchObject({ event: "budget-check", previousOverhead: 15_000 });
+	});
+
+	test("a long conversation is not measured: its estimate error would land in the overhead", async () => {
+		// Guard off, so the 10,000-token output is sent rather than withheld.
+		const clm = await ClmSession.open(SESSION, settings({ budget: 12_000, guard: "off" }));
+		// About 10,000 estimated tokens of conversation against a provider count of 20,000.
+		await clm.transform(conversation("x".repeat(40_000)));
+		await clm.transform([...conversation("x".repeat(40_000)), assistant("msg_a3", "ok", [], 20_000)]);
+		expect(clm.state.budgetCheck).toBeUndefined();
+	});
+
+	test("a tool result withheld at the configured budget is delivered after the raise", async () => {
+		// Hook sizes as in OpenCode: the system prompt is sized, the built-in tool schemas only
+		// partly, so the provider reports more than the 12,000 estimated. Request 2 adds a
+		// ~4,000-token tool result: no room under 12,000 − 2,048, room under the raised limit.
+		const scope = { systemTokens: 9000, toolTokens: 3000 };
+		const big = (tokens: number) => [
+			...conversation(),
+			assistant("msg_a3", "Reading.", [{ callID: "call_big", output: "y".repeat(16_000) }], tokens),
+		];
+		const control = await ClmSession.open(SESSION, settings({ budget: 12_000 }));
+		control.scope = scope;
+		const starved = await control.transform(big(0)); // a first request: nothing measured yet
+		expect(String(toolOutput(starved.messages[3], "call_big"))).toStartWith("[clm overflow guard]");
+		expect(events(control).map((event) => event.event)).toContain("overflow-guard");
+
+		const clm = await ClmSession.open(SESSION, settings({ budget: 12_000 }));
+		clm.scope = scope;
+		await clm.transform(conversation());
+		const fed = await clm.transform(big(18_000));
+		expect(clm.state.budgetCheck?.raised).toBe(true);
+		expect(String(toolOutput(fed.messages[3], "call_big"))).toBe("y".repeat(16_000));
+		// Request 1 ran at the configured budget; nothing is withheld once the raise applies.
+		const names = events(clm).map((event) => event.event);
+		expect(names.slice(names.indexOf("budget-too-small"))).not.toContain("overflow-guard");
+	});
+});

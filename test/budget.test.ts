@@ -4,8 +4,13 @@ import {
 	BudgetTracker,
 	DEFAULT_BUDGET_POLICY,
 	EstimateCalibrator,
+	WORKING_MARGIN,
+	budgetFit,
+	budgetFitLine,
 	budgetNoticeText,
 	budgetSummaryLine,
+	budgetTooSmallAlertText,
+	budgetTooSmallNoticeText,
 	budgetTiers,
 	formatTokens,
 	governingTokens,
@@ -267,5 +272,68 @@ describe("estimate calibrator", () => {
 		expect(text).toMatch(/estimated 17,000 tokens for the next request \(calibrated ×1\.83 from provider counts\); the provider/);
 		expect(budgetNoticeText({ ...reading(17_000), calibration: 1 }, tiers[0]!, undefined)).not.toMatch(/calibrated/);
 		expect(budgetSummaryLine({ ...reading(1_000), calibration: 2 })).toMatch(/estimated next request 1,000 \(×2\.00 calibrated\)/);
+	});
+});
+
+describe("budgetFit", () => {
+	test("a budget below overhead + margin + reserve is raised to that sum", () => {
+		const fit = budgetFit(12_000, 2048, 18_000);
+		expect(fit.tooSmall).toBe(true);
+		expect(fit.usable).toBe(12_000 - 2048 - 18_000);
+		expect(fit.minimum).toBe(18_000 + WORKING_MARGIN + 2048);
+		expect(fit.effective).toBe(fit.minimum!);
+		expect(fit.effectiveUsable).toBe(WORKING_MARGIN);
+		expect(fit.raised).toBe(true);
+		expect(fit.capped).toBe(false);
+	});
+
+	test("an adequate budget, or an unmeasured overhead, is left alone", () => {
+		const fit = budgetFit(64_000, 2048, 18_000);
+		expect(fit).toMatchObject({ tooSmall: false, raised: false, effective: 64_000, usable: 64_000 - 2048 - 18_000 });
+		const unmeasured = budgetFit(12_000, 2048, undefined);
+		expect(unmeasured).toMatchObject({ tooSmall: false, raised: false, effective: 12_000 });
+		expect(unmeasured.overhead).toBeUndefined();
+		// Exactly the margin left: not too small.
+		expect(budgetFit(18_000 + WORKING_MARGIN + 2048, 2048, 18_000).tooSmall).toBe(false);
+	});
+
+	test("the model window caps the raise and never lowers the configured budget", () => {
+		const capped = budgetFit(12_000, 2048, 18_000, 20_000);
+		expect(capped).toMatchObject({ tooSmall: true, raised: true, capped: true, effective: 20_000 });
+		const none = budgetFit(12_000, 2048, 18_000, 12_000);
+		expect(none).toMatchObject({ tooSmall: true, raised: false, capped: true, effective: 12_000 });
+	});
+
+	test("status line and notice state overhead, usable and effective budget", () => {
+		const fit = budgetFit(12_000, 2048, 18_000);
+		const line = budgetFitLine(fit);
+		expect(line).toContain("fixed overhead (system prompt + tool schemas) 18,000 tok");
+		expect(line).toContain("usable -8,048 tok (budget 12,000 − reserve 2,048 − overhead)");
+		expect(line).toContain("effective budget 28,048 tok (raised; usable 8,000 tok)");
+		expect(budgetFitLine(budgetFit(12_000, 2048, undefined))).toContain("not measured yet");
+		expect(budgetFitLine(budgetFit(64_000, 2048, 18_000))).not.toContain("effective");
+
+		const notice = budgetTooSmallNoticeText(fit);
+		expect(notice).toStartWith("[CLM BUDGET] The configured budget of 12,000 tokens is too small");
+		expect(notice).toContain("about 18,000 tokens of every request");
+		expect(notice).toContain("raised this session's budget to 28,048 tokens");
+		expect(budgetTooSmallNoticeText(budgetFit(12_000, 2048, 18_000, 12_000))).toContain("allows no larger budget");
+		expect(budgetTooSmallAlertText(fit)).toContain("Raised to 28,048 for this session; set budget to at least 28,048.");
+	});
+
+	test("a raise the window caps says so instead of promising room", () => {
+		const fit = budgetFit(12_000, 2048, 18_000, 20_000);
+		const notice = budgetTooSmallNoticeText(fit);
+		expect(notice).toContain("raised this session's budget to 20,000 tokens, the most the model window allows");
+		expect(notice).toContain("only 0 tokens for the conversation");
+		expect(notice).not.toContain("count against the raised budget");
+		const alert = budgetTooSmallAlertText(fit);
+		expect(alert).toContain("larger context window");
+		expect(alert).not.toContain("set budget to at least");
+	});
+
+	test("the summary line names a raised budget", () => {
+		const line = budgetSummaryLine({ budget: 28_048, reserve: 2048, estimated: 100, source: "config", raisedFrom: 12_000 });
+		expect(line).toContain("budget 28,048 tok (raised from 12,000 to cover the fixed overhead, reserve 2,048)");
 	});
 });

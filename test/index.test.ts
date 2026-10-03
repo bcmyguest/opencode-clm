@@ -445,3 +445,21 @@ describe("fail open", () => {
 		expect(await command(harness.hooks, STATUS_COMMAND, "", "../x")).toContain("CLM refuses session id");
 	});
 });
+
+describe("budget-too-small", () => {
+	test("a budget below OpenCode's fixed overhead toasts one warning and /clm shows the overhead", async () => {
+		const harness = await load({ budget: "12k" });
+		await system(harness.hooks, SESSION, ["base"]);
+		await transform(harness.hooks, structuredClone(conversation()));
+		const measured = [...structuredClone(conversation()), assistant("msg_a3", "ok", [], 18_000)];
+		await transform(harness.hooks, structuredClone(measured));
+		await transform(harness.hooks, [...structuredClone(measured), assistant("msg_a4", "more", [], 18_500)]);
+		await Bun.sleep(0);
+		const warnings = harness.toasts.filter((toast) => toast.message.includes("is too small"));
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]!.variant).toBe("warning");
+		const status = await command(harness.hooks, STATUS_COMMAND);
+		expect(status).toContain("fixed overhead (system prompt + tool schemas)");
+		expect(status).toContain("effective budget");
+	});
+});
