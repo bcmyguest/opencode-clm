@@ -525,13 +525,40 @@ export function applyContextDocument(
 
 	const parsed = parseDocument(editedText, snapshot);
 	const metadataLine = snapshot.text.split("\n")[0] ?? "";
-	const staleMetadata = () =>
-		rejected(
+	// States the current revision, what is wrong with the file, and the exact line to
+	// write, so the model can fix the file in one step.
+	const staleMetadata = () => {
+		const current = `The mirror is at revision ${snapshot.revision}.`;
+		let found: string;
+		let cause: string;
+		if (parsed.revision === undefined) {
+			found = "your file has no [[LIVE_CONTEXT ...]] line 1";
+			cause = parsed.blocks.length === 0 && /^\s*\[\[CTX_TURN /m.test(editedText)
+				? `${current} Its block headers come from an older copy of the mirror: read the file again and apply your change to its current text.`
+				: `${current} Put the line below back as line 1 and keep the rest of your edit.`;
+		} else if (parsed.revision !== snapshot.revision) {
+			found = `your file says revision ${parsed.revision}`;
+			cause = `${current} It was rewritten after the copy you edited was taken: read the file again and apply your change to its current text, leaving line 1 as it is.`;
+		} else {
+			const fields = [
+				...(parsed.version !== snapshot.version ? ["version"] : []),
+				...(parsed.documentId !== snapshot.documentId ? ["document id"] : []),
+				...(!snapshot.stableDocument && parsed.baselineDigest !== snapshot.baselineDigest ? ["baseline digest"] : []),
+			];
+			found = fields.length > 0
+				? `your file says revision ${parsed.revision}, but its ${fields.join(" and ")} differ${fields.length === 1 ? "s" : ""}`
+				: `your file's line 1 is current, but its block headers belong to another copy of the mirror`;
+			cause = fields.length > 0
+				? `${current} Line 1 was changed or copied from another mirror: restore it exactly and keep the rest of your edit.`
+				: `${current} Read the file again and apply your change to its current text.`;
+		}
+		return rejected(
 			snapshot,
 			beforeEstimate,
-			`Mirror metadata does not match the current context revision (expected revision ${snapshot.revision}, document ${snapshot.documentId.slice(0, 12)}…). ` +
-				`The first line must be exactly: ${metadataLine}`,
+			`Mirror metadata does not match the current context revision (expected revision ${snapshot.revision}, document ${snapshot.documentId.slice(0, 12)}…; ${found}). ` +
+				`${cause} The first line must be exactly: ${metadataLine}`,
 		);
+	};
 	// A file with no current block headers but with framing lines from another document
 	// (or a stale revision) is an old mirror copied back, not a summary: reject it.
 	if (parsed.blocks.length === 0 && hasForeignFraming(editedText, snapshot)) return staleMetadata();

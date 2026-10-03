@@ -560,11 +560,30 @@ describe("stable document nonce", () => {
 		expect(result.messages[1]!.content).toEqual([{ type: "text", text: "done" }]);
 	});
 
+	test("stale-metadata rejections describe what is wrong with line 1", () => {
+		const current = seeded(base, "s", 2);
+		const line1 = current.text.split("\n")[0]!;
+		const missing = applyContextDocument(current.text.slice(line1.length + 1), current, clm).reason!;
+		expect(missing).toContain("your file has no [[LIVE_CONTEXT ...]] line 1");
+		expect(missing).toContain("Put the line below back as line 1");
+		expect(missing).not.toContain("rewritten after");
+		expect(missing).toEndWith(`The first line must be exactly: ${line1}`);
+		const otherId = applyContextDocument(current.text.replace(/document=([a-f0-9]{64})/, `document=${"0".repeat(64)}`), current, clm).reason!;
+		expect(otherId).toContain("your file says revision 2, but its document id differs");
+		expect(otherId).toContain("restore it exactly");
+		expect(otherId).not.toContain("rewritten after");
+		const otherVersion = applyContextDocument(current.text.replace("version=1", "version=9"), current, clm).reason!;
+		expect(otherVersion).toContain("but its version differs");
+	});
+
 	test("rejections name the expected revision and nonce", () => {
 		const current = seeded(base, "s", 2);
 		const wrong = applyContextDocument(current.text.replace("revision=2", "revision=1"), current, clm);
 		expect(wrong.accepted).toBe(false);
 		expect(wrong.reason).toContain(`expected revision 2, document ${current.documentId.slice(0, 12)}`);
+		expect(wrong.reason).toContain("your file says revision 1");
+		expect(wrong.reason).toContain("The mirror is at revision 2. It was rewritten after the copy you edited was taken");
+		expect(wrong.reason).toContain("read the file again");
 		const unknown = current.text.replace(/id=1-[a-f0-9]+/, "id=1-deadbeef0000");
 		expect(applyContextDocument(unknown, current, clm).reason).toContain("prefix a new block's id with new-");
 	});
