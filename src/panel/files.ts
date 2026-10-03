@@ -60,6 +60,8 @@ export interface SnapshotFile {
 	budget: { budget: number; reserve: number; limit: number; source: string };
 	calibration: { factor: number; samples: number };
 	steering?: { name: string; hash: string; path: string };
+	/** Why the configured steering document did not load (sessions then run protocol-only). */
+	steeringError?: string;
 	sizes: { estimated: number; observedPrevious?: number };
 	input: {
 		raw: number;

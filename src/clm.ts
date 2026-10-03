@@ -59,7 +59,7 @@ import {
 	type LiveContextAnnotation,
 } from "./continuity.ts";
 import { classifyMirrorToolCall } from "./mirror-guard.ts";
-import { MirrorStore } from "./mirror-store.ts";
+import { MirrorDirectoryError, MirrorStore } from "./mirror-store.ts";
 import { capObservations } from "./observation.ts";
 import { flatten, noteMessage, unflatten, withoutReasoning, type OcInfo, type OcMessage } from "./opencode.ts";
 import { applyOverflowGuard, overflowGuardLimit, overflowNoticeText } from "./overflow.ts";
@@ -107,6 +107,8 @@ export interface TransformResult {
 	reading?: BudgetReading;
 	/** User-facing warning for a toast (the budget-too-small check); set on one request only. */
 	alert?: string;
+	/** User-facing errors for toasts: the mirror could not be read or refreshed, a revision could not be saved. */
+	errors?: string[];
 }
 
 export interface MirrorCheck {
@@ -212,6 +214,12 @@ export class ClmSession {
 	requests = 0;
 
 	private pendingNotices: string[] = [];
+	/** Errors for the user (toasts), returned with the next transform result. */
+	private pendingErrors: string[] = [];
+	/** The mirror could not be written last time; its error toast is not repeated until a write succeeds. */
+	private refreshFailing = false;
+	/** Why the steering document in the settings did not load, for snapshot.json (the panel). */
+	steeringError?: string;
 	/** Raw length and conversation estimate (calibrated, tokens) of the last request, for the overhead measurement. */
 	private previousRequest?: { rawCount: number; conversation: number };
 	private invalidationStreak = 0;
@@ -255,7 +263,9 @@ export class ClmSession {
 	 */
 	static async open(sessionID: string, settings: ClmSettings, options: { steering?: SteeringDocument } = {}): Promise<ClmSession> {
 		if (!SESSION_ID_RE.test(sessionID)) throw new Error(`Invalid session id for CLM: ${JSON.stringify(sessionID)}`);
-		const store = await MirrorStore.create(sessionID, settings.mirrorDir);
+		const store = await MirrorStore.create(sessionID, settings.mirrorDir).catch((error: unknown) => {
+			throw new MirrorDirectoryError(settings.mirrorDir, error);
+		});
 		const loaded = await loadLiveContextState(store.directory);
 		const session = new ClmSession(sessionID, store, settings, loaded, options.steering);
 		if (loaded.warning) await session.log({ event: "state-warning", warning: loaded.warning });
@@ -319,6 +329,7 @@ export class ClmSession {
 			staged = { settings: this.baseSettings, ...(this.baseSteering ? { steering: this.baseSteering } : {}) };
 		}
 		if (staged.steeringError) warnings.push(`steering document not loaded: ${staged.steeringError}`);
+		this.steeringError = staged.steeringError;
 		await this.activateSettings(staged, overrides);
 		this.settingsWarning = warnings.length > 0 ? warnings.join("; ") : undefined;
 	}
@@ -597,6 +608,7 @@ export class ClmSession {
 			text = await this.store.read();
 		} catch (error) {
 			this.pendingNotices.push(`[CLM] Could not read the mirror: ${describe(error)}`);
+			this.pendingErrors.push(`could not read the mirror, the edit was not applied: ${describe(error)}`);
 			return;
 		}
 		if (text === undefined || text.trim() === baseline.snapshot.text.trim()) return;
@@ -649,6 +661,7 @@ export class ClmSession {
 		} catch (error) {
 			// Persist before activate: an unsaved revision would vanish on restart.
 			this.pendingNotices.push(`[CLM] Revision ${revision} was not applied: it could not be saved (${describe(error)}); the previous context stays in effect.`);
+			this.pendingErrors.push(`revision ${revision} could not be saved, the previous context stays in effect: ${describe(error)}`);
 			return;
 		}
 		this.accepted += 1;
@@ -757,6 +770,7 @@ export class ClmSession {
 			budget: { budget: base.budget, reserve: base.reserve, limit: overflowGuardLimit(resolved.budget, resolved.reserve), source: base.source },
 			calibration: { factor: this.calibrator.factor, samples: this.calibrator.sampleCount },
 			...(steering ? { steering: { name: steering.name, hash: steering.hash, path: steering.path } } : {}),
+			...(this.steeringError ? { steeringError: this.steeringError } : {}),
 			sizes: { estimated: input.estimated, ...(input.observed !== undefined ? { observedPrevious: input.observed } : {}) },
 			input: {
 				raw: input.raw,
@@ -1090,6 +1104,7 @@ export class ClmSession {
 		});
 		try {
 			await this.store.write(snapshot.text);
+			this.refreshFailing = false;
 			this.lastSnapshot = snapshot;
 			this.baseline = {
 				rawMessages: source,
@@ -1102,6 +1117,8 @@ export class ClmSession {
 		} catch (error) {
 			this.baseline = undefined;
 			this.pendingNotices.push(`[CLM] Could not refresh the mirror: ${describe(error)}`);
+			if (!this.refreshFailing) this.pendingErrors.push(`could not refresh the mirror, edits are off until it can be written: ${describe(error)}`);
+			this.refreshFailing = true;
 		}
 
 		const conversationTokens = pinnedTokens + this.estimate(effective) + continuityTokens;
@@ -1184,7 +1201,9 @@ export class ClmSession {
 			calibration: this.calibrator.factor,
 			notices: notices.map((notice) => notice.slice(0, 80)),
 		});
-		return { messages, notices, estimated: reading?.estimated ?? requestTokens, reading, ...(alert ? { alert } : {}) };
+		const errors = this.pendingErrors;
+		this.pendingErrors = [];
+		return { messages, notices, estimated: reading?.estimated ?? requestTokens, reading, ...(alert ? { alert } : {}), ...(errors.length > 0 ? { errors } : {}) };
 	}
 
 	/** Inputs for presentation.ts `statusText` / `statusLine`. */

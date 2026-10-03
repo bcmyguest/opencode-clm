@@ -447,6 +447,10 @@ export function settingsPage(model: PanelModel, state: PanelState, width: number
 		[span("Settings", "accent", true), span(" · changes apply from the next request and are saved in this session", "muted")],
 		...settings.summary.map((line) => text(line, "dim")),
 		...(settings.warning ? [text(`⚠ ${settings.warning}`, "warning")] : []),
+		// The server's own record, also when the TUI's settings check passed.
+		...(model.steeringError && !settings.warning?.includes(model.steeringError)
+			? [text(`⚠ steering document not loaded, the session runs without it: ${model.steeringError}`, "warning")]
+			: []),
 		[],
 	], width);
 	if (settings.rows.length === 0) {

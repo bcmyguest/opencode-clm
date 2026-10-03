@@ -123,6 +123,8 @@ export interface PanelModel {
 	budgetInfo?: BudgetView;
 	calibration?: { factor: number; samples: number };
 	steering?: { name: string; hash: string; path: string };
+	/** snapshot.json `steeringError`: the configured steering document did not load. */
+	steeringError?: string;
 	mirrorPath: string;
 	/** Problems reading the files (corrupt JSON, skipped event lines). */
 	warnings: string[];
@@ -550,5 +552,6 @@ export function buildPanelModel(files: SessionFiles, extras: PanelExtras = {}): 
 	if (steering && typeof steering.name === "string" && typeof steering.hash === "string" && typeof steering.path === "string") {
 		model.steering = { name: steering.name, hash: steering.hash, path: steering.path };
 	}
+	if (typeof snapshot?.steeringError === "string" && snapshot.steeringError !== "") model.steeringError = snapshot.steeringError;
 	return model;
 }

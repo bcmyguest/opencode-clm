@@ -33,6 +33,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { tool, type Hooks, type Plugin, type PluginInput, type PluginOptions } from "@opencode-ai/plugin";
 
 import { ClmSession } from "./src/clm.ts";
+import { MirrorDirectoryError } from "./src/mirror-store.ts";
 import { buildCompactPrompt, loadCompactPrompt } from "./src/compact.ts";
 import { continuityTools } from "./src/continuity.ts";
 import { replaceInPlace, type OcMessage } from "./src/opencode.ts";
@@ -46,7 +47,7 @@ import { buildPanelModel } from "./src/panel/model.ts";
 import { panelPageText } from "./src/panel/text.ts";
 import { readSessionDirectory, sessionDirectory } from "./src/session-files.ts";
 import { fallbackBudget, settingsView } from "./src/tui/data.ts";
-import { resolveSettings, SKILLS_DIR, type ClmSettings } from "./src/settings.ts";
+import { defaultMirrorDir, resolveSettings, SKILLS_DIR, type ClmSettings } from "./src/settings.ts";
 import { loadSteeringDocument, steeringPromptSection, type SteeringDocument } from "./src/steering.ts";
 
 export const PLUGIN_ID = "opencode-clm";
@@ -182,11 +183,39 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		}
 	};
 
+	/** The project's default mirror parent, inside the project (no external-directory prompts). */
+	const projectMirrorDir = defaultMirrorDir(input.directory);
+	/** Sessions already told that CLM could not start for them (one error toast each). */
+	const openFailures = new Set<string>();
+
+	/**
+	 * Opens a session in `mirrorDir`. Only a failure to create or use the session directory
+	 * (`MirrorDirectoryError`) is handled here; any other error propagates as before.
+	 * - An explicitly configured `mirrorDir` that fails: the session uses the project default
+	 *   `.opencode/clm` instead, and a toast names both. Inside the project the model's tools
+	 *   reach it without an `external_directory` permission prompt.
+	 * - The default itself fails: the request goes out with the raw history (the transform
+	 *   hook fails open), and the user gets one error toast for the session.
+	 */
+	const openSession = async (id: string): Promise<ClmSession> => {
+		try {
+			return await ClmSession.open(id, settings, { steering });
+		} catch (error) {
+			if (!(error instanceof MirrorDirectoryError) || settings.mirrorDir === projectMirrorDir) throw error;
+			const clm = await ClmSession.open(id, { ...settings, mirrorDir: projectMirrorDir }, { steering });
+			const message = `could not use the configured mirrorDir ${settings.mirrorDir} (${describe(error.cause)}); the files of session ${id} are in ${clm.store.directory} instead.`;
+			log("warn", message);
+			toast(message, "warning");
+			await clm.log({ event: "mirror-dir-fallback", configured: settings.mirrorDir, used: projectMirrorDir, reason: describe(error.cause) });
+			return clm;
+		}
+	};
+
 	const session = (sessionID: string): Promise<ClmSession> => {
 		const id = checkSessionID(sessionID);
 		let existing = sessions.get(id);
 		if (!existing) {
-			existing = ClmSession.open(id, settings, { steering }).then(async (clm) => {
+			existing = openSession(id).then(async (clm) => {
 				if (clm.loadWarning) toast(`state reset for ${id}: ${clm.loadWarning}`, "warning");
 				return clm;
 			});
@@ -316,7 +345,9 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	async function channelRequest(request: ChannelRequest): Promise<Omit<ChannelReply, "v" | "id">> {
 		const sessionID = checkSessionID(request.session);
 		if (!(await knownSession(sessionID))) throw new Error(`no session ${sessionID} on this server`);
-		const directory = sessionDirectory(settings.mirrorDir, sessionID);
+		// A session that fell back from the configured mirrorDir (openSession) lives elsewhere.
+		const opened = await sessions.get(sessionID)?.catch(() => undefined);
+		const directory = opened?.store.directory ?? sessionDirectory(settings.mirrorDir, sessionID);
 		switch (request.op) {
 			case "locate":
 				return { ok: true, text: "", directory, root: input.directory };
@@ -452,7 +483,12 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			try {
 				clm = await session(sessionID);
 			} catch (error) {
-				toast(`not active for session ${sessionID}: ${describe(error)}`, "error");
+				// The request goes out with the raw history; say so once per session, not per step.
+				if (!openFailures.has(sessionID)) {
+					openFailures.add(sessionID);
+					toast(`not active for session ${sessionID}, requests carry the raw history: ${describe(error)}`, "error");
+					log("error", `not active for session ${sessionID}: ${describe(error)}`);
+				}
 				return;
 			}
 			// Stamp (and detect a fork) once per process, only while CLM edits this session:
@@ -472,6 +508,10 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				if (result.alert) {
 					toast(result.alert, "warning");
 					log("warn", result.alert);
+				}
+				for (const error of result.errors ?? []) {
+					toast(error, "error");
+					log("error", `${sessionID}: ${error}`);
 				}
 			} catch (error) {
 				// Fail open: the request goes out with the raw history.

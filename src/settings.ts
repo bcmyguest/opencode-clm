@@ -54,6 +54,11 @@ function pick(options: Record<string, unknown>, key: string, env: Env, envKey: s
 }
 
 /** `32000`, `32k`, `1.5m`, `32_000`, `32,000`. */
+/** The default `mirrorDir`: `<project>/.opencode/clm`, inside the project, so the model's tools reach it without an external-directory permission. */
+export function defaultMirrorDir(directory: string): string {
+	return join(directory, ".opencode", "clm");
+}
+
 export function parseTokens(value: unknown, name: string): number {
 	const text = String(value).trim().toLowerCase().replace(/[_,]/g, "");
 	const match = /^(\d+(?:\.\d+)?)(k|m)?$/.exec(text);
@@ -176,7 +181,7 @@ export function resolveSettings(options: Record<string, unknown> = {}, env: Env 
 		gate: gateRaw === undefined ? "fit" : withName("gate (CLM_EDIT_GATE)", () => toEditGate(gateRaw)),
 		guard,
 		observationCap,
-		mirrorDir: dirRaw === undefined ? join(directory, ".opencode", "clm") : resolve(directory, String(dirRaw)),
+		mirrorDir: dirRaw === undefined ? defaultMirrorDir(directory) : resolve(directory, String(dirRaw)),
 		steeringPath,
 		compactPromptPath,
 		estimateFactor,

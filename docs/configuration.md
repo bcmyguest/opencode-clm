@@ -80,5 +80,8 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
   server never fails a request over `overrides.json`: it skips bad entries and shows a
   `settings warning:` line in `/clm status`.
 - **Mirror directory.** The default lies inside the project; the plugin writes a
-  `.gitignore` of `*` into it when it creates it. The TUI panel reads `mirrorDir` from the
+  `.gitignore` of `*` into it when it creates it. When a configured `mirrorDir`
+  cannot be created, the session uses the project default `.opencode/clm` instead and a
+  toast names both; when the default fails too, requests carry the raw history and one
+  error toast says so. The TUI panel reads `mirrorDir` from the
   server plugin's entry in `opencode.json`, falling back to its own `tui.json` entry.
