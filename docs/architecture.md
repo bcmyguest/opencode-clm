@@ -1,170 +1,511 @@
-# Architecture
+# opencode-clm architecture
 
-The system as implemented, for OpenCode 1.18.34. [PORTING.md](../PORTING.md) maps each
-module to its pi-clm source.
+opencode-clm gives an OpenCode agent write access to its own context. The context the model
+will see on its next request is mirrored to a file; the model edits that file with ordinary
+tools; the plugin validates the result and uses it for the next request. OpenCode's stored
+session history is never rewritten.
 
-## 1. Two plugins in one package
+This document describes the system as implemented for OpenCode 1.18.34; §11 holds the
+design notes and known limitations.
+
+## 1. Three representations of one conversation
+
+```text
+OpenCode session history (raw, { info, parts } messages)
+             │  experimental.chat.messages.transform
+             ▼
+Effective context — the messages actually sent to the provider
+             │  rendered before every request
+             ▼
+Mirror file  — LIVE_CONTEXT.md, model-editable
+             │  parsed and validated at the start of the next transform
+             ▼
+Revision checkpoint — persisted in the session's state.json
+```
+
+- **Raw history** is the source of truth and audit log. The plugin never deletes or
+  rewrites it.
+- **Effective context** is what the model sees. It equals the pinned task (everything up
+  to and including the first user message), then the latest accepted revision plus every
+  raw message appended since that revision was anchored.
+- **Mirror** is a text rendering of the effective context after the pinned task. Editing
+  it is the only way the model changes its context. It is not byte-for-byte the provider
+  input: the system prompt, the pinned task, the continuity note and the one-request
+  notices are added outside it.
+- **Revision checkpoint** records an accepted edit: which raw prefix it replaces (by
+  count, OpenCode message ids and SHA-256 digest), the resulting messages, size estimates,
+  and a per-message edit trace.
+
+`src/opencode.ts` converts between OpenCode's messages and the flat message list the core
+works on. OpenCode keeps a tool call and its result in one `tool` part; `flatten` splits
+each assistant message into an assistant message with tool calls followed by one
+`toolResult` message per call, so every tool result is its own mirror block. `flatten`
+follows OpenCode's own `toModelMessages` rules (skipped failed replies, the
+"[Old tool result content cleared]" text for pruned output, and so on). `unflatten` maps
+each untouched block back to the current raw OpenCode object, so untouched messages reach
+the provider exactly as OpenCode would send them.
+
+## 2. Request lifecycle
+
+```text
+messages.transform   0. re-read overrides.json if it changed; activate the settings
+                     1. commit: read the mirror; changed → parse, gate, persist a new revision
+                     2. measure the newest provider-reported input (calibration, fixed overhead)
+                     3. effective = checkpoint.messages ++ raw suffix; rebase after a
+                        compaction; drop the checkpoint on any other prefix mismatch
+                     4. hide reasoning if configured; observation cap; overflow guard
+                     5. render effective → mirror file (atomic write)
+                     6. append notices: last edit outcome, reset, overflow, continuity size,
+                        budget reminder
+                     7. write pinned ++ effective ++ continuity ++ notices into OpenCode's
+                        array in place; replace snapshot.json; log a `request` event
+system.transform     append the editing protocol + mirror path (+ steering) to the system prompt
+provider request     the model sees the effective context
+assistant step       the model may rewrite the mirror with bash/edit/write
+tool.execute.after   a tool call that wrote the mirror gets a dry-run verdict appended
+```
+
+OpenCode has no end-of-turn hook, so the edit the model made during step *k* is committed
+at the start of step *k+1*'s transform, right before the request it affects. The file
+content at that moment wins.
+
+Other hooks: `tool.definition` records each tool's schema size; `experimental.session.compacting`
+and `experimental.compaction.autocontinue` and the `session.compacted` event handle
+OpenCode's compaction (§6); `command.execute.before` answers `/clm` and `/clm-compact`;
+`config` registers both commands and the `clm-context` skill directory. The
+`clm_annotate` and `clm_recall` tools manage continuity annotations.
+
+`experimental.chat.messages.transform` receives `{}` as input: the session id comes from
+`messages[0].info.sessionID`, and the result must be written into the array in place.
+OpenCode calls it before `experimental.chat.system.transform` for the same request, so the
+system-prompt size and model limits reach the session one request late. The system
+transform skips OpenCode's helper agents (title, summary, compaction). Transforms of one
+session run one at a time. A transform that throws fails open: the request goes out with
+the raw history and a toast reports the error.
+
+## 3. Mirror format
+
+```text
+[[LIVE_CONTEXT version=1 revision=3 document=<nonce> baseline=<digest>]]
+
+# Edit bodies or delete editable CTX_TURN blocks. Keep metadata/header lines intact.
+
+[[CTX_TURN document=<nonce> index=1 role=assistant id=1-b1ba26e534cb protected=false]]
+I will count the lines of both commands.
+
+[[CTX_TURN document=<nonce> index=2 role=notes id=new-tracker protected=false]]
+TASK TRACKER
+- ...
+```
+
+- Every structural line carries the document nonce. It is derived from the session id, a
+  random value drawn when the session opens in this process, the active checkpoint's
+  source digest and the revision number, so it is **stable between accepted edits** even
+  as new messages arrive: ids a model reads on one call are valid on the next, and a
+  metadata line copied from an earlier read is accepted (only version, revision and nonce
+  must match; the ever-changing `baseline=` digest is informational). Because the nonce is
+  stable, lines inside bodies that start with `[[CTX_TURN ` or `[[LIVE_CONTEXT ` are
+  escaped with a leading backslash at render time and restored when an edited body is
+  turned back into a message; a `head LIVE_CONTEXT.md` tool result can therefore never
+  inject blocks.
+- `id` binds a block to a specific rendered message. `index` is descriptive.
+- `protected` is always `false`: every block is editable. The task statement is protected
+  by staying outside the mirror instead.
+- A block whose id starts with `new-` inserts a message. Any role label is accepted.
+- With the `reasoning` setting off, reasoning is hidden from the mirror view only; the
+  digest a checkpoint stores still covers it.
+
+## 4. Applying an edit
+
+The apply step is identity-preserving: rendering and re-applying an untouched mirror
+yields the original messages, so the plugin's own serialization never counts as change.
+
+| block state                         | result                                                        |
+|-------------------------------------|---------------------------------------------------------------|
+| unchanged                           | original OpenCode message reused (parts, files, tool calls, reasoning intact) |
+| assistant body edited (role kept)   | text-only assistant message; its tool calls are dropped and their results become notes |
+| user body edited (role kept)        | user message with the new text                                 |
+| tool result body edited (role kept) | the tool part keeps its call; only the output text changes     |
+| a block whose role label was changed | a note carrying the text                                      |
+| new block (`id=new-*`), any role — including `assistant` or `system` | a note labelled with the requested role; reaches the provider as synthetic user text, never as an assistant or system role |
+| removed                             | omitted                                                        |
+| text outside any block              | becomes a note at that position                                |
+
+Notes are `clm-note` messages in the core and synthetic user text parts in the request.
+
+Blocks are emitted in document order, so reordering is an edit like any other.
+
+**Tool-call group repair.** OpenCode allows parallel tool calls. An assistant message keeps
+its structured tool calls only if every retained call has its tool result retained; a tool
+result is kept only if its call is retained. Broken groups are flattened to notes rather
+than rejecting the edit.
+
+## 5. Validation
+
+An edit is accepted when:
+
+1. the metadata line matches the rendered one (version, revision and nonce);
+2. every header carries the current nonce and refers to a rendered id or a `new-` id, with
+   no duplicates and no malformed current headers;
+3. the lowered message sequence has legal tool-call structure after repair;
+4. the edit gate passes (below);
+5. the revision can be serialized as a checkpoint and saved to `state.json`.
+
+A file with no current block headers is accepted as a whole-context rewrite: every block is
+removed and the text becomes one `notes` block after the pinned task. A file with no
+current headers but with headers or a metadata line from another copy of the mirror is an
+old copy written back, and is rejected. Metadata rejections quote the exact first line
+expected.
+
+**Edit gate.** The `gate` setting decides whether an edit that grows the context is
+accepted. `fit` (the default) accepts growth while the edited context stays within its
+share of budget − reserve (the system prompt, tool schemas, pinned task and continuity
+note take theirs first). `shrink` rejects any growth. `none` performs no size check, as
+pi-clm's CLM mode does. Under every gate, same-size rewrites, insertion, reordering,
+deletion and edits to any block are valid.
+
+Persistence completes before a revision is activated; a failed write leaves the previous
+revision in force. An edit made against a render that is no longer current (after
+`/clm reset`, `/clm on|off`, or a process restart) is dropped without a notice: the next
+render overwrites it.
+
+## 6. Persistence, revert and compaction
+
+Each session's state lives in `state.json` in its session directory (§9): the enabled
+flag, the revision counter, the active checkpoint, the last outcome and the budget check.
+Every change goes through one save queue: the next state is computed, saved atomically,
+then activated. Every accepted revision also writes `revisions/rN.md` (the mirror text)
+and `revisions/rN.json` (each row's text before and after). Continuity annotations are
+lines in `annotations.jsonl`; every request, edit, rejection, reset, compaction, notice and
+error is a line in `events.jsonl`.
+
+- Session open (start or resume): `state.json` is loaded, and the checkpoint applies only
+  if its raw prefix still validates. An unusable state file starts the session clean with
+  a toast.
+- **Anchor.** The digest covers the flattened raw prefix with tool-result content left
+  out, plus each message's OpenCode id. OpenCode's prune (which clears old tool output in
+  place) therefore does not discard a checkpoint; a revert removes messages, changes the
+  ids, and drops it.
+- Any other prefix mismatch drops the revision: the next request carries the stored
+  history, and the model gets a notice. Two consecutive drops add a warning that edits
+  keep being dropped until the start of the history stops changing.
+- **OpenCode compaction.** `experimental.session.compacting` marks the session and appends
+  an instruction plus the active annotations to the compaction prompt, asking the
+  summarizer to copy them word for word. The compaction's own `messages.transform` call
+  then applies the accepted revision to the head slice it summarizes, so the summary reads
+  the model's edited context, not the raw history; nothing is committed, rendered or
+  reset in that call. When OpenCode reports a finished compaction (`session.compacted` or
+  `experimental.compaction.autocontinue`), the next transform rebases on the summary: the
+  revision number moves on, the checkpoint goes, and the model gets no drop note.
+
+A checkpoint anchors to the digest of the messages this plugin receives. OpenCode runs a
+hook in each plugin in turn, built-in plugins first, then the configured ones in load
+order, all on the same output; a plugin whose `messages.transform` runs earlier and varies
+its output between calls invalidates the checkpoint.
+
+## 7. Budget and reminders
+
+`src/budget.ts`. The budget is the `budget` setting (`CLM_BUDGET`, default 32,000, or
+`window` for the model's context window), capped by the model window minus its output
+limit; the reserve (default 2,048) is generation headroom. Reminders fire at 25/50/75% of
+the budget (`remindAt`) and at budget − reserve, once per tier, re-arming when usage drops.
+
+Two numbers are measured and always labelled separately:
+
+- **estimated next request** — system prompt + tool schemas + pinned task + effective
+  messages + continuity + notices, using chars/4 × `estimateFactor` × the calibration
+  factor;
+- **observed previous request** — input + cache read + cache write tokens of the newest
+  successful assistant message (the provider's own count). It is one call late and is
+  marked stale after an accepted edit, when it no longer describes the current context.
+
+The estimate alone governs reminders; the observed count is shown for reference.
+Reminders are advisory; the plugin never rolls back or refuses a request and never
+re-executes a tool.
+
+**Fixed overhead.** Once per session the plugin measures the system prompt and tool
+schemas as the provider counted them: the previous request's provider count minus its
+conversation estimate, taken from a request whose conversation is at most a quarter of
+that count. When the provider reports no usage, the hook-measured sizes stand in until a
+provider measurement replaces them. If budget − reserve − overhead leaves less than an
+8,000-token working margin, the session's effective budget is raised to overhead + margin
++ reserve (capped by the model window), with a one-time toast and notice. The overhead is
+stored in `state.json`, so the raise survives a restart.
+
+## 7a. Overflow guard
+
+`src/overflow.ts`. Applied in the transform after the observation cap and before
+rendering, when the estimated request (fixed overhead + pinned task + continuity + notices
++ effective messages) exceeds budget − reserve. Unlike pi-clm there is no
+`window − 4096` ceiling: that one models a Pi `max_tokens` clamp OpenCode does not have.
+The model's output limit is subtracted from the window instead (§7).
+
+Tool results in the raw suffix (after the last accepted edit) are replaced, **oldest
+first**, one at a time, by a note of the same `toolResult` role and `toolCallId` — so
+tool-call pairing stays legal — until the estimate fits or no candidates remain. Oldest
+first is essential: the result the model just requested (typically a re-read of a withheld
+file) must stay visible, otherwise withholding becomes a loop. Each note states the tool,
+call id, approximate tokens, the limit, and the path of a file under
+`<session dir>/withheld/` holding the full text (uncapped, when the observation cap cut
+it). Notes are cached per source message (identical objects across calls, never withheld
+again), raw history is untouched, tools are never re-run, and a
+`[CLM BUDGET] Overflow guard …` notice lists what happened. The model's accepted
+projection is never withheld from; if the estimate is still over after all candidates,
+the notice says so. `guard: off` (`CLM_OVERFLOW`) disables the guard.
+
+**Calibration.** `EstimateCalibrator` (budget.ts) records the raw estimate of every
+request sent and, when the provider reports that request's size, updates a factor
+(≥ 1, EMA, capped at 4) applied to all subsequent estimates — reminders, guard, gate and
+notices. It learns only from same-scope estimates: with the overhead measured, the
+conversation against the provider count minus the overhead; otherwise only once both hook
+sizes are known. It restarts at 1 when the provider-measured overhead arrives, and with
+each process. `estimateFactor` (`CLM_ESTIMATE_FACTOR`, 1–4) is a separate fixed multiplier
+on chars/4.
+
+## 7b. Steering and observation cap
+
+`src/steering.ts`: an optional markdown document (`CLM_STEERING`; `house` names the
+shipped `steering/house-brief.md`) appended to the system prompt after the protocol
+section as `## Context-management guidance (<name>)`. The base document is loaded when the
+plugin loads (a missing or empty file fails the plugin with its path); a per-session
+change is loaded when the setting is applied. It is hashed (SHA-256 prefix shown in
+`/clm status`) and never part of the mirror. This is the only sanctioned channel for
+strategy; the protocol text stays protocol-only.
+
+`src/observation.ts`: an optional per-tool-result character cap (`CLM_OBSERVATION_CAP`)
+applied to the *effective* messages in the transform, after the reasoning view and before
+the overflow guard. Oversized results keep a head (80 % by default; `10000:0.5` is the
+paper's 5k+5k) and a tail with an omission marker stating how much was cut; the minimum
+cap is 200 characters. Capped objects are cached per source message so repeated
+transforms yield identical objects; the stored tool part is untouched, and an unchanged
+capped block is persisted in its capped form when an edit is accepted.
+
+## 7c. Settings
+
+`src/settings.ts` resolves the plugin options (the `plugin` entry in `opencode.json`), then
+environment variables, then defaults, once at load; an invalid value fails the plugin with
+the setting's name. `src/settings-table.ts` is the one table of the ten settings a session
+can change — editing, budget, reserve, reminders, edit gate, overflow guard, observation
+cap, steering, compact prompt, reasoning — with each one's label, description, choices,
+formatting and parsing; values parse with the same functions as options and environment
+variables. `enabled`, `mirrorDir`, `estimateFactor`, `skill`, `commands` and
+`dumpRequests` are load-time only.
+
+A change from the panel, `/clm config <setting> <value>` or `/clm on|off` goes through
+`changeSetting` (`src/overrides.ts`): parse, merge, drop values equal to the base, stage
+(resolve the policies, load a steering document or compact prompt strictly), then write
+`overrides.json` atomically as `{ "version": 1, "overrides": { … } }`. A change that fails
+any step is reported and not written, so it never takes effect. The base is the server's
+load-time settings; for `editing` it is `state.json`'s `enabled`. Before each transform,
+system transform and `/clm` command the server compares the file's mtime, size and inode
+with the last read; on a change it re-reads and activates it from the next request. A
+stored value that is malformed is dropped with a warning in `/clm status`; a steering
+document that no longer loads leaves the session protocol-only, also with a warning.
+`/clm config reset` writes an empty override set. Overrides are per session.
+
+## 7d. Model-driven compaction (`/clm-compact`)
+
+`src/compact.ts`. `/clm-compact [instructions]` is an OpenCode command, so the prompt's
+autocomplete lists it beside `/compact`. `command.execute.before` replaces its template
+with a fixed prompt, sent as an ordinary user message: compact the live context by editing
+the mirror, keeping the task, decisions, open items and exact values, and dropping used
+tool output. Text after the command is appended as "Also: …". The model decides how much
+to remove; its edit is validated and committed before the next request like any other,
+and the plugin removes nothing itself. (OpenCode's `/compact` instead summarizes the
+history with a separate model call, §6.) The size in the prompt is the latest estimate, 0
+before the first request. The `compact prompt` setting (`CLM_COMPACT_PROMPT`; `default` =
+built in) replaces the built-in text with a markdown template using `{{mirror}}`,
+`{{current}}`, `{{budget}}` and `{{instructions}}` (typed instructions are appended when
+the template has no `{{instructions}}`); the file is read on every use.
+
+## 8. Panel
 
 OpenCode runs server plugins and TUI plugins in separate runtimes and reads them from
-separate config lists.
+separate config lists, so the package ships two plugins:
 
 | target | entry | `package.json` | config list | does |
 |---|---|---|---|---|
 | server | `index.ts`, default export `{ id: "opencode-clm", server }` | `exports["./server"]` (and `"."`, `main`) | `plugin` in `opencode.json` | hooks, mirror, edits, budget, tools, `/clm` and `/clm-compact` commands |
 | TUI | `tui.ts`, default export `{ id: "opencode-clm", tui }` | `exports["./tui"]` | `plugin` in `tui.json` | the `/clm` panel, typed `/clm …` lines |
 
-The two talk only through the session directory: the server writes it, the TUI reads it.
-`@opentui/core` is an optional peer dependency; OpenCode provides it to TUI plugins at
-runtime. The TUI code uses no JSX, because OpenCode's Solid compile step skips
-`node_modules`; it builds opentui renderables directly.
+The two talk only through the session directory: the server writes it, the TUI reads it
+and writes only `overrides.json`. `@opentui/core` is an optional peer dependency; OpenCode
+provides it to TUI plugins at runtime. The TUI code uses no JSX, because OpenCode's Solid
+compile step skips `node_modules`; it builds opentui renderables directly.
 
-## 2. One request
+`/clm` opens the panel, a plugin route with its own key mode, so the host's prompt and key
+bindings are inactive while it is open; it never enters model context. `/clm <page>` opens
+a page directly. A key interceptor at priority 100 sees Enter before autocomplete and
+prompt submit: a prompt line matching `/clm…` is handled in the TUI and the prompt is
+cleared (a usage error keeps the text so it can be fixed); only `/clm reset` reaches the
+server, because it rewrites `state.json`. When the config's `/clm` is not this package's
+(a user-defined command, or `commands: false`), the intercept lets every line through.
+Without the TUI (`opencode run`, a bare server), the server's `/clm` command returns the
+same pages and `/clm status` as text. Four pages:
 
-OpenCode calls `experimental.chat.messages.transform` before every model request. For the
-session, `ClmSession` (`src/clm.ts`) then:
+- **overview** — a bar chart of the size of every request in the session (one column per
+  request), the budget as a dashed line, requests followed by an accepted edit marked, and
+  the list of edit, reset and compaction points. It opens on **now** (the latest request);
+  `← →` step through the points and back to now. `z` cycles the x axis (shown as all /
+  detail / turns): `fit` (the whole session bucketed to the width; the default),
+  `requests` (one column per request, panning; skipped when fit already shows one request
+  per column) and `turns` (one column per user turn). Edit markers sit above their bar
+  (`▿`, `▼` selected, or a count when several edits share a column); user turns are `•`
+  landmarks on the baseline. The list is collapsed (`▸`) except the selected row (`▾`) and
+  shows a window around the selection (`⋯ N earlier` / `⋯ N later`).
+- **input** — the fraction of the raw history the model currently sees and the effective
+  message list, from `snapshot.json`.
+- **edits** — per-revision, per-message rows from `revisions/rN.json`; `Enter` expands a
+  row into a side-by-side diff (`src/panel/diff.ts`: line diff with word-level emphasis
+  inside changed pairs, unified `-`/`+` below 60 columns). The diff runs on the full text;
+  the display is bounded (400 rows for edited messages, 60 for removed or added, 2,000
+  characters per line) with an explicit "diff preview truncated" row.
+- **settings** — sizes, the guard limit and the steering document above the ten settings
+  of §7c: `Enter` cycles a setting's choices or opens a text prompt; rejected values show a
+  warning and keep the value in effect.
 
-1. re-reads `overrides.json` if it changed and activates the new settings;
-2. commits the mirror if the model changed it (parse, gate, new revision);
-3. measures the newest provider-reported input size (calibration, and the fixed overhead
-   until it is measured);
-4. applies the active checkpoint, or drops it when the stored prefix no longer matches,
-   or rebases after a compaction;
-5. strips reasoning if configured, applies the observation cap and the overflow guard;
-6. renders the mirror, computes the budget reading and queues notices;
-7. writes the request back into OpenCode's array in place, replaces `snapshot.json`, and
-   logs a `request` event.
+`r` reloads the files; `q` or Esc closes. Colors use OpenCode theme names: bars
+`textMuted`, edit events `markdownLink`, `warning` for the budget line and rejected edits,
+`diffAdded`/`diffRemoved` for diffs.
 
-`experimental.chat.system.transform` adds the protocol section and steering document;
-`tool.definition` records tool schema sizes; `tool.execute.after` appends the edit verdict
-to tool output; `experimental.session.compacting` feeds the revision and annotations into
-OpenCode's compaction; `command.execute.before` answers `/clm` and `/clm-compact`.
+`buildPanelModel` (`src/panel/model.ts`) builds the panel from the session files alone:
+points from `request` events (a request's size is the next request's `observedPrevious`
+unless that came from the same message as its own, or for the newest the host's count of a
+reply completed after it, else the estimate), markers from `accepted`, `rejected`,
+`reset`, `projection-reset` and `compacted` events, revisions from `revisions/rN.json`,
+input from `snapshot.json`, and the budget recomputed with `budgetFit`. `renderPanel`
+draws it as lines of styled spans; the opentui adapter maps tones to the theme.
+`src/session-files.ts` reads the directory: missing files are normal, torn lines are
+skipped, revision files are cached by mtime and size.
 
-## 3. Session files
+## 9. Storage and safety
 
-Each session has a directory `<mirrorDir>/clm-<session id>/` (mode 0700; files 0600):
+- Session directory: `<mirrorDir>/clm-<session id>/`, where `mirrorDir` defaults to
+  `.opencode/clm` in the project (`CLM_MIRROR_DIR`). The parent gets a `.gitignore` of `*`;
+  directories are `0700`, files `0600`, writes are atomic temp-file-plus-rename. A session
+  directory that is a symlink or owned by another user is refused, as is a session id
+  containing `/`, `\` or `..`. Directories untouched for seven days are swept when another
+  session opens.
 
 | file | written by | content |
 |---|---|---|
 | `LIVE_CONTEXT.md` | server | the mirror |
-| `state.json` | server | enabled flag (`/clm on|off` before 0.2.0; from 0.2.0 the `editing` override wins), revision, active checkpoint, last outcome, measured fixed overhead and budget decision |
+| `state.json` | server | enabled flag, revision, active checkpoint, last outcome, measured fixed overhead and budget decision |
 | `annotations.jsonl` | server | continuity annotations |
-| `events.jsonl` | server | one JSON line per request, edit, rejection, reset, compaction, notice and error; from 0.2.0, `request` events also carry `users` (user messages in the history) and `observedMessage` (the message that reported `observedPrevious`) |
+| `events.jsonl` | server | one JSON line per request, edit, rejection, reset, compaction, notice and error |
 | `revisions/rN.md` | server | the mirror text of each accepted revision |
-| `revisions/rN.json` | server | each accepted revision row by row (kind, source and output index, role, before/after roles when they differ, tokens, and the full text: `before` and `after`, or one `text` for an unchanged row), written at accept; 0.2.0 on |
-| `snapshot.json` | server | replaced atomically on every request: request number, revision, enabled, configured budget, reserve and guard limit, calibration, steering, sizes, the effective input with a preview (≤ 120 characters) per message, and `base`: the server's base settings in `overrides.json` form; 0.2.0 on |
-| `overrides.json` | TUI and server | per-session setting changes, `{ "version": 1, "overrides": { … } }`, only values that differ from the base; written atomically by `/clm config`, `/clm on|off` and the settings page; 0.2.0 on |
+| `revisions/rN.json` | server | each accepted revision row by row: kind, indexes, roles, tokens, text before and after |
+| `snapshot.json` | server | replaced on every request: sizes, budget, calibration, steering, the effective input with a preview per message, and the server's base settings |
+| `overrides.json` | TUI and server | per-session setting changes (§7c) |
 | `withheld/` | server | tool outputs held back by the overflow guard |
 | `requests/nN.json` | server | transformed requests, with `dumpRequests` only |
 
-The plugin deletes session directories untouched for 7 days when it opens another session.
-`src/session-files.ts` reads the directory for the panel: missing files are normal (a 0.1
-session has only the server's 0.1 files), torn lines are skipped, revision files are
-cached by mtime and size.
+- The session directory contains conversation data and should be treated as sensitive
+  local data.
+- Model-editable working memory is a prompt-injection surface: text that reaches the
+  context can induce the model to rewrite its own constraints. opencode-clm keeps the real
+  system prompt and the task statement outside the mirror and lowers every authored role
+  to non-authoritative text, but it does not defend against a model that chooses to drop
+  important context.
+- `opencode attach` to a remote server: the session files are not local, so the panel
+  shows no data.
 
-## 4. Module map
+## 10. Module map
 
-| module | role |
-|---|---|
-| `index.ts` | server entry: hook registration, commands, tools, skill path |
-| `tui.ts` | TUI entry |
-| `src/clm.ts` | `ClmSession`: the per-request pipeline, state queue, events |
-| `src/opencode.ts` | OpenCode `{ info, parts }` messages ⇄ flat messages |
-| `src/context-document.ts` | mirror render, parse and apply; edit traces |
-| `src/policy.ts` | edit gate (`fit`, `shrink`, `none`) |
-| `src/projection.ts` | checkpoints: digest, prefix validation, projection |
-| `src/state.ts` | `state.json` shape, validation, atomic save |
-| `src/mirror-store.ts` | session directory, atomic mirror writes, stale-directory sweep |
-| `src/mirror-guard.ts` | classifies tool calls that touch the mirror |
-| `src/budget.ts` | budget resolution, tiers, notices, `budgetFit`, calibration |
-| `src/overflow.ts` | overflow guard |
-| `src/observation.ts` | observation cap |
-| `src/continuity.ts` | annotations and recall |
-| `src/compact.ts` | `/clm-compact` prompt |
-| `src/steering.ts` | steering document load |
-| `src/presentation.ts` | system-prompt protocol section, status text |
-| `src/settings.ts` | options → env → defaults |
-| `src/settings-table.ts` | the ten `/clm config` settings: names, aliases, choices, format, parse; merge, sanitize, compare overrides |
-| `src/overrides.ts` | `overrides.json` read, check (stage), change, reset |
-| `src/atomic.ts` | atomic 0600 writes (temp file + rename) |
-| `src/commands.ts` | command names and templates shared by server and TUI |
-| `src/session-files.ts` | read-only access to a session directory |
-| `src/panel/files.ts` | shapes of the session files |
-| `src/panel/model.ts` | `buildPanelModel`: timeline points and markers, revisions, input, budget |
-| `src/panel/timeline.ts` | chart layout (fit, requests, turns) and rendering |
-| `src/panel/diff.ts` | line and word diff, side-by-side and unified layouts |
-| `src/panel/lines.ts` | styled spans, width, wrap and clip |
-| `src/panel/view.ts` | `renderPanel`: frame and the four pages |
-| `src/panel/keys.ts` | key reducer |
-| `src/panel/command.ts` | `parseClmCommand` |
-| `src/tui/panel.ts` | opentui adapter: styled text, key layer, dialogs |
-| `src/tui/plugin.ts` | route, slash row, command handling, reloads |
-| `src/tui/intercept.ts` | the Enter intercept for typed `/clm …` lines |
-| `src/tui/data.ts` | host data: server options, newest usage, model limits, settings rows |
+```text
+index.ts                     server entry: hooks, commands, tools, skill path
+tui.ts                       TUI entry
+src/clm.ts                   ClmSession: the per-request pipeline, commit, state queue, events
+src/opencode.ts              OpenCode { info, parts } messages ⇄ flat messages
+src/context-document.ts      render / parse / apply, role lowering, tool-group repair
+src/policy.ts                edit gate (fit, shrink, none)
+src/projection.ts            digests, prefix validation, projection
+src/state.ts                 state.json shape, validation, atomic save
+src/continuity.ts            annotations, clm_annotate / clm_recall, continuity note
+src/mirror-store.ts          session directory, atomic mirror writes, stale-directory sweep
+src/mirror-guard.ts          classify tool calls that read or write the mirror
+src/budget.ts                budget resolution, tiers, notices, budgetFit, calibration
+src/observation.ts           per-tool-result cap in the effective context
+src/overflow.ts              overflow guard: withhold the oldest tool results above the limit
+src/steering.ts              steering document loading and prompt section
+steering/                    shipped steering documents (house-brief.md)
+src/presentation.ts          system-prompt protocol section, status text
+src/settings.ts              options → environment → defaults
+src/settings-table.ts        the ten per-session settings; merge, sanitize, compare overrides
+src/overrides.ts             overrides.json read, stage, change, reset
+src/compact.ts               /clm-compact prompt and template loading
+src/atomic.ts                atomic 0600 writes
+src/commands.ts              command names and templates shared by server and TUI
+src/session-files.ts         read-only access to a session directory
+src/panel/                   pure panel code: model, timeline, diff, view, keys, command parser
+src/tui/                     opentui adapter, route, Enter intercept, host data
+skills/clm-context/          editing recipes, registered as an OpenCode skill
+test/                        unit tests; test/e2e/ drives a real OpenCode against a mock provider
+```
 
 Everything under `src/panel/` is pure TypeScript with no opentui import and no file
 access; `src/tui/` is the only code that touches the TUI host.
 
-## 5. The panel
+## 11. Design notes
 
-`buildPanelModel` turns the session files into one model: points from `request` events
-(a request's size is the next request's `observedPrevious` unless that came from the same
-message as its own, or for the newest the host's count of a reply completed after it,
-else the estimate), markers from `accepted`, `rejected`,
-`reset`, `projection-reset` and `compacted` events, revisions from `revisions/rN.json`,
-input from `snapshot.json`, and the budget recomputed with `budgetFit`. `renderPanel` draws
-it as lines of styled spans (tones such as `muted`, `edit`, `diffAdd`); the adapter maps
-tones to the theme and sets one `StyledText`.
+**Validity is the plugin's job; strategy is the model's.** opencode-clm gives the model
+write access to the context of its next request, following
+[Context Language Models](https://github.com/RulinShao/Context-Language-Model). The plugin
+guarantees that the result is *valid* — it can be sent to a provider, raw history is never
+lost, revisions are atomic and attributable — and that the model is *budget-aware*: it
+always knows how much room it has. When to compact, what to keep, whether to grow a
+scratchpad or invent a role belongs to the model, or to a steering document the user
+chooses. The one size rule is the edit gate, which the user picks: `fit` (default) keeps an
+edit within the budget, `shrink` holds the line, `none` matches pi-clm's CLM mode.
 
-The panel is a plugin route with its own key mode, so the host's prompt and key bindings
-are inactive while it is open. A key interceptor at priority 100 sees Enter before
-autocomplete and prompt submit. For a prompt line matching `/clm…` it handles the line in
-the TUI and clears the prompt (a usage error keeps the text so it can be fixed); only
-`/clm reset` reaches the server command. When the config's `/clm` is not this package's (a
-user-defined command, or `commands: false`), the intercept lets every line through.
+**First user message pinned.** The task statement stays outside the mirror, so the model
+cannot delete it. pi-clm instead renders it as an editable block.
 
-Settings changes take one path from both sides: `changeSetting` (`src/overrides.ts`)
-parses the value, merges it, drops base-equal keys, checks the result strictly and writes
-`overrides.json`. The base is the server's: the server uses its load-time settings, and
-the TUI reads them from `snapshot.json` (`base`), falling back to its own resolution of
-the server options before the first 0.2.0 request; the `editing` base is `state.json`'s
-`enabled`. Before each transform, system transform and `/clm` command the server
-compares the file's mtime, size and inode with the last read; on a change it re-reads,
-sanitizes, checks non-strictly and activates the new settings, keeping a warning for
-`/clm status`.
+**Commit at the next request, last write wins.** The model may write the mirror as often
+as it likes during a step; only the content at the next transform is validated. The
+verdict reaches the model earlier, appended to the output of the tool call that wrote the
+mirror. Staleness is detected through the revision and nonce in the metadata line, not by
+counting writes.
 
-## 6. Design notes
+**Authored roles are lowered to non-authoritative text.** A `role=notes` block (or
+`system`, or any other label) becomes synthetic user text. The real system prompt is never
+part of the mirror. Trackers, ledgers and notes can therefore exist without inventing API
+roles or granting them authority.
 
-- **Commit at the next request.** OpenCode has no end-of-turn hook, so edits apply when the
-  next request starts. The verdict reaches the model earlier, appended to the tool output.
-- **First user message pinned.** The task statement stays outside the mirror, so the model
-  cannot delete it.
-- **One estimator.** chars/4 × `estimateFactor` × calibration, in tokens, for the gate,
-  tiers, guard and notices.
-- **Checkpoints survive prune.** The digest excludes tool-result content.
-- **Separate overrides file.** `state.json` belongs to the server's save queue; the TUI
-  never writes it.
+**One estimator, two size numbers.** chars/4 × `estimateFactor` × calibration, in tokens,
+serves the gate, tiers, guard and notices. The provider's own count arrives one request
+late. Both are shown and labelled, and the estimate is calibrated against the count (§7a).
 
-## 7. Known limitations
+**Checkpoints survive prune.** The digest excludes tool-result content (§6).
 
+**Separate overrides file.** `state.json` belongs to the server's save queue; the TUI
+never writes it.
+
+**The timeline is derived from the event log.** Context size per request and edit points
+come from `events.jsonl`, so the panel works on resume without extra persistence.
+
+### Known limitations
+
+- The step that performs an edit — the tool call that wrote the mirror, and its result —
+  stays in the context after the edit is accepted, until the model removes it in a later
+  edit.
+- Editing the body of an assistant message turns its tool results into notes; the
+  structured tool calls are not kept.
+- Accept and reject notices are shown to the model for one request only.
 - Model limits and the system-prompt size reach the plugin one request late. On the first
   request of a process the model window does not yet cap the budget and the estimate omits
   the system prompt; with `budget: "window"` that request has no budget reading.
   `/clm-compact` before the first request reports about 0 tokens.
-- Built-in tool descriptions are measured, but not their parameter schemas, so
-  calibration attributes that size to undercounting.
+- Built-in tool descriptions are measured, but not their parameter schemas; the
+  provider-measured overhead covers them once it arrives.
 - A checkpoint ignores changes to stored tool output inside the prefix it covers. An output
   rewritten by another plugin or an SDK client goes out with the new text, while the mirror
   and estimate keep the revision's.
-- The calibration factor lives in memory and restarts at 1 with each process.
+- The calibration factor and the render an edit is checked against live in memory: a
+  process restart resets the factor to 1 and drops an edit not yet committed.
 - A subagent (task) session gets its own mirror and state.
-- The fixed overhead is measured once per session.
-- Panel sizes rely on the next request's `observedPrevious`. For a session logged before
-  0.2.0 (no `observedMessage`), an equal count on consecutive requests is read as a
-  repeat after an errored reply, and the panel shows the estimate.
 - A setting changed while a request runs applies from the next request.
 - Duplicate `/clm` rows appear in autocomplete (the server command and the TUI slash row);
   Enter is handled by the TUI either way.
-- `opencode attach` to a remote server: the session files are not local, so the panel
-  shows no data.
-- Not ported from pi-clm: branch-aware restore, the `max_tokens` clamp lift, cancelling
-  Pi's own compaction, and the `oneToolPerTurn` and `sizeTrailer` switches.
+- Tool backends on another machine or in a container cannot see the mirror, and
+  `opencode attach` to a remote server shows no panel data (§9).
