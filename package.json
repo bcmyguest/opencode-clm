@@ -1,0 +1,28 @@
+{
+  "name": "opencode-clm",
+  "version": "0.1.0",
+  "description": "OpenCode plugin for Context Language Models: the model edits a file mirror of its own context, and the edited mirror becomes its next input.",
+  "type": "module",
+  "license": "MIT",
+  "author": "B Guest",
+  "homepage": "https://github.com/bcmyguest/opencode-clm#readme",
+  "bugs": { "url": "https://github.com/bcmyguest/opencode-clm/issues" },
+  "repository": { "type": "git", "url": "git+https://github.com/bcmyguest/opencode-clm.git" },
+  "keywords": ["opencode", "opencode-plugin", "context-management", "context-window", "context-language-models", "clm"],
+  "main": "./index.ts",
+  "exports": { ".": "./index.ts" },
+  "files": ["index.ts", "src/**/*.ts", "skills/**", "steering/**", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md"],
+  "engines": { "bun": ">=1.2", "opencode": ">=1.18" },
+  "publishConfig": { "access": "public" },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && bun test",
+    "test:e2e": "OPENCODE_CLM_E2E=1 bun test test/e2e"
+  },
+  "dependencies": { "@opencode-ai/plugin": "^1.18.34" },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,56 @@
+# git-cliff: Conventional Commits -> next semver and release notes.
+# prepare-release.yml reads `git-cliff --bumped-version`; release.yml feeds
+# `git-cliff --latest --strip header` to the GitHub Release body.
+# Locally: git-cliff --bumped-version; git-cliff --unreleased --strip header
+#
+# v0.1.0 is a single commit, `feat: initial release`; the first tag is
+# [bump].initial_tag. After a tag, a commit outside the convention lands under
+# "Other changes" and still bumps the patch version.
+[changelog]
+header = ""
+body = """
+{% if version %}## {{ version | trim_start_matches(pat="v") }}{% else %}## Unreleased{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+{%- if group is containing("Other changes") %}
+- {{ commit.raw_message | split(pat="\n") | first }} ({{ commit.id | truncate(length=7, end="") }})
+{%- else %}
+- {% if commit.breaking %}**BREAKING** {% endif %}{% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | split(pat="\n") | first | upper_first }} ({{ commit.id | truncate(length=7, end="") }})
+{%- endif %}
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+# Keep unconventional commits; the last parser files them under "Other changes".
+filter_unconventional = false
+split_commits = false
+# Group names carry a hidden numeric prefix so notes render in this order.
+commit_parsers = [
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactor" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^build", group = "<!-- 5 -->Build & Tooling" },
+  { message = "^ci", group = "<!-- 6 -->CI" },
+  { message = "^test", group = "<!-- 7 -->Tests" },
+  { message = "^revert", group = "<!-- 8 -->Reverts" },
+  { message = "^style", skip = true },
+  { message = "^chore", skip = true },
+  { message = ".*", group = "<!-- 9 -->Other changes" },
+]
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "v[0-9]*"
+sort_commits = "newest"
+
+[bump]
+initial_tag = "v0.1.0"
+# Below 1.0.0 a breaking change bumps minor, not major; feat bumps minor, fix patch.
+breaking_always_bump_major = false
+features_always_bump_minor = true

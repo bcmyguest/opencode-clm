@@ -1,0 +1,5 @@
+node_modules/
+.opencode/
+*.tgz
+.notes/
+PROGRESS.md

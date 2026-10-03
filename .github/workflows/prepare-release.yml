@@ -1,0 +1,78 @@
+name: Prepare release
+
+# Manual release. git-cliff derives the next version from Conventional Commits since
+# the last tag (feat -> minor, fix -> patch, `!`/BREAKING -> minor below 1.0.0, major
+# after), then this workflow bumps package.json, commits, tags and dispatches
+# release.yml. The first run tags v0.1.0, the version package.json already holds.
+#
+# A tag pushed with GITHUB_TOKEN does not trigger `on: push: tags`, so this workflow
+# dispatches release.yml itself.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute the next version only: no commit, tag or release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write # to dispatch release.yml
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Bump, tag, dispatch
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # git-cliff needs full history and tags
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: git-cliff
+
+      - name: Compute next version
+        id: ver
+        run: |
+          set -euo pipefail
+          tag=$(git-cliff --config cliff.toml --bumped-version)
+          if [ -z "$tag" ]; then echo "::error::git-cliff returned no version."; exit 1; fi
+          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "::error::No releasable commits since the last tag ($tag exists)."; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Next version: $tag (package.json: $(jq -r .version package.json))"
+          git-cliff --config cliff.toml --unreleased --tag "$tag" --strip header >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bump package.json, commit, tag, push
+        if: ${{ !inputs.dry_run }}
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "$(jq -r .version package.json)" != "$VERSION" ]; then
+            npm version "$VERSION" --no-git-tag-version
+            git add package.json
+            git commit -m "chore(release): $TAG"
+          fi
+          git tag -a "$TAG" -m "opencode-clm $TAG"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "$TAG"
+
+      - name: Dispatch release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: gh workflow run release.yml --ref "$TAG"

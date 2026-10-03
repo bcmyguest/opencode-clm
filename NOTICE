@@ -1,0 +1,41 @@
+opencode-clm
+Copyright (c) 2026 B Guest. MIT License (see LICENSE).
+
+This product includes software derived from pi-clm 1.0.0
+(https://github.com/lolipopshock/pi-clm, commit b84a9d7), MIT License,
+Copyright 2026 Emanuel Casco. pi-clm's license notice is reproduced in LICENSE.
+
+Derived from pi-clm (code and model-facing text, adapted for OpenCode):
+  index.ts                      pi-clm index.ts, src/index.ts (hooks, commands, tools)
+  src/budget.ts                 src/budget.ts (status line and budget notices)
+  src/clm.ts                    src/index.ts (context and turn_end handling)
+  src/compact.ts                src/compact.ts (compaction prompt, near verbatim)
+  src/context-document.ts       src/context-document.ts (rejection and receipt text)
+  src/continuity.ts             src/continuity.ts, annotate/recall tools in src/index.ts
+  src/mirror-guard.ts           src/mirror-guard.ts
+  src/mirror-store.ts           src/mirror-store.ts
+  src/observation.ts            src/observation.ts
+  src/overflow.ts               src/overflow.ts
+  src/projection.ts             src/projection.ts
+  src/settings.ts               src/settings.ts
+  src/state.ts                  src/state.ts
+  src/steering.ts               src/steering.ts
+  src/types.ts                  src/types.ts
+  steering/house-brief.md       steering/house-brief.md (byte-identical copy)
+  skills/clm-context/SKILL.md   src/skills/live-context/SKILL.md
+
+Written for this package (structure follows pi-clm, text does not):
+  src/presentation.ts (system-prompt protocol section and /clm status text),
+  src/policy.ts (edit gate and its refusal note), src/opencode.ts.
+
+Context Language Models
+  Paper: arXiv 2609.37725. Research code:
+  https://github.com/facebookresearch/context-language-models, licensed CC BY-NC 4.0.
+  opencode-clm is not licensed under CC BY-NC and is not endorsed by its authors. A
+  normalized 5-gram comparison of every model-facing string here against that
+  repository found no shared span longer than 6 tokens (generic phrases and URLs).
+  Two design choices follow its harness: the fit/shrink edit gate and the default
+  25/50/75% reminder steps. pi-clm's skill guidance on edit cost (batch edits, mind the
+  tail below an edit, write detailed summaries), carried into
+  skills/clm-context/SKILL.md, covers the same points as the harness prompt in
+  different words.

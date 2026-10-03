@@ -1,0 +1,100 @@
+name: Release
+
+# Publishes a tag: runs CI on it, publishes to npm through trusted publishing (OIDC,
+# no stored token; npm attaches provenance), then creates the GitHub Release with
+# git-cliff notes. prepare-release.yml dispatches this on the tag; a manual tag push
+# also works. To retry, use "Run workflow" with the tag (not a branch) as the ref.
+#
+# One-time setup: npm lets a trusted publisher be added only to an existing package,
+# so publish 0.1.0 once by hand (`npm publish`), then on npmjs.com: opencode-clm ->
+# Settings -> Trusted Publisher -> GitHub Actions: owner bcmyguest, repository
+# opencode-clm, workflow release.yml.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Check tag against package.json
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # The ci job checks out github.ref, so the run must be on the tag itself.
+          [ "$GITHUB_REF_TYPE" = tag ] || { echo "::error::run this workflow on a tag ref"; exit 1; }
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+      - env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          v=$(jq -r .version package.json)
+          [ "v$v" = "$TAG" ] || { echo "::error::package.json has $v, tag is $TAG"; exit 1; }
+
+  ci:
+    needs: gate
+    uses: ./.github/workflows/ci.yml
+
+  publish-npm:
+    name: Publish to npm (trusted publishing)
+    needs: [gate, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token for npm trusted publishing and provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@^11.5.1
+      - name: npm publish (skips a version already on the registry)
+        run: |
+          set -euo pipefail
+          name=$(jq -r .name package.json); version=$(jq -r .version package.json)
+          if npm view "$name@$version" version > /dev/null 2>&1; then
+            echo "::notice::$name@$version is already on npm."
+          else
+            npm publish --provenance --access public
+          fi
+
+  github-release:
+    name: GitHub Release
+    needs: [gate, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
+          fetch-depth: 0 # git-cliff needs full history and tags
+      - name: Release notes (git-cliff)
+        id: notes
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.gate.outputs.tag }}
+          body: ${{ steps.notes.outputs.content }}

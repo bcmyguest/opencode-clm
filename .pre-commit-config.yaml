@@ -1,0 +1,10 @@
+# Commit-message check: subjects must be Conventional Commits, which git-cliff turns
+# into the next version and the release notes. `pre-commit install` wires the
+# commit-msg stage through default_install_hook_types.
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: 91ab4bf57e58b32adf1a122681f6ebe164d081c8 # frozen: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
