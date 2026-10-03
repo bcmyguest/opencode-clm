@@ -38,9 +38,6 @@ writes the spec to both files. By hand, add it to both `plugin` lists; options g
 { "plugin": ["opencode-clm"] }
 ```
 
-From a local clone, use `file:///path/to/opencode-clm/index.ts` and
-`file:///path/to/opencode-clm/tui.ts`. Tested with OpenCode 1.18.34.
-
 ## Quick start
 
 | command | what it does |

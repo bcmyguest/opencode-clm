@@ -38,7 +38,7 @@ No automated test calls a model.
 
 ## Running a checkout in OpenCode
 
-Point both plugin lists at the checkout; edits apply on the next OpenCode start:
+Tested with OpenCode 1.18.34. Point both plugin lists at the checkout; edits apply on the next OpenCode start:
 
 ```jsonc
 // opencode.json
