@@ -186,6 +186,13 @@ error is a line in `events.jsonl`.
   out, plus each message's OpenCode id. OpenCode's prune (which clears old tool output in
   place) therefore does not discard a checkpoint; a revert removes messages, changes the
   ids, and drops it.
+- **Revert and fork.** Each accepted checkpoint is also kept in `checkpoints/rN.json` (the
+  newest 8). When the active revision no longer fits (a revert cut into its prefix), the
+  newest older checkpoint that still fits becomes the next revision, with a notice and a
+  `restored` event. The plugin stamps `metadata.clm.origin` on each OpenCode session; a fork
+  copies the metadata, so a fork's first request restores the origin's newest checkpoint
+  whose source the fork starts with (compared without message ids). `/clm reset` clears
+  the history. Annotations do not carry into a fork.
 - Any other prefix mismatch drops the revision: the next request carries the stored
   history, and the model gets a notice. Two consecutive drops add a warning that edits
   keep being dropped until the start of the history stops changing.
@@ -396,6 +403,7 @@ skipped, revision files are cached by mtime and size.
 | `events.jsonl` | server | one JSON line per request, edit, rejection, reset, compaction, notice and error |
 | `revisions/rN.md` | server | the mirror text of each accepted revision |
 | `revisions/rN.json` | server | each accepted revision row by row: kind, indexes, roles, tokens, text before and after |
+| `checkpoints/rN.json` | server | the newest 8 accepted checkpoints, for restore after a revert or into a fork |
 | `snapshot.json` | server | replaced on every request: sizes, budget, calibration, steering, the effective input with a preview per message, and the server's base settings |
 | `overrides.json` | TUI and server | per-session setting changes (§7c) |
 | `withheld/` | server | tool outputs held back by the overflow guard |

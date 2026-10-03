@@ -25,7 +25,10 @@ subagent reviewed it against the pi-clm original and the OpenCode plugin API.
 
 Blocks 1–9 are 0.1.0; rows `0.2.0-n` are the 0.2.0 blocks.
 
-pi-clm features tied to Pi internals and therefore not ported: branch-aware restore on
-`/tree` (OpenCode has no branches; revert is handled as a prefix mismatch), the
+Branch-aware restore on `/tree` maps to OpenCode's revert and fork: `src/history.ts` keeps
+the newest checkpoints, and `src/clm.ts` restores the newest one that still fits after a
+revert, or the origin's into a fork (found through a `metadata.clm.origin` stamp).
+
+pi-clm features tied to Pi internals and therefore not ported: the
 `max_tokens` clamp lift (`before_provider_request`), cancelling Pi's threshold compaction,
 `oneToolPerTurn` and `sizeTrailer` parity switches.

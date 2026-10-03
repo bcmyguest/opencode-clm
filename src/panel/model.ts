@@ -297,6 +297,13 @@ function markerOf(name: string | undefined, event: ClmEvent, afterPoint: number)
 			const reason = str(event.reason) ?? "OpenCode's history changed.";
 			return base("reset", dropped === undefined ? 0 : dropped + 1, dropped === undefined ? reason : `Revision ${dropped} dropped: ${reason}`);
 		}
+		case "restored": {
+			// Revert (`dropped`) or fork (`origin`): an older revision became the next one.
+			const from = count(event.from);
+			const origin = str(event.origin);
+			const source = from === undefined ? "an earlier revision" : `r${from}`;
+			return base("restored", revision ?? 0, origin ? `restored ${source} of ${origin} (fork)` : `restored ${source} (revert)`);
+		}
 		case "compacted": {
 			const summary = str(event.summary);
 			return base("compacted", revision ?? 0, summary ? `Rebased on compaction summary ${summary}.` : "Rebased on a compaction summary.");

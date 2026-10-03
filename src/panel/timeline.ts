@@ -19,7 +19,7 @@ export interface TimelinePoint {
 	revision: number;
 }
 
-export type MarkerKind = "applied" | "rejected" | "reset" | "compacted";
+export type MarkerKind = "applied" | "rejected" | "reset" | "compacted" | "restored";
 
 export interface TimelineMarker {
 	kind: MarkerKind;
@@ -410,6 +410,8 @@ export function formatMarkerCompact(marker: TimelineMarker): string {
 			return `r${marker.revision}  ${time}  reset to raw context`;
 		case "compacted":
 			return `r${marker.revision}  ${time}  compacted by OpenCode`;
+		case "restored":
+			return `r${marker.revision}  ${time}  ${marker.message}`;
 		case "rejected":
 			return `r${marker.revision}  ${time}  rejected: ${marker.message}`;
 		case "applied": {
@@ -439,6 +441,8 @@ export function formatMarkerRow(marker: TimelineMarker, timeline: ContextTimelin
 			return `r${marker.revision}  ${time}  reset to raw context  (${where})`;
 		case "compacted":
 			return `r${marker.revision}  ${time}  compacted by OpenCode  (${where})`;
+		case "restored":
+			return `r${marker.revision}  ${time}  ${marker.message}  (${where})`;
 		case "rejected":
 			return `r${marker.revision}  ${time}  edit rejected: ${marker.message}  (${where})`;
 	}

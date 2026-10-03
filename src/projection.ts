@@ -85,6 +85,14 @@ export function digestSourcePrefix(messages: readonly LiveContextMessage[]): str
 	);
 }
 
+/**
+ * `digestSourcePrefix` without OpenCode message ids. `Session.fork` copies every message
+ * under a new id, so the copied history digests the same way as the original.
+ */
+export function digestSourceContent(messages: readonly LiveContextMessage[]): string {
+	return digestSourcePrefix(messages.map(({ ocMessageID: _id, ...rest }) => rest as LiveContextMessage));
+}
+
 export function createProjectionCheckpoint(options: {
 	revision: number;
 	sourceMessages: readonly LiveContextMessage[];

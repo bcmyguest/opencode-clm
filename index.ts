@@ -121,11 +121,72 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	/** Command names this plugin defined; a user's own `clm` / `clm-compact` stays theirs. */
 	const ownCommands = new Set<string>();
 
+	/**
+	 * OpenCode's record of a session: its metadata (`Session.Info.metadata`, a free record) and
+	 * whether it is a child (subagent) session (`parentID`). Undefined when the client is
+	 * unavailable; a failed call is logged as `stamp-error`. The v1 SDK's `Session` type omits
+	 * `metadata`.
+	 */
+	const sessionRecord = async (clm: ClmSession): Promise<{ metadata: Record<string, unknown>; child: boolean } | undefined> => {
+		const get = input.client?.session?.get;
+		if (typeof get !== "function") return undefined;
+		try {
+			const result = await input.client.session.get({ path: { id: clm.sessionID } });
+			const failed = (result as { error?: unknown } | undefined)?.error;
+			const data = (result as { data?: { metadata?: unknown; parentID?: unknown } } | undefined)?.data;
+			if (failed !== undefined || !data) {
+				await clm.log({ event: "stamp-error", stage: "get", error: JSON.stringify(failed ?? "no data") });
+				return undefined;
+			}
+			const metadata = data.metadata;
+			return {
+				metadata: metadata && typeof metadata === "object" && !Array.isArray(metadata) ? (metadata as Record<string, unknown>) : {},
+				child: typeof data.parentID === "string" && data.parentID !== "",
+			};
+		} catch (error) {
+			await clm.log({ event: "stamp-error", stage: "get", error: describe(error) });
+			return undefined;
+		}
+	};
+	/** Sessions whose stamp was handled in this process (`linkFork`). */
+	const linked = new Set<string>();
+
+	/**
+	 * Fork detection. The plugin stamps `metadata.clm.origin = <own id>` on every session it
+	 * opens; `Session.fork` copies the metadata into the fork, so a stamp naming another session
+	 * marks a fork of it. A fresh fork restores the origin's newest matching revision on its
+	 * first request (clm.ts `restoreFromFork`); the stamp is then rewritten to the fork's id.
+	 * `PATCH /session/:id` replaces the whole metadata record, so the other keys are copied.
+	 */
+	const linkFork = async (clm: ClmSession): Promise<void> => {
+		const record = await sessionRecord(clm);
+		// Child (subagent) sessions are never forked: no stamp, no PATCH bumping their time.
+		if (!record || record.child) return;
+		const metadata = record.metadata;
+		const stamp = metadata.clm && typeof metadata.clm === "object" && !Array.isArray(metadata.clm) ? (metadata.clm as Record<string, unknown>) : {};
+		const origin = stamp.origin;
+		if (origin === clm.sessionID) return;
+		if (typeof origin === "string" && !clm.state.checkpoint && clm.state.revision === 0) {
+			try {
+				clm.forkOrigin = { sessionID: origin, directory: sessionDirectory(settings.mirrorDir, checkSessionID(origin)) };
+			} catch {
+				// a foreign stamp that is not a usable session id: ignore it
+			}
+		}
+		try {
+			const result = await input.client?.session?.update?.({ path: { id: clm.sessionID }, body: { metadata: { ...metadata, clm: { ...stamp, origin: clm.sessionID } } } } as never);
+			const error = (result as { error?: unknown } | undefined)?.error;
+			if (error) await clm.log({ event: "stamp-error", stage: "update", error: JSON.stringify(error) });
+		} catch (error) {
+			await clm.log({ event: "stamp-error", stage: "update", error: describe(error) });
+		}
+	};
+
 	const session = (sessionID: string): Promise<ClmSession> => {
 		const id = checkSessionID(sessionID);
 		let existing = sessions.get(id);
 		if (!existing) {
-			existing = ClmSession.open(id, settings, { steering }).then((clm) => {
+			existing = ClmSession.open(id, settings, { steering }).then(async (clm) => {
 				if (clm.loadWarning) toast(`state reset for ${id}: ${clm.loadWarning}`, "warning");
 				return clm;
 			});
@@ -393,6 +454,15 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			} catch (error) {
 				toast(`not active for session ${sessionID}: ${describe(error)}`, "error");
 				return;
+			}
+			// Stamp (and detect a fork) once per process, only while CLM edits this session:
+			// a session with CLM off is left untouched in OpenCode's store.
+			if (!linked.has(sessionID)) {
+				await clm.refreshSettings().catch(() => undefined);
+				if (clm.enabled) {
+					linked.add(sessionID);
+					await linkFork(clm);
+				}
 			}
 			const tools = toolTokens();
 			if (tools !== undefined) clm.scope = { ...clm.scope, toolTokens: tools };

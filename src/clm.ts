@@ -64,7 +64,8 @@ import { capObservations } from "./observation.ts";
 import { flatten, noteMessage, unflatten, withoutReasoning, type OcInfo, type OcMessage } from "./opencode.ts";
 import { applyOverflowGuard, overflowGuardLimit, overflowNoticeText } from "./overflow.ts";
 import type { ClmStatus } from "./presentation.ts";
-import { applyProjection, createProjectionCheckpoint, type ProjectionCheckpoint } from "./projection.ts";
+import { applyProjection, createProjectionCheckpoint, digestSourceContent, type ProjectionCheckpoint } from "./projection.ts";
+import { clearHistory, loadHistory, remapProjection, saveHistoryEntry, type HistoryEntry } from "./history.ts";
 import type { ClmSettings } from "./settings.ts";
 import {
 	keptFields,
@@ -196,6 +197,12 @@ export class ClmSession {
 	 * `experimental.compaction.autocontinue` hook); the next transform rebases onto the summary.
 	 */
 	compacted = false;
+	/**
+	 * Set by the plugin when OpenCode's session metadata names another session as the origin
+	 * (a fork, `Session.fork` copies metadata). The first transform restores the newest of the
+	 * origin's checkpoints whose source the forked history still contains, then clears it.
+	 */
+	forkOrigin?: { sessionID: string; directory: string };
 	/** What the last transform rendered; the next transform commits the mirror against it. */
 	baseline?: Baseline;
 	/** The snapshot now in the mirror file; continuity tools resolve block ids against it. */
@@ -520,6 +527,9 @@ export class ClmSession {
 		this.baseline = undefined;
 		this.tracker.reset();
 		this.continuitySize.reset();
+		// The user dropped the edits on purpose: a later revert must not bring one back. Queued
+		// behind any history write in flight; writes queued later see no checkpoint and skip.
+		await this.historyTask(() => clearHistory(this.store.directory));
 		await this.log({ event: "reset", revision: next.revision, reason });
 	}
 
@@ -642,6 +652,7 @@ export class ClmSession {
 			return;
 		}
 		this.accepted += 1;
+		await this.remember({ version: 1, checkpoint, contentDigest: digestSourceContent(baseline.rawMessages) });
 		const revisions = join(this.store.directory, "revisions");
 		await mkdir(revisions, { recursive: true, mode: 0o700 }).catch(() => undefined);
 		await writeFile(join(revisions, `r${revision}.md`), text, { mode: 0o600 }).catch(() => undefined);
@@ -812,6 +823,127 @@ export class ClmSession {
 		await this.log({ event: "compacted", revision: next.revision, previous, summary: summaryId, written });
 	}
 
+	// ---- checkpoint history (revert and fork) ------------------------------------------
+
+	/** History writes and clears run one at a time (`/clm reset` runs outside the transform queue). */
+	private historyQueue: Promise<void> = Promise.resolve();
+
+	private historyTask(task: () => Promise<void>): Promise<void> {
+		const run = this.historyQueue.then(task).catch(() => undefined);
+		this.historyQueue = run;
+		return run;
+	}
+
+	/**
+	 * Add an accepted checkpoint to `checkpoints/`. Best effort: the revision is already saved.
+	 * Skipped when the checkpoint is no longer the active one by the time the write runs (a
+	 * `/clm reset` came in between), so a reset edit never lands in the history.
+	 */
+	private remember(entry: HistoryEntry): Promise<void> {
+		return this.historyTask(async () => {
+			if (this.state.checkpoint?.revision !== entry.checkpoint.revision) return;
+			await saveHistoryEntry(this.store.directory, entry)
+				.catch((error: unknown) => this.log({ event: "history-error", revision: entry.checkpoint.revision, error: describe(error) }));
+		});
+	}
+
+	/**
+	 * Make `entry`'s projection, with `projected` standing for `source`, the next revision.
+	 * Persisted before it takes effect, like an accepted edit.
+	 */
+	private async activateRestored(
+		entry: HistoryEntry,
+		source: readonly LiveContextMessage[],
+		projected: readonly LiveContextMessage[],
+		describeRestore: (revision: number) => string,
+	): Promise<boolean> {
+		const at = new Date().toISOString();
+		const old = entry.checkpoint;
+		const revision = this.state.revision + 1;
+		let checkpoint: ProjectionCheckpoint;
+		try {
+			checkpoint = createProjectionCheckpoint({
+				revision,
+				sourceMessages: source,
+				projectedMessages: projected,
+				beforeEstimate: old.beforeEstimate,
+				afterEstimate: old.afterEstimate,
+				estimateUnit: old.estimateUnit,
+				createdAt: at,
+				...(old.editTrace ? { editTrace: old.editTrace } : {}),
+			});
+		} catch {
+			return false;
+		}
+		const message = describeRestore(revision);
+		try {
+			await this.updateState((state) => {
+				if (state.revision + 1 !== revision) throw new Error("the session state changed while the revision was restored");
+				return {
+					version: 1,
+					enabled: state.enabled,
+					revision,
+					checkpoint,
+					lastOutcome: { kind: "applied", message, beforeEstimate: old.beforeEstimate, afterEstimate: old.afterEstimate, estimateUnit: old.estimateUnit, at },
+					...keptFields(state),
+				};
+			});
+		} catch {
+			return false;
+		}
+		this.tracker.reset();
+		await this.remember({ version: 1, checkpoint, contentDigest: entry.contentDigest });
+		this.pendingNotices.push(`[CLM] ${message} The mirror shows it.`);
+		return true;
+	}
+
+	/**
+	 * The active revision no longer fits the history (a revert cut into its prefix): restore
+	 * the newest older checkpoint that still fits, as pi-clm restores the checkpoint of the
+	 * branch `/tree` selects. False when none fits; the caller then resets.
+	 */
+	private async restoreAfterMismatch(source: readonly LiveContextMessage[], reason: string): Promise<boolean> {
+		const dropped = this.state.checkpoint?.revision;
+		const { entries, ignored } = await loadHistory(this.store.directory);
+		if (ignored.length > 0) await this.log({ event: "history-ignored", files: ignored });
+		for (const entry of entries) {
+			if (entry.checkpoint.revision === dropped) continue;
+			const candidate = applyProjection(source, entry.checkpoint);
+			if (!candidate.valid) continue;
+			const from = entry.checkpoint.revision;
+			const prefix = source.slice(0, entry.checkpoint.sourceMessageCount);
+			const restored = await this.activateRestored(entry, prefix, entry.checkpoint.projectedMessages, (revision) =>
+				`Revision ${dropped} no longer matches OpenCode's history: ${reason.replace(/\.\s*$/, "")}; restored revision ${from}, which still does, as revision ${revision}.`);
+			if (!restored) return false;
+			await this.log({ event: "restored", revision: this.state.revision, from, dropped, reason });
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * First request of a forked session: find the newest origin checkpoint whose source the
+	 * fork's history starts with (compared without message ids, which the fork renews) and
+	 * restore it with the ids mapped to the fork's.
+	 */
+	private async restoreFromFork(origin: { sessionID: string; directory: string }, source: readonly LiveContextMessage[]): Promise<boolean> {
+		const { entries, ignored } = await loadHistory(origin.directory);
+		if (ignored.length > 0) await this.log({ event: "history-ignored", origin: origin.sessionID, files: ignored });
+		for (const entry of entries) {
+			const count = entry.checkpoint.sourceMessageCount;
+			if (count > source.length) continue;
+			const prefix = source.slice(0, count);
+			if (digestSourceContent(prefix) !== entry.contentDigest) continue;
+			const from = entry.checkpoint.revision;
+			const restored = await this.activateRestored(entry, prefix, remapProjection(entry.checkpoint, prefix), (revision) =>
+				`This session is a fork of ${origin.sessionID}; restored its revision ${from} as revision ${revision}.`);
+			if (!restored) return false;
+			await this.log({ event: "restored", revision: this.state.revision, from, origin: origin.sessionID });
+			return true;
+		}
+		return false;
+	}
+
 	private async loadAnnotations(): Promise<LiveContextAnnotation[]> {
 		try {
 			return await this.annotations.list();
@@ -867,6 +999,10 @@ export class ClmSession {
 		if (rebase) {
 			await this.rebaseAfterCompaction(summaryId);
 			projection = applyProjection(source, undefined);
+		} else if (!projection.valid && (await this.restoreAfterMismatch(source, projection.reason))) {
+			// A revert cut into the active revision's prefix; an older revision still fits.
+			this.invalidationStreak = 0;
+			projection = applyProjection(source, this.state.checkpoint);
 		} else if (!projection.valid) {
 			const dropped = this.state.checkpoint?.revision;
 			this.invalidationStreak += 1;
@@ -881,6 +1017,11 @@ export class ClmSession {
 			projection = applyProjection(source, undefined);
 		} else if (this.state.checkpoint) {
 			this.invalidationStreak = 0;
+		}
+		const origin = this.forkOrigin;
+		this.forkOrigin = undefined;
+		if (origin && !this.state.checkpoint && this.state.revision === 0 && (await this.restoreFromFork(origin, source))) {
+			projection = applyProjection(source, this.state.checkpoint);
 		}
 		const checkpoint = this.state.checkpoint;
 		const suffixLength = projection.valid ? projection.suffix.length : 0;

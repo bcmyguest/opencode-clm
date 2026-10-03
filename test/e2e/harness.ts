@@ -78,9 +78,12 @@ export interface CaseOptions {
 }
 
 /** A running `opencode serve`. */
+/** A running `opencode serve` (Case.serve). */
 export interface Served {
 	url: string;
 	stop(): void;
+	/** JSON request against the server, scoped to the case's project directory. */
+	request(method: string, path: string, body?: unknown): Promise<any>;
 }
 
 export class Case {
@@ -195,7 +198,8 @@ export class Case {
 
 	/**
 	 * `opencode serve` in the project directory on a free loopback port; resolves once it
-	 * listens. `stop()` kills its process group.
+	 * listens. `stop()` kills its process group; `request` calls the HTTP API with the
+	 * project as `directory`.
 	 */
 	async serve(): Promise<Served> {
 		const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
@@ -235,7 +239,24 @@ export class Case {
 			})();
 		});
 		const found = await Promise.race([url, Bun.sleep(RUN_TIMEOUT_MS).then(() => undefined)]);
-		if (found) return { url: found, stop };
+		const project = this.project;
+		if (found) return {
+			url: found,
+			stop,
+			async request(method: string, path: string, body?: unknown): Promise<any> {
+				const url = new URL(path, found);
+				url.searchParams.set("directory", project);
+				const response = await fetch(url, {
+					method,
+					headers: { "content-type": "application/json" },
+					...(body === undefined ? {} : { body: JSON.stringify(body) }),
+					signal: AbortSignal.timeout(RUN_TIMEOUT_MS),
+				});
+				const text = await response.text();
+				if (!response.ok) throw new Error(`${method} ${path}: ${response.status} ${text.slice(0, 500)}`);
+				return text ? JSON.parse(text) : undefined;
+			},
+		};
 		stop();
 		throw new Error(`e2e ${this.name}: opencode serve did not start; stdout:\n${output.slice(-2000)}`);
 	}
@@ -263,6 +284,11 @@ export class Case {
 			throw new Error(`e2e ${this.name}: opencode ${how}`);
 		}
 		return result;
+	}
+
+	/** Every `clm-<session id>` directory under the mirror dir. */
+	sessionDirs(): string[] {
+		return readdirSync(this.mirror).filter((name) => name.startsWith("clm-")).map((name) => join(this.mirror, name));
 	}
 
 	/** The single `clm-<session id>` directory under the mirror dir. */
