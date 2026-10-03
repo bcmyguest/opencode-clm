@@ -58,6 +58,34 @@ In the panel: `1–4` or `Tab` switch pages, `← →` step through the overview
 the edits page's revisions, `z` zooms the chart, `Enter` opens the selection, `r`
 reloads, `q` closes.
 
+## Benchmarks
+
+These numbers come from one machine (AMD Strix Halo, gfx1151, Vulkan) running
+Qwen3.8-Flash-Next (UD-IQ4_XS) through lemonade, on a llama.cpp build with an
+unreleased patch that ports the paper's
+[Suffix Cache Reuse](https://github.com/facebookresearch/context-language-models/tree/main/suffix_cache_reuse)
+(an SGLang patch) to llama.cpp's hybrid models. On a stock server, an edit re-prefills
+everything after the first changed token.
+
+**GSM8K, 50 test problems, edited prompt.** Each problem is primed with an 8-shot prompt
+holding three stale worked examples, then asked again with that block replaced by a
+one-line note, mirroring a CLM edit. Temperature 0, thinking off.
+
+| | reuse after the edit | full prefill |
+|---|---|---|
+| accuracy | 47/50 | 49/50 |
+| median tokens prefilled | 23 | 1,362 |
+| median prompt time | 0.51 s | 4.93 s |
+| median request time | 2.7 s | 6.9 s |
+
+**A live OpenCode session** with opencode-clm 0.2 (48k budget, auto-compaction off),
+reading and summarising this repository's files: 6 accepted edits, 0 rejected. After
+edits, requests of 20–31k tokens prefilled 153–877 tokens instead of everything after the
+edit point.
+
+Flash-Next was not trained for CLM, so it makes more edit mistakes than the paper's
+trained models. Hosted APIs are untested.
+
 ## Docs
 
 - [How it works](docs/how-it-works.md) — the mirror, what runs without the model, the panel, model and server support, safety.
