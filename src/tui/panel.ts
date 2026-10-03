@@ -66,6 +66,17 @@ export function toStyledText(lines: readonly Line[], theme: TuiThemeCurrent): St
 	return new StyledText(chunks);
 }
 
+/** A one-line text renderable for a host slot (the footer), restyled on each `set`. */
+export function createFooter(api: Pick<TuiPluginApi, "renderer" | "theme">, id: string): { renderable: TextRenderable; set(text: string | undefined): void } {
+	const renderable = new TextRenderable(api.renderer, { id, content: "", wrapMode: "none" });
+	return {
+		renderable,
+		set(text) {
+			renderable.content = toStyledText(text ? [[{ text, tone: "muted" }]] : [[]], api.theme.current);
+		},
+	};
+}
+
 export interface PanelOptions {
 	page: Page;
 	/** Reads the session files and builds the model. Never rejects with a broken panel: errors become a model. */

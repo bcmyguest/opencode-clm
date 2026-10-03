@@ -208,7 +208,9 @@ error is a line in `events.jsonl`.
 A checkpoint anchors to the digest of the messages this plugin receives. OpenCode runs a
 hook in each plugin in turn, built-in plugins first, then the configured ones in load
 order, all on the same output; a plugin whose `messages.transform` runs earlier and varies
-its output between calls invalidates the checkpoint.
+its output between calls invalidates the checkpoint. After two consecutive drops the
+plugin toasts once per session, naming that cause and advising to load opencode-clm before
+such a plugin.
 
 ## 7. Budget and reminders
 
@@ -307,8 +309,10 @@ any step is reported and not written, so it never takes effect. The base is the 
 load-time settings; for `editing` it is `state.json`'s `enabled`. Before each transform,
 system transform and `/clm` command the server compares the file's mtime, size and inode
 with the last read; on a change it re-reads and activates it from the next request. A
-stored value that is malformed is dropped with a warning in `/clm status`; a steering
-document that no longer loads leaves the session protocol-only, also with a warning.
+stored value that is malformed is dropped with a warning in `/clm status` and one toast
+(again only when the warning changes; delivered with the next request, also while CLM is
+off); a steering document that no longer loads leaves the session protocol-only, also with
+a warning. The base steering document failing again does not repeat its load-time toast.
 `/clm config reset` writes an empty override set. Overrides are per session.
 
 ## 7d. Model-driven compaction (`/clm-compact`)
@@ -320,8 +324,18 @@ the mirror, keeping the task, decisions, open items and exact values, and droppi
 tool output. Text after the command is appended as "Also: …". The model decides how much
 to remove; its edit is validated and committed before the next request like any other,
 and the plugin removes nothing itself. (OpenCode's `/compact` instead summarizes the
-history with a separate model call, §6.) The size in the prompt is the latest estimate, 0
-before the first request. The `compact prompt` setting (`CLM_COMPACT_PROMPT`; `default` =
+history with a separate model call, §6.) The size in the prompt is estimated when the
+command runs, from the stored history through the accepted revision (the system prompt and
+tool schemas count once the session has reported them). The stored history is cut as
+OpenCode cuts it for a request (`filterCompacted`, a port of `MessageV2.filterCompacted`),
+so history before a native compaction does not count. OpenCode runs a command at once,
+also during a run, and its prompt joins the running loop; typed mid-run, the size lacks the
+rest of the current turn, and the toast says it was measured before the run finishes. A
+second `/clm-compact` is refused (toast and one-line note) until the model receives the
+first: the first request whose history holds its prompt, or the session going idle or
+failing, ends the wait. With CLM off for the session or an
+empty history the command is refused with a toast, and the model gets a one-line note
+instead of the prompt. The `compact prompt` setting (`CLM_COMPACT_PROMPT`; `default` =
 built in) replaces the built-in text with a markdown template using `{{mirror}}`,
 `{{current}}`, `{{budget}}` and `{{instructions}}` (typed instructions are appended when
 the template has no `{{instructions}}`); the file is read on every use.
@@ -369,9 +383,15 @@ same pages and `/clm status` as text. Four pages:
   inside changed pairs, unified `-`/`+` below 60 columns). The diff runs on the full text;
   the display is bounded (400 rows for edited messages, 60 for removed or added, 2,000
   characters per line) with an explicit "diff preview truncated" row.
-- **settings** — sizes, the guard limit and the steering document above the ten settings
-  of §7c: `Enter` cycles a setting's choices or opens a text prompt; rejected values show a
+- **settings** — sizes, calibration, the guard limit, the steering document and the
+  annotation counts (from `annotations.jsonl`) above the ten settings of §7c and a Reset
+  row (`Enter` cycles it to "reset now", which resets at once): `Enter` cycles a setting's choices or opens a text prompt; rejected values show a
   warning and keep the value in effect.
+
+The TUI plugin also fills the `session_prompt_right` slot with a one-line footer
+(`clm <size> / <budget> · r<revision>`), one renderable per session, refreshed on
+`session.idle` and completed replies; while the panel is open for the session it takes the
+panel's model instead of reading the files again.
 
 `r` reloads the files; `q` or Esc closes. Colors use OpenCode theme names: bars
 `textMuted`, edit events `markdownLink`, `warning` for the budget line and rejected edits,
@@ -510,7 +530,6 @@ come from `events.jsonl`, so the panel works on resume without extra persistence
 - Model limits and the system-prompt size reach the plugin one request late. On the first
   request of a process the model window does not yet cap the budget and the estimate omits
   the system prompt; with `budget: "window"` that request has no budget reading.
-  `/clm-compact` before the first request reports about 0 tokens.
 - Built-in tool descriptions are measured, but not their parameter schemas; the
   provider-measured overhead covers them once it arrives.
 - A checkpoint ignores changes to stored tool output inside the prefix it covers. An output

@@ -98,6 +98,11 @@ export interface RequestScope {
 	toolTokens?: number;
 }
 
+/** Toast when edits keep being dropped (pi `compositionWarningText`, reworded for OpenCode). */
+export const COMPOSITION_WARNING = "CLM edits keep being dropped: OpenCode's history changed between consecutive requests. " +
+	"Another plugin that rewrites already-sent messages (experimental.chat.messages.transform) is the usual cause; " +
+	"load opencode-clm before it (earlier in the `plugin` list), or turn CLM off for this session with /clm off.";
+
 export interface TransformResult {
 	/** The messages to send; the caller writes them into OpenCode's array in place. */
 	messages: OcMessage[];
@@ -106,7 +111,7 @@ export interface TransformResult {
 	/** Calibrated estimate of this request, tokens (system prompt and tool schemas included when known); undefined when CLM did not run. */
 	estimated?: number;
 	reading?: BudgetReading;
-	/** User-facing warning for a toast (the budget-too-small check); set on one request only. */
+	/** User-facing warning for a toast (budget too small, composition warning, ignored saved settings); set on one request only. */
 	alert?: string;
 	/** User-facing errors for toasts: the mirror could not be read or refreshed, a revision could not be saved. */
 	errors?: string[];
@@ -224,6 +229,12 @@ export class ClmSession {
 	/** Raw length and conversation estimate (calibrated, tokens) of the last request, for the overhead measurement. */
 	private previousRequest?: { rawCount: number; conversation: number };
 	private invalidationStreak = 0;
+	/** The composition warning toast is shown once per session (pi: `compositionWarned`). */
+	private compositionWarned = false;
+	/** User-facing warnings for the next transform result (`alert`). */
+	private pendingAlerts: string[] = [];
+	/** The settings warning last shown to the user, so a new or changed one toasts once. */
+	private shownSettingsWarning?: string;
 	/**
 	 * Per-process seed of the stable document id. Fresh on every open, so a document id never
 	 * repeats even when a corrupt state file resets the revision counter to 0.
@@ -331,10 +342,22 @@ export class ClmSession {
 			// The base settings resolved at load; staging them again keeps a base steering error.
 			staged = stageSettings(this.baseSettings, {}, { strict: false, loaded: this.baseSteering });
 		}
-		if (staged.steeringError) warnings.push(`steering document not loaded: ${staged.steeringError}`);
+		// Only warnings about saved settings toast here. The base steering document failing
+		// again (no override names another path) already toasted once at load (index.ts).
+		const alerting = [...warnings];
+		if (staged.steeringError) {
+			const warning = `steering document not loaded: ${staged.steeringError}`;
+			warnings.push(warning);
+			if (staged.settings.steeringPath !== this.baseSettings.steeringPath) alerting.push(warning);
+		}
 		this.steeringError = staged.steeringError;
 		await this.activateSettings(staged, overrides);
 		this.settingsWarning = warnings.length > 0 ? warnings.join("; ") : undefined;
+		const alert = alerting.length > 0 ? alerting.join("; ") : undefined;
+		if (alert && alert !== this.shownSettingsWarning) {
+			this.pendingAlerts.push(`saved settings partly ignored: ${alert}`);
+		}
+		this.shownSettingsWarning = alert;
 	}
 
 	private async activateSettings(staged: StagedSettings, overrides: ClmOverrides): Promise<void> {
@@ -361,6 +384,34 @@ export class ClmSession {
 	}
 
 	// ---- measurement -------------------------------------------------------------------
+
+	/**
+	 * System prompt and tool schemas, when the hooks reported them (one request late).
+	 * A provider-measured overhead replaces them: it is in real tokens, so it is not
+	 * calibrated, and it includes the built-in tool schemas the hooks cannot size. The
+	 * hook sizes stay a floor, since they count text that is certainly sent.
+	 */
+	private scopeSize(): { measuredOverhead?: number; scopeTokens: number } {
+		const { systemTokens, toolTokens } = this.scope;
+		const measuredOverhead = this.state.budgetCheck?.source === "provider"
+			? Math.max(this.state.budgetCheck.overhead, (systemTokens ?? 0) + (toolTokens ?? 0))
+			: undefined;
+		return { ...(measuredOverhead !== undefined ? { measuredOverhead } : {}), scopeTokens: measuredOverhead ?? this.calibrator.apply((systemTokens ?? 0) + (toolTokens ?? 0)) };
+	}
+
+	/**
+	 * `/clm-compact`: about how large the next request would be, from the stored history
+	 * (as OpenCode sends it, see `filterCompacted`) through the accepted revision (continuity and notices not
+	 * counted). Undefined when the history holds no message to compact.
+	 */
+	idleEstimate(raw: OcMessage[]): number | undefined {
+		const pinned = pinnedCount(raw);
+		const source = flatten(raw.slice(pinned));
+		if (source.length === 0) return undefined;
+		const projection = applyProjection(source, this.state.checkpoint);
+		const effective = projection.valid ? projection.messages : source;
+		return this.scopeSize().scopeTokens + this.estimate(flatten(raw.slice(0, pinned))) + this.estimate(effective);
+	}
 
 	/** Uncalibrated tokens of a text: chars/4 × estimateFactor. */
 	textTokens(text: string): number {
@@ -1003,7 +1054,7 @@ export class ClmSession {
 		if (!this.settings.enabled || !this.enabled) {
 			this.baseline = undefined;
 			this.compacting = false;
-			return { messages: raw, notices: [] };
+			return { messages: raw, notices: [], ...this.drainAlerts() };
 		}
 		const pinned = pinnedCount(raw);
 		const pinnedMessages = raw.slice(0, pinned);
@@ -1016,8 +1067,8 @@ export class ClmSession {
 		if (this.compacting) {
 			this.compacting = false;
 			const projection = applyProjection(flatten(raw.slice(pinned)), this.state.checkpoint);
-			if (!projection.valid || !this.state.checkpoint) return { messages: raw, notices: [] };
-			return { messages: [...pinnedMessages, ...unflatten(projection.messages, context)], notices: [] };
+			if (!projection.valid || !this.state.checkpoint) return { messages: raw, notices: [], ...this.drainAlerts() };
+			return { messages: [...pinnedMessages, ...unflatten(projection.messages, context)], notices: [], ...this.drainAlerts() };
 		}
 
 		await this.commit();
@@ -1057,6 +1108,10 @@ export class ClmSession {
 			let notice = `[CLM] Revision ${dropped} was dropped because OpenCode's history changed under it: ${projection.reason} The mirror now shows the stored history.`;
 			if (this.invalidationStreak >= 2) {
 				notice += " This happened on consecutive requests; edits keep being dropped until the start of the history stops changing.";
+				if (!this.compositionWarned) {
+					this.compositionWarned = true;
+					this.pendingAlerts.push(COMPOSITION_WARNING);
+				}
 			}
 			this.pendingNotices.push(notice);
 			await this.log({ event: "projection-reset", revision: dropped, reason: projection.reason });
@@ -1082,15 +1137,8 @@ export class ClmSession {
 		const pinnedTokens = this.estimate(flatten(pinnedMessages));
 		const resolved = this.resolvedBudget();
 		const limit = resolved ? overflowGuardLimit(resolved.budget, resolved.reserve) : undefined;
-		// System prompt and tool schemas, when the hooks reported them (one request late).
-		// A provider-measured overhead replaces them: it is in real tokens, so it is not
-		// calibrated, and it includes the built-in tool schemas the hooks cannot size. The
-		// hook sizes stay a floor, since they count text that is certainly sent.
 		const { systemTokens, toolTokens } = this.scope;
-		const measuredOverhead = this.state.budgetCheck?.source === "provider"
-			? Math.max(this.state.budgetCheck.overhead, (systemTokens ?? 0) + (toolTokens ?? 0))
-			: undefined;
-		const scopeTokens = measuredOverhead ?? this.calibrator.apply((systemTokens ?? 0) + (toolTokens ?? 0));
+		const { measuredOverhead, scopeTokens } = this.scopeSize();
 		const excluded = measuredOverhead !== undefined ? [] : [
 			...(systemTokens === undefined ? ["the system prompt"] : []),
 			...(toolTokens === undefined ? ["tool schemas"] : []),
@@ -1233,9 +1281,25 @@ export class ClmSession {
 			calibration: this.calibrator.factor,
 			notices: notices.map((notice) => notice.slice(0, 80)),
 		});
+		return {
+			messages,
+			notices,
+			estimated: reading?.estimated ?? requestTokens,
+			reading,
+			...this.drainAlerts(alert),
+		};
+	}
+
+	/** The queued toasts (`alert`, `errors`) for a transform result, cleared once taken. */
+	private drainAlerts(alert?: string): Pick<TransformResult, "alert" | "errors"> {
+		const alerts = [...(alert ? [alert] : []), ...this.pendingAlerts];
+		this.pendingAlerts = [];
 		const errors = this.pendingErrors;
 		this.pendingErrors = [];
-		return { messages, notices, estimated: reading?.estimated ?? requestTokens, reading, ...(alert ? { alert } : {}), ...(errors.length > 0 ? { errors } : {}) };
+		return {
+			...(alerts.length > 0 ? { alert: alerts.join("\n") } : {}),
+			...(errors.length > 0 ? { errors } : {}),
+		};
 	}
 
 	/** Inputs for presentation.ts `statusText` / `statusLine`. */

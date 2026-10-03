@@ -32,12 +32,13 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { tool, type Hooks, type Plugin, type PluginInput, type PluginOptions } from "@opencode-ai/plugin";
 
+import { formatTokens } from "./src/budget.ts";
 import { ClmSession } from "./src/clm.ts";
 import { MirrorDirectoryError } from "./src/mirror-store.ts";
 import { applyCompactionMode, nativeCompactionText, oneToolText, overflowNotCompactedText, ToolCallCounter } from "./src/compaction.ts";
 import { buildCompactPrompt, loadCompactPrompt } from "./src/compact.ts";
 import { continuityTools } from "./src/continuity.ts";
-import { replaceInPlace, type OcMessage } from "./src/opencode.ts";
+import { filterCompacted, replaceInPlace, type OcMessage } from "./src/opencode.ts";
 import { statusText, systemGuidance } from "./src/presentation.ts";
 import { COMPACT_COMMAND, COMPACT_TEMPLATE, STATUS_COMMAND, STATUS_TEMPLATE } from "./src/commands.ts";
 import { changeSetting, resetSettings, showSetting } from "./src/overrides.ts";
@@ -61,7 +62,9 @@ const HELPER_PROMPTS = [
 	"You are a context summarization agent",
 ];
 
-const STATUS_USAGE = "Usage: /clm [overview | input | edits | settings | status | path | on | off | reset | config [setting [value] | reset]]";
+const STATUS_USAGE = "Usage: /clm [overview | input | edits | settings | status | path | on | off | reset | budget [value] | config [setting [value] | reset]]";
+/** A pending `/clm-compact` older than this no longer refuses a new one (its prompt may have failed to send). */
+const COMPACT_PENDING_MS = 5 * 60_000;
 
 type ToastVariant = "info" | "success" | "warning" | "error";
 
@@ -320,6 +323,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		const words = args.split(/\s+/).filter(Boolean);
 		const argument = (words[0] ?? "").toLowerCase();
 		if (argument === "config") return configCommand(clm, words.slice(1));
+		// pi's shorthand: `/clm budget <value>` = `/clm config budget <value>`.
+		if (argument === "budget") return configCommand(clm, ["budget", ...words.slice(1)]);
 		const command = parseClmCommand(`/clm ${args}`);
 		if (args !== "" && command?.kind === "open") return pageCommand(clm, command.page);
 		if (words.length > 1) return `${STATUS_USAGE}\nUnknown argument: ${JSON.stringify(args)}`;
@@ -439,13 +444,108 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			.catch(() => undefined);
 	};
 
-	function compactCommand(clm: ClmSession, argument: string): string {
-		return buildCompactPrompt(loadCompactPrompt(clm.settings.compactPromptPath), {
+	/**
+	 * `/clm-compact [instructions]`: the compaction prompt, with the size of the context as
+	 * it would be sent now. pi's checks (pi src/index.ts compactCommand): CLM off and an empty
+	 * context are refused with a toast; the model then gets a short relay instead of the
+	 * prompt (the turn cannot be cancelled, see C14). OpenCode does not queue a command behind
+	 * a busy session: `SessionPrompt.command` fires `command.execute.before` at once and its
+	 * prompt joins the running loop (session/prompt.ts:1346, 1356-1466). Typed mid-run, the
+	 * size is therefore measured mid-run, without the rest of the current turn; the toast says
+	 * so. pi waits for idle instead; this port accepts the lag. A second invocation before the
+	 * model received the first prompt is refused like pi's (`compactPending`, below).
+	 */
+	async function compactCommand(clm: ClmSession, sessionID: string, argument: string): Promise<string> {
+		const waiting = compactPending.get(sessionID);
+		if (waiting && Date.now() - waiting.at < COMPACT_PENDING_MS) {
+			const message = "A /clm-compact is already queued and the model has not received it yet.";
+			toast(message, "info");
+			return relay(`[CLM] ${message}`);
+		}
+		// Reserved before the first await, so a second invocation in the meantime is refused.
+		const entry: { prompt?: string; at: number } = { at: Date.now() };
+		compactPending.set(sessionID, entry);
+		const refuse = (message: string) => {
+			if (compactPending.get(sessionID) === entry) compactPending.delete(sessionID);
+			toast(message, "warning");
+			return relay(`[CLM] ${message}`);
+		};
+		try {
+			return await compactPrompt(clm, sessionID, argument, entry, refuse);
+		} catch (error) {
+			if (compactPending.get(sessionID) === entry) compactPending.delete(sessionID);
+			throw error;
+		}
+	}
+
+	async function compactPrompt(
+		clm: ClmSession,
+		sessionID: string,
+		argument: string,
+		entry: { prompt?: string; at: number },
+		refuse: (message: string) => string,
+	): Promise<string> {
+		await clm.refreshSettings();
+		const template = loadCompactPrompt(clm.settings.compactPromptPath);
+		if (!clm.enabled) {
+			return refuse("CLM is off for this session, so there is no editable context to compact. Turn it on with /clm on.");
+		}
+		// Without a history (the client cannot list messages) the last request's estimate stands in.
+		const history = await sessionMessages(sessionID);
+		const current = history ? clm.idleEstimate(filterCompacted(history)) : clm.lastReading?.estimated ?? 0;
+		if (current === undefined) return refuse("Nothing to compact yet: the context is empty.");
+		const busy = await sessionBusy(sessionID);
+		toast(`Asked the model to compact its context (now about ${formatTokens(current)} tokens` +
+			`${busy ? ", measured before the current run finishes" : ""}).`);
+		const prompt = buildCompactPrompt(template, {
 			mirror: clm.mirrorPath,
-			current: clm.lastReading?.estimated ?? 0,
+			current,
 			budget: clm.resolvedBudget()?.budget,
 			instructions: argument,
 		});
+		entry.prompt = prompt;
+		entry.at = Date.now();
+		return prompt;
+	}
+
+	/**
+	 * Sessions with a `/clm-compact` prompt the model has not received yet, and that prompt.
+	 * pi refuses a second `/clm-compact` while one waits (`compactPending`, pi src/index.ts:235,
+	 * 997-1000): set when the command is accepted (:1008), cleared once its prompt is sent
+	 * (:1046). OpenCode sends the prompt itself, into the running loop or a new one, so here
+	 * pending ends at the first model request whose history holds the prompt (the
+	 * `messages.transform` hook), or when the session goes idle or fails without one
+	 * (`session.idle`, session/status.ts:43; `session.error`). If OpenCode's prompt() fails after
+	 * the hook, neither event may come; an entry older than COMPACT_PENDING_MS no longer refuses.
+	 */
+	const compactPending = new Map<string, { prompt?: string; at: number }>();
+
+	const holdsPrompt = (raw: OcMessage[], prompt: string) =>
+		raw.some((message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === prompt));
+
+	/** Whether OpenCode reports the session busy or retrying; false when the client cannot tell. */
+	async function sessionBusy(sessionID: string): Promise<boolean> {
+		const status = input.client?.session?.status;
+		if (typeof status !== "function") return false;
+		try {
+			const result = await input.client.session.status();
+			const entry = (result?.data as Record<string, { type?: string }> | undefined)?.[sessionID];
+			return entry?.type === "busy" || entry?.type === "retry";
+		} catch {
+			return false;
+		}
+	}
+
+	/** The session's stored messages, or undefined when the client cannot list them. */
+	async function sessionMessages(sessionID: string): Promise<OcMessage[] | undefined> {
+		const list = input.client?.session?.messages;
+		if (typeof list !== "function") return undefined;
+		try {
+			const result = await input.client.session.messages({ path: { id: sessionID } });
+			return Array.isArray(result?.data) ? (result.data as unknown as OcMessage[]) : undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	const hooks: Hooks = {
@@ -512,6 +612,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			const raw = output.messages as unknown as OcMessage[];
 			const sessionID = raw[0]?.info?.sessionID;
 			if (!sessionID) return;
+			const pendingPrompt = compactPending.get(sessionID)?.prompt;
+			if (pendingPrompt !== undefined && holdsPrompt(raw, pendingPrompt)) compactPending.delete(sessionID);
 			// A new model request: `one-tool` counts its tool calls from zero.
 			toolCalls.reset(sessionID);
 			let clm: ClmSession;
@@ -608,6 +710,10 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				reply({ ...answer, v: CHANNEL_VERSION, id: request.id });
 				return;
 			}
+			if (event.type === "session.idle" || event.type === "session.error") {
+				const ended = (event.properties as { sessionID?: string }).sessionID;
+				if (ended) compactPending.delete(ended);
+			}
 			if (event.type === "session.error") {
 				const { sessionID, error } = event.properties as { sessionID?: string; error?: { name?: string } };
 				if (!sessionID || error?.name !== "ContextOverflowError") return;
@@ -680,7 +786,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				const argument = (hookInput.arguments ?? "").trim();
 				text = hookInput.command === STATUS_COMMAND
 					? relay(await statusCommand(clm, argument))
-					: compactCommand(clm, argument);
+					: await compactCommand(clm, hookInput.sessionID, argument);
 			} catch (error) {
 				const message = `/${hookInput.command} failed: ${describe(error)}`;
 				toast(message, "error");

@@ -337,3 +337,62 @@ export function unflatten(messages: readonly LiveContextMessage[], context: Unfl
 export function replaceInPlace(target: OcMessage[], next: readonly OcMessage[]): void {
 	target.splice(0, target.length, ...next);
 }
+
+/**
+ * The part of a stored history OpenCode sends to the model: port of OpenCode 1.18.34
+ * `MessageV2.filterCompacted` (packages/opencode/src/session/message-v2.ts:525-576), which
+ * the prompt loop applies to the stored stream (session/prompt.ts:1092). `client.session.messages`
+ * returns the full history, oldest first (no filter); OpenCode's `stream` walks it newest
+ * first, so this walks `messages` backwards. After a completed compaction the result is
+ * [compaction user message, summary, retained tail (`tail_start_id`), newer messages];
+ * without one it is `messages` unchanged.
+ */
+export function filterCompacted(messages: readonly OcMessage[]): OcMessage[] {
+	const result: OcMessage[] = [];
+	const completed = new Set<string>();
+	let retain: string | undefined;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i]!;
+		result.push(message);
+		if (retain) {
+			if (message.info.id === retain) break;
+			continue;
+		}
+		if (message.info.role === "user" && completed.has(message.info.id)) {
+			const part = message.parts.find((item) => item.type === "compaction");
+			if (!part) continue;
+			if (!part.tail_start_id) break;
+			retain = String(part.tail_start_id);
+			if (message.info.id === retain) break;
+			continue;
+		}
+		if (message.info.role === "assistant" && message.info.summary && message.info.finish && !message.info.error) {
+			completed.add(message.info.parentID);
+		}
+	}
+	result.reverse();
+	const isTailCompaction = (item: OcPart) => item.type === "compaction" && item.tail_start_id !== undefined;
+	let compactionIndex = -1;
+	for (let i = result.length - 1; i >= 0; i--) {
+		const message = result[i]!;
+		if (message.info.role === "user" && message.parts.some(isTailCompaction)) {
+			compactionIndex = i;
+			break;
+		}
+	}
+	const compaction = result[compactionIndex];
+	const part = compaction?.parts.find(isTailCompaction);
+	const summaryIndex = compaction
+		? result.findIndex((message, index) =>
+			index > compactionIndex && message.info.role === "assistant" && message.info.summary && message.info.parentID === compaction.info.id)
+		: -1;
+	const tailIndex = part?.tail_start_id ? result.findIndex((message) => message.info.id === part.tail_start_id) : -1;
+	if (tailIndex >= 0 && tailIndex < compactionIndex && summaryIndex > compactionIndex) {
+		return [
+			...result.slice(compactionIndex, summaryIndex + 1),
+			...result.slice(tailIndex, compactionIndex),
+			...result.slice(summaryIndex + 1),
+		];
+	}
+	return result;
+}

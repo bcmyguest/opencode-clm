@@ -16,9 +16,9 @@ import { buildPanelModel, type PanelModel } from "../panel/model.ts";
 import { formatTokenCount } from "../panel/timeline.ts";
 import { readSessionDirectory, sessionDirectory, type SessionReader } from "../session-files.ts";
 import { resolveSettings, type ClmSettings } from "../settings.ts";
-import { fallbackBudget, latestUsage, modelLimits, overridesNewer, serverBase, serverPluginOptions, settingsView } from "./data.ts";
+import { fallbackBudget, footerText, latestUsage, modelLimits, overridesNewer, RESET_NOW, RESET_ROW, resetRow, serverBase, serverPluginOptions, settingsView } from "./data.ts";
 import type { SessionFiles } from "../panel/files.ts";
-import { createPanel, type PanelController } from "./panel.ts";
+import { createFooter, createPanel, type PanelController } from "./panel.ts";
 
 export const PANEL_ROUTE = "opencode-clm.panel";
 const OPEN_COMMAND = "opencode-clm.panel.open";
@@ -142,7 +142,20 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 			format: { ...(limits.context ? { modelWindow: limits.context } : {}) },
 			...(current.warning ? { warning: current.warning } : {}),
 		});
+		model.settings.rows.push(resetRow(model.settings.changed.length));
 		return model;
+	};
+
+	/** Drops the session's settings changes, locally or through the server. */
+	const resetSessionSettings = async (sessionID: string): Promise<{ viaServer: boolean }> => {
+		const from = await source(sessionID, { write: true });
+		if (from.kind === "local") {
+			await resetSettings(from.directory);
+			return { viaServer: false };
+		}
+		await ask(sessionID, { op: "settings-reset" });
+		channelWrites.set(sessionID, Date.now());
+		return { viaServer: true };
 	};
 
 	/**
@@ -202,10 +215,26 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 			active?.controller.dispose();
 			const controller = createPanel(api, {
 				page,
-				load: () => loadModel(sessionID).catch((error: unknown) => errorModel(sessionID, error)),
+				// The footer of this session takes the panel's model instead of reading the files again.
+				load: () => loadModel(sessionID).then(
+					(model) => {
+						showFooter(sessionID, model);
+						return model;
+					},
+					(error: unknown) => {
+						showFooter(sessionID, undefined);
+						return errorModel(sessionID, error);
+					},
+				),
 				apply: async (setting, value) => {
 					try {
+						if (setting === RESET_ROW) {
+							if (value === RESET_NOW) await resetSessionSettings(sessionID);
+							refreshFooter(sessionID);
+							return undefined;
+						}
 						await applySetting(sessionID, setting, value);
+						refreshFooter(sessionID);
 						return undefined;
 					} catch (error) {
 						return describe(error);
@@ -245,6 +274,7 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 	/** After a change: refresh an open panel so it shows the new value. */
 	const refreshPanel = (sessionID: string) => {
 		if (active?.sessionID === sessionID) void active.controller.reload();
+		refreshFooter(sessionID);
 	};
 
 	/** Every `/clm …` line the intercept consumes (`/clm reset` goes to the server over the channel). */
@@ -287,14 +317,7 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 				refreshPanel(sessionID);
 				return;
 			case "config-reset": {
-				const from = await source(sessionID, { write: true });
-				if (from.kind === "local") {
-					await resetSettings(from.directory);
-					toast("CLM settings reset to the defaults.");
-				} else {
-					await ask(sessionID, { op: "settings-reset" });
-					channelWrites.set(sessionID, Date.now());
-				}
+				if (!(await resetSessionSettings(sessionID)).viaServer) toast("CLM settings reset to the defaults.");
 				refreshPanel(sessionID);
 				return;
 			}
@@ -328,17 +351,73 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 		});
 	}, { priority: 100 });
 
+	// ---- footer: `clm 12k / 32k · r2` right of the session prompt (pi's status line) -----
+	/**
+	 * One footer per session, reused while it is alive: the host's Solid slot calls the
+	 * renderer again whenever its props change, and returning the same renderable keeps it
+	 * from piling up new ones. Leaving the session view destroys it; the next render makes a
+	 * new one.
+	 */
+	const footers = new Map<string, ReturnType<typeof createFooter>>();
+	const footerTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	/** The session's footer while it can still be drawn; the host destroys one it unmounts. */
+	const liveFooter = (sessionID: string) => {
+		const footer = footers.get(sessionID);
+		if (footer?.renderable.isDestroyed) footers.delete(sessionID);
+		return footer?.renderable.isDestroyed ? undefined : footer;
+	};
+	const showFooter = (sessionID: string, model: PanelModel | undefined) =>
+		liveFooter(sessionID)?.set(model ? footerText(model) : undefined);
+	const refreshFooter = (sessionID: string) => {
+		if (!liveFooter(sessionID)) return;
+		// An open panel for this session reloads its model and feeds the footer (above).
+		if (active?.sessionID === sessionID) return;
+		clearTimeout(footerTimers.get(sessionID));
+		footerTimers.set(sessionID, setTimeout(() => {
+			footerTimers.delete(sessionID);
+			void loadModel(sessionID).then(
+				(model) => showFooter(sessionID, model),
+				() => showFooter(sessionID, undefined),
+			);
+		}, RELOAD_DEBOUNCE_MS));
+	};
+	api.slots.register({
+		order: 50,
+		slots: {
+			session_prompt_right(_context, props) {
+				const sessionID = (props as { session_id?: unknown }).session_id;
+				if (typeof sessionID !== "string" || !settings().enabled) return null as never;
+				let footer = liveFooter(sessionID);
+				if (!footer) {
+					footer = createFooter(api, `opencode-clm-footer-${sessionID}`);
+					footers.set(sessionID, footer);
+				}
+				refreshFooter(sessionID);
+				// A raw renderable, as the panel route returns (accepted by the host's Solid insert).
+				return footer.renderable as never;
+			},
+		},
+	});
+
 	const scheduleReload = (sessionID: unknown) => {
+		if (typeof sessionID === "string") refreshFooter(sessionID);
 		if (!active || (typeof sessionID === "string" && sessionID !== active.sessionID)) return;
 		clearTimeout(reloadTimer);
 		reloadTimer = setTimeout(() => void active?.controller.reload(), RELOAD_DEBOUNCE_MS);
 	};
 	const offIdle = api.event.on("session.idle", (event) => scheduleReload((event.properties as { sessionID?: unknown }).sessionID));
-	const offMessage = api.event.on("message.updated", (event) =>
-		scheduleReload((event.properties as { info?: { sessionID?: unknown } }).info?.sessionID));
+	// Sizes change when a reply completes; streaming updates in between are skipped.
+	const offMessage = api.event.on("message.updated", (event) => {
+		const info = (event.properties as { info?: { sessionID?: unknown; role?: unknown; time?: { completed?: unknown } } }).info;
+		if (info?.role === "assistant" && info.time?.completed === undefined) return;
+		scheduleReload(info?.sessionID);
+	});
 
 	api.lifecycle.onDispose(() => {
 		clearTimeout(reloadTimer);
+		for (const timer of footerTimers.values()) clearTimeout(timer);
+		for (const footer of footers.values()) if (!footer.renderable.isDestroyed) footer.renderable.destroy();
+		footers.clear();
 		active?.controller.dispose();
 		active = undefined;
 		offIdle();

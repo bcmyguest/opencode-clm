@@ -109,7 +109,7 @@ export function fallbackBudget(settings: ClmSettings, limits: { context?: number
  */
 export function settingsView(
 	values: { base: SettingsValues; effective: SettingsValues },
-	model: Pick<PanelModel, "budgetInfo" | "timeline" | "mirrorPath">,
+	model: Pick<PanelModel, "budgetInfo" | "timeline" | "mirrorPath"> & Partial<Pick<PanelModel, "calibration" | "steering" | "annotations">>,
 	options: { format?: FormatContext; warning?: string } = {},
 ): PanelSettings {
 	const changed = new Set<string>(changedSettings(values.base, values.effective));
@@ -127,6 +127,7 @@ export function settingsView(
 	if (latest) summary.push(`Size last request ${latest.measured ? "" : "~"}${formatTokenCount(latest.tokens)}${latest.measured ? " (provider count)" : " (estimate)"}`);
 	const info = model.budgetInfo;
 	if (info?.overhead !== undefined) summary.push(`Fixed overhead ~${formatTokenCount(info.overhead)} · usable ${formatTokenCount(info.usable ?? 0)}`);
+	summary.push(...detailLines(values.effective, model));
 	summary.push(`Files mirror ${model.mirrorPath}`);
 	return {
 		rows,
@@ -134,6 +135,70 @@ export function settingsView(
 		changed: SETTINGS_TABLE.filter((item) => changed.has(item.key)).map((item) => item.name),
 		...(options.warning ? { warning: options.warning } : {}),
 	};
+}
+
+/**
+ * Footer text in the session prompt's right slot, as pi's status line:
+ * `clm 12k / 32k · r2` (newest size against the budget in force), `clm off · r2`, or
+ * undefined before the session has CLM data.
+ */
+export function footerText(model: Pick<PanelModel, "found" | "enabled" | "revision" | "timeline" | "budget">): string | undefined {
+	if (!model.found) return undefined;
+	if (!model.enabled) return `clm off · r${model.revision}`;
+	const latest = model.timeline.points.at(-1);
+	const size = latest === undefined
+		? ""
+		: ` ${latest.measured ? "" : "~"}${formatTokenCount(latest.tokens)}${model.budget !== undefined ? ` / ${formatTokenCount(model.budget)}` : ""}`;
+	return `clm${size} · r${model.revision}`;
+}
+
+/** Key of the settings page's "Reset to defaults" row, and the choice that resets. */
+export const RESET_ROW = "reset";
+export const RESET_NOW = "reset now";
+
+/**
+ * pi's "Reset to defaults" row: Enter cycles to "reset now", which drops this session's
+ * changes (the same as `/clm config reset`). With nothing changed Enter does nothing.
+ */
+export function resetRow(changed: number): SettingRow {
+	const value = changed === 0 ? "nothing changed" : `${changed} changed`;
+	return {
+		key: RESET_ROW,
+		label: "Reset to defaults",
+		value,
+		description: "Drop this session's changes; the plugin options, environment and defaults apply again from the next request. Same as /clm config reset. Enter on \"reset now\" resets at once.",
+		choices: changed === 0 ? [value] : [value, RESET_NOW],
+	};
+}
+
+/**
+ * Settings-page details after the size lines (pi's settings summary): calibration, the
+ * overflow guard's limit, the steering document with its hash, annotation counts.
+ */
+export function detailLines(
+	effective: SettingsValues,
+	model: Pick<PanelModel, "budgetInfo"> & Partial<Pick<PanelModel, "calibration" | "steering" | "annotations">>,
+): string[] {
+	const lines: string[] = [];
+	const calibration = model.calibration;
+	if (calibration) {
+		lines.push(calibration.samples === 0
+			? "Estimate not calibrated yet (characters ÷ 4 until the provider reports a size)"
+			: `Estimate ×${calibration.factor.toFixed(2)}, calibrated from ${calibration.samples} provider count${calibration.samples === 1 ? "" : "s"}`);
+	}
+	const limit = model.budgetInfo?.limit;
+	lines.push(effective.settings.guard === "off"
+		? "Guard off"
+		: `Guard withholds the oldest tool results above ${limit === undefined ? "budget − reserve" : formatTokenCount(limit)}`);
+	// The hash prefix identifies an experiment arm (compare with sha256sum).
+	if (model.steering) lines.push(`Steering ${model.steering.name} (sha256 ${model.steering.hash}…)`);
+	const counts = model.annotations;
+	if (counts) {
+		lines.push(counts.total === 0
+			? "Annotations none"
+			: `Annotations ${counts.active} continuity/pin · ${counts.archived} archive · ${counts.total} total`);
+	}
+	return lines;
 }
 
 /**

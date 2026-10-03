@@ -125,6 +125,8 @@ export interface PanelModel {
 	steering?: { name: string; hash: string; path: string };
 	/** snapshot.json `steeringError`: the configured steering document did not load. */
 	steeringError?: string;
+	/** annotations.jsonl counts (`countAnnotations`): active continuity/pin, unresolved archive, all. */
+	annotations?: { active: number; archived: number; total: number };
 	mirrorPath: string;
 	/** Problems reading the files (corrupt JSON, skipped event lines). */
 	warnings: string[];
@@ -548,6 +550,7 @@ export function buildPanelModel(files: SessionFiles, extras: PanelExtras = {}): 
 	const calibration = isObject(snapshot?.calibration) ? snapshot.calibration : undefined;
 	const factor = num(calibration?.factor);
 	if (factor !== undefined) model.calibration = { factor, samples: count(calibration?.samples) ?? 0 };
+	if (files.annotations) model.annotations = files.annotations;
 	const steering = isObject(snapshot?.steering) ? snapshot.steering : undefined;
 	if (steering && typeof steering.name === "string" && typeof steering.hash === "string" && typeof steering.path === "string") {
 		model.steering = { name: steering.name, hash: steering.hash, path: steering.path };

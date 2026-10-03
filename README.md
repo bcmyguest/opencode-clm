@@ -50,9 +50,12 @@ writes the spec to both files. By hand, add it to both `plugin` lists; options g
 | `/clm config` | open **settings**; `/clm config <setting> <value>` changes one, `/clm config reset` drops this session's changes <br><img src="https://raw.githubusercontent.com/bcmyguest/opencode-clm/main/.github/images/settings.png" alt="The settings page: sizes, files, and every setting" width="720"> |
 | `/clm-compact [instructions]` | ask the model to compact its own context now; anything you add (e.g. what to keep) is passed along. The result shows on the **edits** page |
 | `/clm on` / `off` / `reset` / `path` | enable, use raw context, discard the accepted revision, show the mirror's path |
+| `/clm budget [value]` | show or change the budget, the same as `/clm config budget` |
 
 With the TUI plugin, typed `/clm …` lines run in the TUI and cost no model turn;
-`/clm reset` is handed to the server plugin, also without a turn.
+`/clm reset` is handed to the server plugin, also without a turn. The right of the
+session prompt shows `clm <size> / <budget> · r<revision>` (`~` before the size marks an
+estimate the provider has not confirmed; `clm off · r<revision>` while CLM is off).
 
 In the panel: `1–4` or `Tab` switch pages, `← →` step through the overview's markers or
 the edits page's revisions, `z` zooms the chart, `Enter` opens the selection, `r`

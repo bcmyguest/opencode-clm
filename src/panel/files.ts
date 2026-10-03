@@ -100,6 +100,8 @@ export interface SessionFiles {
 	revisionTexts: Map<number, string>;
 	/** Path of the mirror file, whether or not it exists. */
 	mirrorPath: string;
+	/** annotations.jsonl counts: unresolved continuity/pin, unresolved archive, all. */
+	annotations?: { active: number; archived: number; total: number };
 	/** Read problems other than missing files. */
 	warnings: string[];
 }

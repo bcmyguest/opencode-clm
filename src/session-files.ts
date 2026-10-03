@@ -17,6 +17,17 @@ import {
 	type SessionFiles,
 } from "./panel/files.ts";
 import { STATE_FILE } from "./state.ts";
+import { activeContinuityAnnotations, ANNOTATIONS_FILE, reconstructAnnotations } from "./continuity.ts";
+
+/** Counts of annotations.jsonl (latest snapshot per id, as the server reconstructs them). */
+export function countAnnotations(text: string): { active: number; archived: number; total: number } {
+	const annotations = reconstructAnnotations(parseEvents(text).events);
+	return {
+		active: activeContinuityAnnotations(annotations).length,
+		archived: annotations.filter((annotation) => annotation.retention === "archive" && annotation.resolvedAt === undefined).length,
+		total: annotations.length,
+	};
+}
 
 /** `<mirrorDir>/clm-<safe session id>`, the directory MirrorStore creates for the session. */
 export function sessionDirectory(mirrorDir: string, sessionID: string): string {
@@ -232,11 +243,13 @@ export async function readSessionDirectory(directory: string, sessionID: string,
 	}
 	if (!files.found) return files;
 
-	const [eventsText, state, snapshot] = await Promise.all([
+	const [eventsText, state, snapshot, annotationsText] = await Promise.all([
 		readText(reader, join(directory, EVENTS_FILE), warnings),
 		readJson(reader, join(directory, STATE_FILE), warnings),
 		readJson(reader, join(directory, SNAPSHOT_FILE), warnings),
+		readText(reader, join(directory, ANNOTATIONS_FILE), warnings),
 	]);
+	if (annotationsText !== undefined) files.annotations = countAnnotations(annotationsText);
 	if (eventsText !== undefined) {
 		const parsed = parseEvents(eventsText);
 		files.events = parsed.events;

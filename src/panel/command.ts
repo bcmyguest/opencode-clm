@@ -19,7 +19,7 @@ export type ClmCommand =
 	| { kind: "server"; args: string }
 	| { kind: "usage"; text: string };
 
-export const CLM_USAGE = "Usage: /clm [overview | input | edits | settings | status | path | on | off | reset | config [setting [value]]]";
+export const CLM_USAGE = "Usage: /clm [overview | input | edits | settings | status | path | on | off | reset | budget [value] | config [setting [value]]]";
 
 /** Page names and the short forms pi accepts. */
 const PAGE_ALIASES: Record<string, Page> = {
@@ -56,6 +56,11 @@ export function parseClmCommand(text: string): ClmCommand | undefined {
 		case "reset":
 			// Extra words are a typo, not a reset: dropping the revision cannot be undone.
 			return rest.length === 0 ? { kind: "server", args } : { kind: "usage", text: CLM_USAGE };
+		case "budget": {
+			// pi's shorthand for `/clm config budget …`.
+			const value = args.replace(/^\S+\s*/, "");
+			return value === "" ? { kind: "config-show", setting: "budget" } : { kind: "config-set", setting: "budget", value };
+		}
 		case "config": {
 			if (rest.length === 0) return { kind: "open", page: "settings" };
 			const setting = rest[0]!.toLowerCase();
