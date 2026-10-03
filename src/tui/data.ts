@@ -4,7 +4,7 @@
 
 import { resolveBudget } from "../budget.ts";
 import type { LatestUsage, PanelModel, PanelSettings, SettingRow } from "../panel/model.ts";
-import { formatTokenCount } from "../panel/timeline.ts";
+import { formatTokenCount, type TimelinePoint } from "../panel/timeline.ts";
 import type { ClmSettings } from "../settings.ts";
 import { applyOverrides, changedSettings, sanitizeOverrides, SETTINGS_TABLE, type FormatContext, type SettingsValues } from "../settings-table.ts";
 
@@ -124,7 +124,7 @@ export function settingsView(
 	}));
 	const latest = model.timeline.points.at(-1);
 	const summary: string[] = [];
-	if (latest) summary.push(`Size last request ${latest.measured ? "" : "~"}${formatTokenCount(latest.tokens)}${latest.measured ? " (provider count)" : " (estimate)"}`);
+	if (latest) summary.push(sizeLine(latest, model.budgetInfo?.budget));
 	const info = model.budgetInfo;
 	if (info?.overhead !== undefined) summary.push(`Fixed overhead ~${formatTokenCount(info.overhead)} · usable ${formatTokenCount(info.usable ?? 0)}`);
 	summary.push(...detailLines(values.effective, model));
@@ -135,6 +135,19 @@ export function settingsView(
 		changed: SETTINGS_TABLE.filter((item) => changed.has(item.key)).map((item) => item.name),
 		...(options.warning ? { warning: options.warning } : {}),
 	};
+}
+
+/**
+ * pi's settings-page Size line ("next request ~E of B · last request M (provider count)").
+ * pi's "next request" is the estimate of the request built last, here the newest request.
+ * The line shows its provider count and the logged estimate side by side. The budget is
+ * today's, so after a budget change it is off until the next request.
+ */
+export function sizeLine(latest: Pick<TimelinePoint, "tokens" | "measured" | "estimated">, budget?: number): string {
+	const of = budget !== undefined ? ` of ${formatTokenCount(budget)}` : "";
+	if (!latest.measured) return `Size last request ~${formatTokenCount(latest.tokens)}${of} (estimate)`;
+	const estimate = latest.estimated !== undefined ? ` · estimated ~${formatTokenCount(latest.estimated)}` : "";
+	return `Size last request ${formatTokenCount(latest.tokens)}${of} (provider count)${estimate}`;
 }
 
 /**
@@ -190,6 +203,8 @@ export function detailLines(
 	lines.push(effective.settings.guard === "off"
 		? "Guard off"
 		: `Guard withholds the oldest tool results above ${limit === undefined ? "budget − reserve" : formatTokenCount(limit)}`);
+	// pi appends the native-compaction state; `auto` and `on` leave OpenCode's own config.
+	if (effective.settings.compaction === "off") lines[lines.length - 1] += " · OpenCode's automatic compaction off";
 	// The hash prefix identifies an experiment arm (compare with sha256sum).
 	if (model.steering) lines.push(`Steering ${model.steering.name} (sha256 ${model.steering.hash}…)`);
 	const counts = model.annotations;

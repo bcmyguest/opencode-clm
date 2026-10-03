@@ -251,11 +251,13 @@ export function buildTimeline(events: readonly ClmEvent[], latest?: LatestUsage)
 			let tokens = observedAfter.get(position);
 			if (tokens === undefined && position === lastRequest?.position) tokens = latestTokens;
 			const measured = tokens !== undefined;
+			const estimated = num(event.estimated);
 			points.push({
 				request: points.length + 1,
 				...(at ? { at } : {}),
-				tokens: tokens ?? Math.max(0, num(event.estimated) ?? 0),
+				tokens: tokens ?? Math.max(0, estimated ?? 0),
 				measured,
+				...(measured && estimated !== undefined && estimated > 0 ? { estimated } : {}),
 				revision: count(event.revision) ?? 0,
 			});
 			// `users` counts user messages in the raw history; a rise starts a turn. A drop

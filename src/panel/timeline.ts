@@ -15,6 +15,8 @@ export interface TimelinePoint {
 	/** Context size of this request: provider-reported when `measured`, else the CLM estimate. */
 	tokens: number;
 	measured: boolean;
+	/** The CLM estimate logged for this request, kept beside a provider count (`measured`). */
+	estimated?: number;
 	/** Live-context revision active when the request was sent. */
 	revision: number;
 }

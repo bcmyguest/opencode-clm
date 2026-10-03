@@ -11,6 +11,7 @@ import { COMMAND_EVENT, commandOf, createChannelClient, type ChannelOperation, t
 import { createLocator, resetSession } from "./locator.ts";
 import { outsideMessage, resolveSource, sourceOverrides, type FileApi, type SessionSource } from "./remote.ts";
 import type { SettingsValues } from "../settings-table.ts";
+import { interceptTab } from "./complete.ts";
 import { interceptEnter } from "./intercept.ts";
 import { buildPanelModel, type PanelModel } from "../panel/model.ts";
 import { formatTokenCount } from "../panel/timeline.ts";
@@ -342,6 +343,12 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 	};
 
 	const disposeIntercept = api.keymap.intercept("key", (context) => {
+		// Tab on a `/clm …` line completes it inline (OpenCode has no argument completion).
+		if (interceptTab(context as never, {
+			focused: () => api.renderer.currentFocusedRenderable as never,
+			owned,
+			show: (items) => toast(items.map((item) => `/clm ${item}`).join(" · ")),
+		})) return;
 		interceptEnter(context as never, {
 			focused: () => api.renderer.currentFocusedRenderable as never,
 			owned,
