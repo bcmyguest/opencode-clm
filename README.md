@@ -1,5 +1,8 @@
 # opencode-clm
 
+[![npm](https://img.shields.io/npm/v/opencode-clm)](https://www.npmjs.com/package/opencode-clm)
+[![CI](https://github.com/bcmyguest/opencode-clm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bcmyguest/opencode-clm/actions/workflows/ci.yml)
+
 ```
   ____ _     __  __
  / ___| |   |  \/  |
