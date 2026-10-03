@@ -63,11 +63,11 @@
     }
   },
   "devDependencies": {
-    "@opentui/core": "0.4.5",
-    "@opentui/keymap": "0.4.5",
-    "@opentui/solid": "0.4.5",
-    "@types/bun": "1.3.14",
+    "@opentui/core": "0.5.14",
+    "@opentui/keymap": "0.5.14",
+    "@opentui/solid": "0.5.14",
+    "@types/bun": "1.4.2",
     "@xterm/headless": "6.0.0",
-    "typescript": "5.9.3"
+    "typescript": "7.0.2"
   }
 }
