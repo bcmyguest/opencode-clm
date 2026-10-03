@@ -23,10 +23,18 @@ Derived from pi-clm (code and model-facing text, adapted for OpenCode):
   src/types.ts                  src/types.ts
   steering/house-brief.md       steering/house-brief.md (byte-identical copy)
   skills/clm-context/SKILL.md   src/skills/live-context/SKILL.md
+  src/panel/timeline.ts         src/timeline.ts (context chart and its zoom levels)
+  src/panel/diff.ts             src/diff.ts (side-by-side diff)
+  src/panel/view.ts             src/viewer.ts (panel pages)
+  src/panel/keys.ts             src/viewer.ts (key handling)
+  src/panel/model.ts            src/viewer.ts (revision view model)
+  src/panel/command.ts          src/index.ts (/clm and /clm config parsing)
 
 Written for this package (structure follows pi-clm, text does not):
   src/presentation.ts (system-prompt protocol section and /clm status text),
-  src/policy.ts (edit gate and its refusal note), src/opencode.ts.
+  src/policy.ts (edit gate and its refusal note), src/opencode.ts, and the OpenCode TUI
+  adapter (tui.ts, src/tui/*, src/panel/lines.ts, src/panel/files.ts,
+  src/session-files.ts).
 
 Context Language Models
   Paper: arXiv 2609.37725. Research code:
