@@ -51,6 +51,7 @@ const ZOOM_LABELS: Record<TimelineZoom, string> = { fit: "all", requests: "detai
 const EDIT_TONE: Tone = "edit";
 const KEPT_PREVIEW_CHARACTERS = 2_000;
 const MIRROR_TEXT_MAX_LINES = 200;
+const MIRROR_UNAVAILABLE_TEXT = "No mirror: requests carry the raw history plus the continuity annotations; edits are off.";
 
 /** Body rows available for the page. */
 export function viewportHeight(size: PanelSize): number {
@@ -191,6 +192,8 @@ function overviewLines(model: PanelModel, state: PanelState, width: number, view
 	const timeline = model.timeline;
 	const notice = !model.enabled
 		? text("Projection off: the model sees the raw history (/clm on).", "warning")
+		: model.mirrorUnavailable !== undefined
+		? text(MIRROR_UNAVAILABLE_TEXT, "warning")
 		: model.lastOutcome?.kind === "rejected"
 			? text(`Last edit rejected: ${model.lastOutcome.message}`, "warning")
 			: undefined;
@@ -271,7 +274,9 @@ function inputLines(model: PanelModel, width: number): Line[] {
 		return wrapAll([
 			title,
 			[],
-			text("No input snapshot yet: snapshot.json appears after the next model request.", "muted"),
+			model.mirrorUnavailable !== undefined
+				? text(`${MIRROR_UNAVAILABLE_TEXT} No input snapshot is kept.`, "warning")
+				: text("No input snapshot yet: snapshot.json appears after the next model request.", "muted"),
 			[],
 			text(`Mirror: ${model.mirrorPath}`, "dim"),
 		], width);

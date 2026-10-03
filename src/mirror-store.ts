@@ -1,8 +1,9 @@
 // Adapted from pi-clm src/mirror-store.ts (MIT, Copyright 2026 Emanuel Casco).
 
 import { readFileSync } from "node:fs";
-import { chmod, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -80,6 +81,36 @@ async function assertPrivateDirectory(directory: string): Promise<void> {
 	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
 	if (uid !== undefined && info.uid !== uid) {
 		throw new Error(`Refusing mirror directory ${directory}: owned by uid ${info.uid}, not ${uid}.`);
+	}
+}
+
+/** A fresh private (0700) directory under the OS temp directory, for sessions without a usable mirror directory. */
+export function privateTemporaryParent(): Promise<string> {
+	return mkdtemp(join(tmpdir(), "opencode-clm-"));
+}
+
+/**
+ * Copies `name` from `fromDirectory` into `toDirectory` (mode 0600), only when the source
+ * directory passes the store's own check (a real directory owned by this user) and the file
+ * is a regular file. Never overwrites. Returns whether a copy was made; never throws.
+ */
+export async function copyPrivateFile(fromDirectory: string, toDirectory: string, name: string): Promise<boolean> {
+	try {
+		await assertPrivateDirectory(fromDirectory);
+		// O_NOFOLLOW and a check on the open handle: a file swapped for a symlink is not followed.
+		// O_NONBLOCK: opening a FIFO must not block before the isFile() check.
+		const handle = await open(join(fromDirectory, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		let content: Buffer;
+		try {
+			if (!(await handle.stat()).isFile()) return false;
+			content = await handle.readFile();
+		} finally {
+			await handle.close();
+		}
+		await writeFile(join(toDirectory, name), content, { mode: 0o600, flag: "wx" });
+		return true;
+	} catch {
+		return false;
 	}
 }
 

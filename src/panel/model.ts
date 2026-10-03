@@ -128,6 +128,8 @@ export interface PanelModel {
 	/** annotations.jsonl counts (`countAnnotations`): active continuity/pin, unresolved archive, all. */
 	annotations?: { active: number; archived: number; total: number };
 	mirrorPath: string;
+	/** The newest `mirror-unavailable` event's reason: the session runs without a mirror. */
+	mirrorUnavailable?: string;
 	/** Problems reading the files (corrupt JSON, skipped event lines). */
 	warnings: string[];
 }
@@ -556,5 +558,10 @@ export function buildPanelModel(files: SessionFiles, extras: PanelExtras = {}): 
 		model.steering = { name: steering.name, hash: steering.hash, path: steering.path };
 	}
 	if (typeof snapshot?.steeringError === "string" && snapshot.steeringError !== "") model.steeringError = snapshot.steeringError;
+	const unavailable = files.events.filter((event) => eventName(event) === "mirror-unavailable").at(-1)?.reason;
+	if (typeof unavailable === "string") {
+		model.mirrorUnavailable = unavailable;
+		model.mirrorPath = `unavailable (${unavailable})`;
+	}
 	return model;
 }

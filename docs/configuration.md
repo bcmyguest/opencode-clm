@@ -96,6 +96,15 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
 - **Mirror directory.** The default lies inside the project; the plugin writes a
   `.gitignore` of `*` into it when it creates it. When a configured `mirrorDir`
   cannot be created, the session uses the project default `.opencode/clm` instead and a
-  toast names both; when the default fails too, requests carry the raw history and one
-  error toast says so. The TUI panel reads `mirrorDir` from the
-  server plugin's entry in `opencode.json`, falling back to its own `tui.json` entry.
+  toast names both.
+- **No usable mirror directory.** When the default fails too, the session runs without a
+  mirror, as pi-clm does: no protocol prompt and no edits; requests carry the raw history
+  plus the continuity annotations and their size notice. `/clm-compact` refuses, the tool
+  output size line is off, and the `compaction` setting is not applied (OpenCode's
+  compaction is the only way to shrink). The session's files go to a private directory
+  under the OS temp directory, removed when the server exits normally; `state.json`,
+  `overrides.json` and `annotations.jsonl` still readable in the failed session directory
+  are copied there first. One error toast names the directories that failed. Only when
+  the temp directory fails too do requests carry the bare raw history.
+- **TUI panel.** The panel reads `mirrorDir` from the server plugin's entry in
+  `opencode.json`, falling back to its own `tui.json` entry.

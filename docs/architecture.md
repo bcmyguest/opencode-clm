@@ -415,6 +415,12 @@ skipped, revision files are cached by mtime and size.
   directory that is a symlink or owned by another user is refused, as is a session id
   containing `/`, `\` or `..`. Directories untouched for seven days are swept when another
   session opens.
+- No usable session directory (configured `mirrorDir` and the project default both fail):
+  the session runs without a mirror from a private `opencode-clm-*` directory under the OS
+  temp directory, one per server process, removed on normal exit
+  (`ClmSession.mirrorUnavailable`). The model gets no protocol prompt and no mirror;
+  requests carry the raw history, the continuity message and its size notice. See
+  configuration.md, "No usable mirror directory".
 
 | file | written by | content |
 |---|---|---|

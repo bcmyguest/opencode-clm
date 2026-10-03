@@ -27,21 +27,23 @@
  * - `tool.definition` carries no session id; it runs per tool each time OpenCode builds the
  *   tool set, before the request's `messages.transform`.
  */
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { rmSync } from "node:fs";
+import { mkdir, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { tool, type Hooks, type Plugin, type PluginInput, type PluginOptions } from "@opencode-ai/plugin";
 
 import { formatTokens } from "./src/budget.ts";
 import { ClmSession } from "./src/clm.ts";
-import { MirrorDirectoryError } from "./src/mirror-store.ts";
+import { copyPrivateFile, MirrorDirectoryError, privateTemporaryParent } from "./src/mirror-store.ts";
 import { applyCompactionMode, nativeCompactionText, oneToolText, overflowNotCompactedText, ToolCallCounter } from "./src/compaction.ts";
 import { buildCompactPrompt, loadCompactPrompt } from "./src/compact.ts";
-import { continuityTools } from "./src/continuity.ts";
+import { ANNOTATIONS_FILE, continuityTools } from "./src/continuity.ts";
 import { filterCompacted, replaceInPlace, type OcMessage } from "./src/opencode.ts";
 import { statusText, systemGuidance } from "./src/presentation.ts";
 import { COMPACT_COMMAND, COMPACT_TEMPLATE, STATUS_COMMAND, STATUS_TEMPLATE } from "./src/commands.ts";
-import { changeSetting, resetSettings, showSetting } from "./src/overrides.ts";
+import { changeSetting, OVERRIDES_FILE, resetSettings, showSetting } from "./src/overrides.ts";
+import { STATE_FILE } from "./src/state.ts";
 import { CHANNEL_VERSION, commandOf, decodeRequest, encodeReply, MAX_READ_BYTES, type ChannelReply, type ChannelRequest } from "./src/channel.ts";
 import { settingsText } from "./src/settings-table.ts";
 import { parseClmCommand, type Page } from "./src/panel/command.ts";
@@ -218,27 +220,90 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	/** Sessions already told that CLM could not start for them (one error toast each). */
 	const openFailures = new Set<string>();
 
+	/** Private parent for sessions without a usable mirror directory, made on first use (`openWithoutMirror`). */
+	let unmirroredParent: Promise<string> | undefined;
+
 	/**
 	 * Opens a session in `mirrorDir`. Only a failure to create or use the session directory
 	 * (`MirrorDirectoryError`) is handled here; any other error propagates as before.
 	 * - An explicitly configured `mirrorDir` that fails: the session uses the project default
 	 *   `.opencode/clm` instead, and a toast names both. Inside the project the model's tools
 	 *   reach it without an `external_directory` permission prompt.
-	 * - The default itself fails: the request goes out with the raw history (the transform
-	 *   hook fails open), and the user gets one error toast for the session.
+	 * - The default fails too: the session runs without a mirror (`openWithoutMirror`).
 	 */
 	const openSession = async (id: string): Promise<ClmSession> => {
+		const failures: MirrorDirectoryError[] = [];
 		try {
 			return await ClmSession.open(id, settings, { steering });
 		} catch (error) {
-			if (!(error instanceof MirrorDirectoryError) || settings.mirrorDir === projectMirrorDir) throw error;
-			const clm = await ClmSession.open(id, { ...settings, mirrorDir: projectMirrorDir }, { steering });
-			const message = `could not use the configured mirrorDir ${settings.mirrorDir} (${describe(error.cause)}); the files of session ${id} are in ${clm.store.directory} instead.`;
-			log("warn", message);
-			toast(message, "warning");
-			await clm.log({ event: "mirror-dir-fallback", configured: settings.mirrorDir, used: projectMirrorDir, reason: describe(error.cause) });
-			return clm;
+			if (!(error instanceof MirrorDirectoryError)) throw error;
+			failures.push(error);
 		}
+		if (settings.mirrorDir !== projectMirrorDir) {
+			try {
+				const clm = await ClmSession.open(id, { ...settings, mirrorDir: projectMirrorDir }, { steering });
+				const error = failures[0]!;
+				const message = `could not use the configured mirrorDir ${settings.mirrorDir} (${describe(error.cause)}); the files of session ${id} are in ${clm.store.directory} instead.`;
+				log("warn", message);
+				toast(message, "warning");
+				await clm.log({ event: "mirror-dir-fallback", configured: settings.mirrorDir, used: projectMirrorDir, reason: describe(error.cause) });
+				return clm;
+			} catch (error) {
+				if (!(error instanceof MirrorDirectoryError)) throw error;
+				failures.push(error);
+			}
+		}
+		return await openWithoutMirror(id, failures);
+	};
+
+	/**
+	 * pi-clm's degraded mode (src/index.ts `replaceStore` and the `context` handler's `!store`
+	 * branch): no mirror, no protocol prompt, no edits; requests carry the raw history plus the
+	 * continuity annotations and their size notice. The session's files go to a private
+	 * directory under the OS temp directory, made once per process and removed at exit. The
+	 * model is never pointed there, so no `external_directory` prompt arises. state.json,
+	 * overrides.json and annotations.jsonl still readable in a failed session directory (ours,
+	 * not a symlink) are copied in before the session loads them; changes stay in the copy.
+	 * When even that fails, the open fails: raw history, one "not active" toast naming every
+	 * reason.
+	 */
+	const openWithoutMirror = async (id: string, failures: MirrorDirectoryError[]): Promise<ClmSession> => {
+		const reason = failures.map((failure) => `${failure.parent}: ${describe(failure.cause)}`).join("; ");
+		const copied: string[] = [];
+		let copiedFrom: string | undefined;
+		let clm: ClmSession;
+		try {
+			if (!unmirroredParent) {
+				unmirroredParent = privateTemporaryParent().then((parent) => {
+					process.once("exit", () => rmSync(parent, { recursive: true, force: true }));
+					return parent;
+				});
+				unmirroredParent.catch(() => (unmirroredParent = undefined));
+			}
+			const parent = await unmirroredParent;
+			const directory = sessionDirectory(parent, id);
+			await mkdir(directory, { recursive: true, mode: 0o700 });
+			for (const name of [STATE_FILE, OVERRIDES_FILE, ANNOTATIONS_FILE]) {
+				for (const failure of failures) {
+					const from = sessionDirectory(failure.parent, id);
+					if (await copyPrivateFile(from, directory, name)) {
+						copied.push(name);
+						copiedFrom ??= from;
+						break;
+					}
+				}
+			}
+			clm = await ClmSession.open(id, { ...settings, mirrorDir: parent }, { steering });
+		} catch (error) {
+			throw new Error(`no mirror directory could be used (${reason}), and no temporary directory either: ${describe(error)}`);
+		}
+		clm.mirrorUnavailable = reason;
+		const kept = copiedFrom ? `${copied.join(", ")} copied from ${copiedFrom}; changes stay` : "No saved session files found; the session's files are";
+		const message = `CLM editing not active for session ${id}: no mirror directory could be used (${reason}). Requests carry the raw history plus the continuity annotations and their size notice. ${kept} in ${clm.store.directory} for this server process only.`;
+		log("error", message);
+		toast(message, "error");
+		await clm.log({ event: "mirror-unavailable", reason, directory: clm.store.directory, ...(copiedFrom ? { copiedFrom, copied } : {}) });
+		return clm;
 	};
 
 	const session = (sessionID: string): Promise<ClmSession> => {
@@ -313,6 +378,11 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		const budget = fallbackBudget(clm.settings, clm.limits);
 		const model = buildPanelModel(files, budget ? { budget } : {});
 		model.enabled = clm.enabled;
+		// No mirror: name why, never the temporary directory (the text reaches the model).
+		if (clm.mirrorUnavailable !== undefined) {
+			model.mirrorUnavailable = clm.mirrorUnavailable;
+			model.mirrorPath = `unavailable (${clm.mirrorUnavailable})`;
+		}
 		const format = { ...(clm.limits.context ? { modelWindow: clm.limits.context } : {}) };
 		model.settings = settingsView(clm.settingsValues(), model, { format, ...(clm.settingsWarning ? { warning: clm.settingsWarning } : {}) });
 		return panelPageText(model, page);
@@ -336,12 +406,17 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				return text;
 			}
 			case "path":
-				return `CLM mirror: ${clm.mirrorPath}`;
+				return clm.mirrorUnavailable === undefined ? `CLM mirror: ${clm.mirrorPath}` : `CLM mirror: unavailable (${clm.mirrorUnavailable})`;
 			case "on":
 			case "off": {
 				// The same override the TUI and `/clm config editing` write.
 				await setSetting(clm, "editing", argument);
 				toast(`CLM ${argument} for this session`);
+				if (clm.mirrorUnavailable !== undefined) {
+					return argument === "on"
+						? "CLM is on for this session. No mirror is available: requests carry the raw history plus the continuity annotations."
+						: "CLM is off for this session: requests carry the raw history.";
+				}
 				return argument === "on"
 					? "CLM is on for this session: the mirror is refreshed before the next request."
 					: "CLM is off for this session: requests carry the raw history and the mirror is no longer read.";
@@ -599,7 +674,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				return;
 			}
 			await clm.refreshSettings();
-			if (!clm.enabled) return;
+			// Without a mirror the model gets no protocol text (pi-clm's before_agent_start).
+			if (!clm.enabled || clm.mirrorUnavailable !== undefined) return;
 			const limit = (hookInput.model as { limit?: { context?: number; output?: number } } | undefined)?.limit;
 			if (limit) clm.limits = { context: limit.context || undefined, output: limit.output || undefined };
 			const sections = [systemGuidance(clm.mirrorPath, clm.resolvedBudget()?.budget)];
@@ -649,7 +725,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				// it after this step and before the next one (src/compaction.ts). Sessions running
 				// concurrently in one server overwrite each other's value.
 				if (!compaction && liveConfig) {
-					const mode = clm.settings.enabled && clm.enabled ? clm.settings.compaction : "auto";
+					// Without a mirror, OpenCode's compaction is the only way to shrink: leave it as configured.
+					const mode = clm.settings.enabled && clm.enabled && clm.mirrorUnavailable === undefined ? clm.settings.compaction : "auto";
 					applyCompactionMode(liveConfig, mode, userAutoCompaction);
 				}
 				if (result.alert) {
@@ -724,6 +801,11 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				// live flag, not this session's setting, says what happened (another session may
 				// have set it). An overflow of the compaction request itself is not this case.
 				if (liveConfig?.compaction?.auto !== false || compactionRequests.has(sessionID)) return;
+				if (clm.mirrorUnavailable !== undefined) {
+					await clm.log({ event: "overflow-not-compacted", setting: clm.settings.compaction });
+					toast("The provider rejected the request as too long, and OpenCode's automatic compaction is off. Run /compact.", "warning");
+					return;
+				}
 				clm.queueNotice(overflowNotCompactedText(clm.mirrorPath));
 				await clm.log({ event: "overflow-not-compacted", setting: clm.settings.compaction });
 				toast("The provider rejected the request as too long, and OpenCode's automatic compaction is off. Edit the mirror or run /compact.", "warning");
@@ -784,9 +866,12 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			try {
 				const clm = await session(hookInput.sessionID);
 				const argument = (hookInput.arguments ?? "").trim();
-				text = hookInput.command === STATUS_COMMAND
-					? relay(await statusCommand(clm, argument))
-					: await compactCommand(clm, hookInput.sessionID, argument);
+				if (hookInput.command === STATUS_COMMAND) text = relay(await statusCommand(clm, argument));
+				else if (clm.mirrorUnavailable !== undefined) {
+					// pi-clm's compactCommand: nothing for the model to edit, so nothing is asked of it.
+					toast(`The context mirror is unavailable, so the model cannot edit its context (${clm.mirrorUnavailable}).`, "warning");
+					text = relay("[CLM] The context mirror is unavailable, so the model cannot edit its context.");
+				} else text = await compactCommand(clm, hookInput.sessionID, argument);
 			} catch (error) {
 				const message = `/${hookInput.command} failed: ${describe(error)}`;
 				toast(message, "error");

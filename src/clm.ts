@@ -211,6 +211,13 @@ export class ClmSession {
 	 * origin's checkpoints whose source the forked history still contains, then clears it.
 	 */
 	forkOrigin?: { sessionID: string; directory: string };
+	/**
+	 * Why no mirror directory could be used, set by the plugin (M1). The store then sits in a
+	 * private temporary directory the model is never told about; requests carry the raw
+	 * history plus the continuity annotations and their size notice, as pi-clm does when its
+	 * mirror store fails to initialize.
+	 */
+	mirrorUnavailable?: string;
 	/** What the last transform rendered; the next transform commits the mirror against it. */
 	baseline?: Baseline;
 	/** The snapshot now in the mirror file; continuity tools resolve block ids against it. */
@@ -650,7 +657,7 @@ export class ClmSession {
 	 * result's calibrated estimate, against the budget in force); undefined when off.
 	 */
 	sizeTrailer(output: string): string | undefined {
-		if (!this.settings.enabled || !this.enabled || !this.settings.trailer) return undefined;
+		if (!this.settings.enabled || !this.enabled || !this.settings.trailer || this.mirrorUnavailable !== undefined) return undefined;
 		const budget = this.resolvedBudget()?.budget;
 		if (!budget) return undefined;
 		return sizeTrailer(this.lastReading?.estimated ?? 0, this.calibrator.apply(this.textTokens(output)), budget);
@@ -1049,6 +1056,35 @@ export class ClmSession {
 		}
 	}
 
+	/**
+	 * Without a mirror (`mirrorUnavailable`): the raw history, then the continuity message and
+	 * its size notice. Nothing is projected, rendered or measured; queued notices name the
+	 * mirror, so they are dropped. pi-clm src/index.ts `context` handler, `!store` branch.
+	 */
+	private async transformWithoutMirror(raw: OcMessage[]): Promise<TransformResult> {
+		this.baseline = undefined;
+		this.compacted = false;
+		this.pendingNotices = [];
+		if (this.compacting) {
+			this.compacting = false;
+			return { messages: raw, notices: [] };
+		}
+		this.requests += 1;
+		const continuity = formatContinuityMessage({ annotations: await this.loadAnnotations(), effectiveMessages: flatten(raw) });
+		const tokens = continuity ? this.textTokens(continuity) : 0;
+		const notices = this.continuitySize.observe(tokens) ? [continuitySizeNoticeText(tokens)] : [];
+		const context = this.context(raw);
+		const messages = [
+			...raw,
+			...(continuity ? [noteMessage(continuity, "continuity", context)] : []),
+			...(notices.length > 0 ? [noteMessage(notices.join("\n\n"), `notice:${this.requests}`, context)] : []),
+		];
+		this.lastRequest = { rawMessages: raw.length, sentMessages: messages.length, mirrorBlocks: 0 };
+		const errors = this.pendingErrors;
+		this.pendingErrors = [];
+		return { messages, notices, ...(errors.length > 0 ? { errors } : {}) };
+	}
+
 	private async transformNow(raw: OcMessage[]): Promise<TransformResult> {
 		await this.refreshSettings();
 		if (!this.settings.enabled || !this.enabled) {
@@ -1056,6 +1092,7 @@ export class ClmSession {
 			this.compacting = false;
 			return { messages: raw, notices: [], ...this.drainAlerts() };
 		}
+		if (this.mirrorUnavailable !== undefined) return await this.transformWithoutMirror(raw);
 		const pinned = pinnedCount(raw);
 		const pinnedMessages = raw.slice(0, pinned);
 		const context = this.context(raw);
@@ -1311,7 +1348,7 @@ export class ClmSession {
 			...(changed ? { changed } : {}),
 			...(this.settingsWarning ? { settingsWarning: this.settingsWarning } : {}),
 			sessionID: this.sessionID,
-			mirrorPath: this.mirrorPath,
+			mirrorPath: this.mirrorUnavailable === undefined ? this.mirrorPath : `unavailable, requests carry the raw history (${this.mirrorUnavailable})`,
 			revision: this.state.revision,
 			accepted: this.accepted,
 			rejected: this.rejected,
