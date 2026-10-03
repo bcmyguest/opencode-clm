@@ -90,6 +90,13 @@ notes: 49 requests, 16 accepted edits, 0 rejected. The server reused cache after
 and prefilled 11,240 tokens in total, where a prefix-only cache would have prefilled
 214,585 (95% less); requests of 20–48k tokens prefilled 34–3,523 tokens each.
 
+**Nine agent tasks in OpenCode** (find and fix, opencode-clm 0.3.0, 1 run each), CLM
+at a 32k budget vs CLM off: both solved 9/9; CLM took 55.5 s per task vs 91.3 s and
+prefilled 2,868 tokens vs 7,317 on average. CLM accepted only 1 edit in 9 runs because no
+task came near the budget, so most of the gain looks behavioural: told its budget, the
+model makes fewer tool calls. One CLM run read files outside its workspace and is not
+comparable.
+
 Flash-Next was not trained for CLM, so it makes more edit mistakes than the paper's
 trained models. Hosted APIs are untested.
 
