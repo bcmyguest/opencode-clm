@@ -23,10 +23,13 @@
   ],
   "main": "./index.ts",
   "exports": {
-    ".": "./index.ts"
+    ".": "./index.ts",
+    "./server": "./index.ts",
+    "./tui": "./tui.ts"
   },
   "files": [
     "index.ts",
+    "tui.ts",
     "src/**/*.ts",
     "skills/**",
     "steering/**",
@@ -51,8 +54,20 @@
   "dependencies": {
     "@opencode-ai/plugin": "^1.18.34"
   },
+  "peerDependencies": {
+    "@opentui/core": ">=0.4.5"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@opentui/core": "0.4.5",
+    "@opentui/keymap": "0.4.5",
+    "@opentui/solid": "0.4.5",
     "@types/bun": "1.3.14",
+    "@xterm/headless": "6.0.0",
     "typescript": "5.9.3"
   }
 }

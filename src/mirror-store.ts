@@ -14,7 +14,7 @@ export function defaultMirrorParent(): string {
 	return join(stateHome, "opencode-clm", "mirrors");
 }
 
-function safeSessionId(sessionId: string): string {
+export function safeSessionId(sessionId: string): string {
 	const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 64);
 	return safe || "session";
 }
