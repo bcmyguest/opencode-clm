@@ -6,12 +6,15 @@ import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui";
 
 import { userOwnsStatusCommand } from "../commands.ts";
 import { type ClmCommand, type Page } from "../panel/command.ts";
-import { changeSetting, resetSettings, sessionValues, showSetting } from "../overrides.ts";
+import { changeSetting, overridesValues, resetSettings, sessionValues, showSetting } from "../overrides.ts";
+import { COMMAND_EVENT, commandOf, createChannelClient, type ChannelOperation, type ChannelReply } from "../channel.ts";
+import { createLocator, resetSession } from "./locator.ts";
+import { outsideMessage, resolveSource, sourceOverrides, type FileApi, type SessionSource } from "./remote.ts";
 import type { SettingsValues } from "../settings-table.ts";
 import { interceptEnter } from "./intercept.ts";
 import { buildPanelModel, type PanelModel } from "../panel/model.ts";
 import { formatTokenCount } from "../panel/timeline.ts";
-import { readSessionFiles, sessionDirectory } from "../session-files.ts";
+import { readSessionDirectory, sessionDirectory, type SessionReader } from "../session-files.ts";
 import { resolveSettings, type ClmSettings } from "../settings.ts";
 import { fallbackBudget, latestUsage, modelLimits, overridesNewer, serverBase, serverPluginOptions, settingsView } from "./data.ts";
 import type { SessionFiles } from "../panel/files.ts";
@@ -24,6 +27,15 @@ const RELOAD_DEBOUNCE_MS = 250;
 const PACKAGE_INDEX_URL = new URL("../../index.ts", import.meta.url).href;
 
 const PAGES = new Set<Page>(["overview", "input", "edits", "settings"]);
+/** `/clm path` names how this TUI reads the files. */
+const SOURCE_LABEL: Record<SessionSource["kind"], string> = {
+	local: "local disk",
+	remote: "server file API",
+	channel: "server plugin channel",
+	outside: "unreadable from this TUI",
+};
+/** Reads nothing: a session directory the attached TUI cannot reach. */
+const NO_READER: SessionReader = { name: "none", isDirectory: async () => false, readText: async () => undefined, list: async () => [], stamp: async () => undefined };
 
 function describe(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -40,6 +52,60 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 		return resolveSettings(options, process.env, api.state.path.directory);
 	};
 
+	// ---- the channel to the server plugin (src/channel.ts) --------------------------------
+	const channel = createChannelClient({
+		publish: async (command) => {
+			const result = await api.client.tui.publish({ body: { type: COMMAND_EVENT, properties: { command } } });
+			if (result.error !== undefined) throw new Error(`publishing to the server failed: ${JSON.stringify(result.error)}`);
+		},
+		subscribe: (handler) => api.event.on(COMMAND_EVENT, (event) => {
+			const command = commandOf(event);
+			if (command !== undefined) handler(command);
+		}),
+	});
+
+	/** Sends one operation; throws the server's error text, or a timeout. */
+	const ask = async (sessionID: string, operation: ChannelOperation, timeoutMs?: number): Promise<ChannelReply> => {
+		const reply = await channel.request(sessionID, operation, timeoutMs);
+		if (!reply.ok) throw new Error(reply.text);
+		return reply;
+	};
+
+	/** Where the server keeps each session's files (`locate`), cached; see locator.ts. */
+	const locator = createLocator({ ask });
+
+	/** When this TUI last changed a session's overrides through the channel (no mtime remotely). */
+	const channelWrites = new Map<string, number>();
+
+	/** `write`: the source a setting change goes to (never the read-only same-disk guess). */
+	const source = (sessionID: string, options: { write?: boolean } = {}): Promise<SessionSource> => resolveSource({
+		ownDirectory: sessionDirectory(settings().mirrorDir, sessionID),
+		serverRoot: api.state.path.directory,
+		file: api.client.file as unknown as FileApi,
+		locate: () => locator.locate(sessionID),
+		located: () => locator.fresh(sessionID),
+		relocate: () => {
+			const own = sessionDirectory(settings().mirrorDir, sessionID);
+			// The server keeps this session's files elsewhere: show them.
+			locator.relocate(sessionID, (value) => {
+				if (value.directory !== own) refreshPanel(sessionID);
+			});
+		},
+		ask: (operation) => ask(sessionID, operation),
+	}, options);
+
+	const readFiles = async (sessionID: string, from: SessionSource): Promise<SessionFiles> => {
+		if (from.kind === "outside") {
+			const files = await readSessionDirectory(from.directory, sessionID, NO_READER);
+			files.warnings.push(outsideMessage(from));
+			return files;
+		}
+		const files = await readSessionDirectory(from.directory, sessionID, from.reader);
+		// A read through the server failed: ask where the files are again next time.
+		if (from.kind !== "local" && files.warnings.some((warning) => warning.startsWith("Could not"))) locator.forget(sessionID);
+		return files;
+	};
+
 	/**
 	 * Base and effective settings of a session. The server is the authority on the base:
 	 * once it wrote snapshot.json, the base is the server's (`serverBase`), so a TUI whose
@@ -47,24 +113,25 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 	 * Before the first request, the TUI's own resolution of the server's options stands in.
 	 * Editing base = state.json's `enabled`. Effective = base + the session's overrides.json.
 	 */
-	const sessionSettings = async (sessionID: string, files: Pick<SessionFiles, "state" | "snapshot">) => {
+	const sessionSettings = async (sessionID: string, from: SessionSource, files: Pick<SessionFiles, "state" | "snapshot">) => {
 		const own = settings();
-		const { base, source } = serverBase(own, files.snapshot);
-		const directory = sessionDirectory(own.mirrorDir, sessionID);
+		const { base, source: baseSource } = serverBase(own, files.snapshot);
 		const stored = files.state && typeof files.state === "object" ? (files.state as { enabled?: unknown }).enabled : undefined;
 		const baseEditing = typeof stored === "boolean" ? stored : true;
-		const read = await sessionValues(directory, base, baseEditing);
+		const read = from.kind === "local"
+			? await sessionValues(from.directory, base, baseEditing)
+			: overridesValues(await sourceOverrides(from), base, baseEditing, channelWrites.get(sessionID));
 		const values: { base: SettingsValues; effective: SettingsValues } = { base: { editing: baseEditing, settings: base }, effective: read.values };
-		return { base, baseSource: source, baseEditing, directory, values, ...(read.warning ? { warning: read.warning } : {}), ...(read.mtimeMs !== undefined ? { overridesAt: read.mtimeMs } : {}) };
+		return { base, baseSource, baseEditing, directory: from.directory, values, ...(read.warning ? { warning: read.warning } : {}), ...(read.mtimeMs !== undefined ? { overridesAt: read.mtimeMs } : {}) };
 	};
 
 	const loadModel = async (sessionID: string): Promise<PanelModel> => {
-		const resolved = settings();
-		const files = await readSessionFiles(resolved.mirrorDir, sessionID);
+		const from = await source(sessionID);
+		const files = await readFiles(sessionID, from);
 		const messages = api.state.session.messages(sessionID);
 		const latest = latestUsage(messages);
 		const limits = modelLimits(messages, api.state.provider);
-		const current = await sessionSettings(sessionID, files);
+		const current = await sessionSettings(sessionID, from, files);
 		const budget = fallbackBudget(current.values.effective.settings, limits);
 		// overrides.json written after the last request: its budget is in force from the next
 		// request, so the panel shows it rather than the snapshot's.
@@ -78,17 +145,27 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 		return model;
 	};
 
-	/** Validates and writes one setting to the session's overrides.json; returns `Label: value`. */
-	const applySetting = async (sessionID: string, name: string, value: string): Promise<string> => {
-		const files = await readSessionFiles(settings().mirrorDir, sessionID);
-		const current = await sessionSettings(sessionID, files);
+	/**
+	 * Validates and saves one setting; returns `Label: value` and whether the server
+	 * confirmed it with its own toast. Local files: written here (overrides.json, which the
+	 * server reads before each request). Otherwise the server applies it over the channel.
+	 */
+	const applySetting = async (sessionID: string, name: string, value: string): Promise<{ text: string; viaServer: boolean }> => {
+		const from = await source(sessionID, { write: true });
+		if (from.kind !== "local") {
+			const reply = await ask(sessionID, { op: "set", setting: name, value });
+			channelWrites.set(sessionID, Date.now());
+			return { text: reply.text, viaServer: true };
+		}
+		const files = await readFiles(sessionID, from);
+		const current = await sessionSettings(sessionID, from, files);
 		const result = await changeSetting({
 			sessionDirectory: current.directory,
 			base: current.base,
 			baseEditing: current.baseEditing,
 			projectDirectory: api.state.path.directory,
 		}, name, value);
-		return result.text;
+		return { text: result.text, viaServer: false };
 	};
 
 	/** False when `/clm` belongs to someone else: `commands: false`, or a user-defined command. */
@@ -170,8 +247,8 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 		if (active?.sessionID === sessionID) void active.controller.reload();
 	};
 
-	/** Every `/clm …` line the intercept consumes (`/clm reset` goes to the server). */
-	const handle = async (command: Exclude<ClmCommand, { kind: "server" }>): Promise<void> => {
+	/** Every `/clm …` line the intercept consumes (`/clm reset` goes to the server over the channel). */
+	const handle = async (command: ClmCommand): Promise<void> => {
 		if (command.kind === "open") {
 			open(command.page);
 			return;
@@ -186,35 +263,56 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 			return;
 		}
 		switch (command.kind) {
-			case "path":
-				toast(sessionDirectory(settings().mirrorDir, sessionID));
+			case "path": {
+				const from = await source(sessionID);
+				toast(`${from.directory} (${SOURCE_LABEL[from.kind]})`);
 				return;
+			}
 			case "status":
 				toast(statusSummary(await loadModel(sessionID)));
 				return;
 			case "config-show": {
-				const files = await readSessionFiles(settings().mirrorDir, sessionID);
-				const current = await sessionSettings(sessionID, files);
+				const from = await source(sessionID);
+				const current = await sessionSettings(sessionID, from, await readFiles(sessionID, from));
 				toast(showSetting(command.setting, current.values.effective));
 				return;
 			}
 			case "config-set":
 				try {
-					toast(`CLM ${await applySetting(sessionID, command.setting, command.value)}.`);
+					const result = await applySetting(sessionID, command.setting, command.value);
+					if (!result.viaServer) toast(`CLM ${result.text}.`);
 				} catch (error) {
 					toast(describe(error), "warning");
 				}
 				refreshPanel(sessionID);
 				return;
-			case "config-reset":
-				await resetSettings(sessionDirectory(settings().mirrorDir, sessionID));
-				toast("CLM settings reset to the defaults.");
+			case "config-reset": {
+				const from = await source(sessionID, { write: true });
+				if (from.kind === "local") {
+					await resetSettings(from.directory);
+					toast("CLM settings reset to the defaults.");
+				} else {
+					await ask(sessionID, { op: "settings-reset" });
+					channelWrites.set(sessionID, Date.now());
+				}
 				refreshPanel(sessionID);
 				return;
-			case "enable":
+			}
+			case "enable": {
 				// The same override as the server's `/clm on|off` and `/clm config editing`.
-				await applySetting(sessionID, "editing", command.enabled ? "on" : "off");
-				toast(`CLM ${command.enabled ? "on" : "off"} for this session`);
+				const result = await applySetting(sessionID, "editing", command.enabled ? "on" : "off");
+				if (!result.viaServer) toast(`CLM ${command.enabled ? "on" : "off"} for this session`);
+				refreshPanel(sessionID);
+				return;
+			}
+			case "server":
+				// `/clm reset`: the server owns state.json; it drops the revision and toasts.
+				await resetSession({
+					sessionID,
+					ask,
+					command: (parameters) => api.client.session.command(parameters),
+					toast,
+				});
 				refreshPanel(sessionID);
 				return;
 		}
@@ -225,6 +323,7 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 			focused: () => api.renderer.currentFocusedRenderable as never,
 			owned,
 			handle,
+			serverChannel: () => true,
 			report: (message) => toast(message, "warning"),
 		});
 	}, { priority: 100 });
@@ -244,6 +343,7 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 		active = undefined;
 		offIdle();
 		offMessage();
+		channel.dispose();
 		disposeIntercept();
 		disposeLayer();
 	});

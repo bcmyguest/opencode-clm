@@ -337,8 +337,9 @@ compile step skips `node_modules`; it builds opentui renderables directly.
 bindings are inactive while it is open; it never enters model context. `/clm <page>` opens
 a page directly. A key interceptor at priority 100 sees Enter before autocomplete and
 prompt submit: a prompt line matching `/clm…` is handled in the TUI and the prompt is
-cleared (a usage error keeps the text so it can be fixed); only `/clm reset` reaches the
-server, because it rewrites `state.json`. When the config's `/clm` is not this package's
+cleared (a usage error keeps the text so it can be fixed); `/clm reset` rewrites
+`state.json`, so it goes to the server plugin over a turn-free channel (`src/channel.ts`:
+a `tui.command.execute` event the server's `event` hook answers). When the config's `/clm` is not this package's
 (a user-defined command, or `commands: false`), the intercept lets every line through.
 Without the TUI (`opencode run`, a bare server), the server's `/clm` command returns the
 same pages and `/clm status` as text. Four pages:
@@ -407,8 +408,10 @@ skipped, revision files are cached by mtime and size.
   system prompt and the task statement outside the mirror and lowers every authored role
   to non-authoritative text, but it does not defend against a model that chooses to drop
   important context.
-- `opencode attach` to a remote server: the session files are not local, so the panel
-  shows no data.
+- `opencode attach` when the TUI cannot see the session directory: the panel reads it
+  through the server (OpenCode's file API inside the server's directory, else the server
+  plugin over the channel), and settings changes go to the server plugin. The server needs
+  the same plugin version; without an answer the TUI reports a timeout after 5 s.
 
 ## 10. Module map
 
@@ -507,5 +510,5 @@ come from `events.jsonl`, so the panel works on resume without extra persistence
 - A setting changed while a request runs applies from the next request.
 - Duplicate `/clm` rows appear in autocomplete (the server command and the TUI slash row);
   Enter is handled by the TUI either way.
-- Tool backends on another machine or in a container cannot see the mirror, and
-  `opencode attach` to a remote server shows no panel data (§9).
+- Tool backends on another machine or in a container cannot see the mirror. Under
+  `opencode attach` the panel reads through the server (§9).

@@ -51,8 +51,8 @@ writes the spec to both files. By hand, add it to both `plugin` lists; options g
 | `/clm-compact [instructions]` | ask the model to compact its own context now; anything you add (e.g. what to keep) is passed along. The result shows on the **edits** page |
 | `/clm on` / `off` / `reset` / `path` | enable, use raw context, discard the accepted revision, show the mirror's path |
 
-With the TUI plugin, typed `/clm …` lines run in the TUI and cost no model turn. Only
-`/clm reset` reaches the server command, which costs one turn.
+With the TUI plugin, typed `/clm …` lines run in the TUI and cost no model turn;
+`/clm reset` is handed to the server plugin, also without a turn.
 
 In the panel: `1–4` or `Tab` switch pages, `← →` step through the overview's markers or
 the edits page's revisions, `z` zooms the chart, `Enter` opens the selection, `r`

@@ -25,6 +25,14 @@ export const CASE_TIMEOUT_MS = 2 * RUN_TIMEOUT_MS + 30_000;
 
 let root = "";
 const mocks: MockServer[] = [];
+/** Stops for every `opencode serve` started. */
+const servers: Array<() => void> = [];
+
+/** A path under the shared temp root (created lazily). */
+export function tempPath(name: string): string {
+	shared();
+	return join(root, name);
+}
 
 function shared() {
 	if (!root) root = mkdtempSync(join(tmpdir(), "opencode-clm-e2e-"));
@@ -35,6 +43,7 @@ function shared() {
 
 /** Stop every mock and remove the temp tree (kept with OPENCODE_CLM_E2E_KEEP=1). */
 export function cleanup(): void {
+	for (const stop of servers) stop();
 	for (const mock of mocks) mock.stop();
 	if (root && !process.env.OPENCODE_CLM_E2E_KEEP) rmSync(root, { recursive: true, force: true });
 	else if (root) console.warn(`kept ${root}`);
@@ -59,6 +68,19 @@ export interface CaseOptions {
 	autocompact?: boolean;
 	/** Omit the plugin from opencode.json (control runs). */
 	withoutPlugin?: boolean;
+	/**
+	 * Name the mirror dir only in the server processes' CLM_MIRROR_DIR, not in the plugin
+	 * options, so a TUI with its own CLM_MIRROR_DIR resolves a different, absent directory
+	 * (attach tests). `inside`: `<project>/.opencode/clm-server`, readable through OpenCode's
+	 * file API; `outside`: the usual per-case mirror dir outside the project.
+	 */
+	mirrorViaServerEnv?: "inside" | "outside";
+}
+
+/** A running `opencode serve`. */
+export interface Served {
+	url: string;
+	stop(): void;
 }
 
 export class Case {
@@ -75,7 +97,7 @@ export class Case {
 		this.project = join(base, "project");
 		this.data = join(base, "xdg-data");
 		this.state = join(base, "xdg-state");
-		this.mirror = join(base, "mirror");
+		this.mirror = options.mirrorViaServerEnv === "inside" ? join(this.project, ".opencode", "clm-server") : join(base, "mirror");
 		for (const path of [this.project, this.data, this.state, this.mirror]) mkdirSync(path, { recursive: true });
 		this.mock = startMockServer(script);
 		mocks.push(this.mock);
@@ -99,7 +121,7 @@ export class Case {
 					models: { [MODEL_ID]: { name: "mock", tool_call: true, limit: o.limit ?? { context: 32000, output: 2048 } } },
 				},
 			},
-			...(o.withoutPlugin ? {} : { plugin: [[PLUGIN, { mirrorDir: this.mirror, ...(o.plugin ?? {}) }]] }),
+			...(o.withoutPlugin ? {} : { plugin: [[PLUGIN, { ...(o.mirrorViaServerEnv ? {} : { mirrorDir: this.mirror }), ...(o.plugin ?? {}) }]] }),
 			...(o.config ?? {}),
 		};
 		writeFileSync(join(this.project, "opencode.json"), JSON.stringify(config, null, 2));
@@ -130,6 +152,7 @@ export class Case {
 		};
 		// The env flag overrides the config, so it is set only when compaction must stay off.
 		if (!this.options.autocompact) env.OPENCODE_DISABLE_AUTOCOMPACT = "1";
+		if (this.options.mirrorViaServerEnv) env.CLM_MIRROR_DIR = this.mirror;
 		return env;
 	}
 
@@ -168,6 +191,53 @@ export class Case {
 			clearTimeout(timer);
 			killGroup();
 		}
+	}
+
+	/**
+	 * `opencode serve` in the project directory on a free loopback port; resolves once it
+	 * listens. `stop()` kills its process group.
+	 */
+	async serve(): Promise<Served> {
+		const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+		const port = probe.port;
+		probe.stop(true);
+		const child = Bun.spawn([OPENCODE, "serve", "--hostname", "127.0.0.1", "--port", String(port), "--print-logs"], {
+			cwd: this.project,
+			env: this.env(),
+			stdout: "pipe",
+			stderr: "pipe",
+			stdin: "ignore",
+			detached: true,
+		});
+		const stop = () => {
+			try {
+				process.kill(-child.pid, "SIGKILL");
+			} catch {
+				// group already gone
+			}
+		};
+		servers.push(stop);
+		void new Response(child.stderr).text().catch(() => undefined);
+		const decoder = new TextDecoder();
+		let output = "";
+		// One read loop for the server's life: it finds the URL, then keeps the pipe drained.
+		const url = new Promise<string | undefined>((resolve) => {
+			void (async () => {
+				const reader = child.stdout.getReader();
+				for (;;) {
+					const chunk = await reader.read().catch(() => ({ done: true, value: undefined }));
+					if (chunk.done) break;
+					output += decoder.decode(chunk.value);
+					const match = output.match(/listening on (http:\/\/\S+)/);
+					if (match) resolve(match[1]);
+				}
+				resolve(undefined);
+			})();
+		});
+		const found = await Promise.race([url, Bun.sleep(RUN_TIMEOUT_MS).then(() => undefined)]);
+		if (found) return { url: found, stop };
+		stop();
+		throw new Error(`e2e ${this.name}: opencode serve did not start; stdout:\n${output.slice(-2000)}`);
 	}
 
 	/**

@@ -170,9 +170,21 @@ export async function resetSettings(sessionDirectory: string): Promise<void> {
  * Current values of one session, read from its overrides.json (non-strict, never throws for
  * bad files). `mtimeMs`: when overrides.json was last written, if it exists.
  */
-export async function sessionValues(sessionDirectory: string, base: ClmSettings, baseEditing: boolean): Promise<{ values: SettingsValues; warning?: string; overrides: ClmOverrides; mtimeMs?: number }> {
+export async function sessionValues(sessionDirectory: string, base: ClmSettings, baseEditing: boolean): Promise<SessionValues> {
 	const read = await readOverrides(sessionDirectory);
 	const mtimeMs = await stat(overridesPath(sessionDirectory)).then((info) => info.mtimeMs, () => undefined);
+	return overridesValues(read, base, baseEditing, mtimeMs);
+}
+
+export interface SessionValues {
+	values: SettingsValues;
+	warning?: string;
+	overrides: ClmOverrides;
+	mtimeMs?: number;
+}
+
+/** `sessionValues` for overrides already read (e.g. through the server's file API). */
+export function overridesValues(read: OverridesRead, base: ClmSettings, baseEditing: boolean, mtimeMs?: number): SessionValues {
 	const at = mtimeMs !== undefined ? { mtimeMs } : {};
 	try {
 		return { values: valuesOf(base, baseEditing, read.overrides), overrides: read.overrides, ...(read.warning ? { warning: read.warning } : {}), ...at };

@@ -17,13 +17,14 @@ export class TuiDriver {
 	private readonly term: Terminal;
 	private readonly proc: ReturnType<typeof Bun.spawn>;
 
-	constructor(c: Case, args: string[], readonly cols = 120, readonly rows = 34) {
+	/** `env` is merged over the case's environment (e.g. a TUI-only CLM_MIRROR_DIR). */
+	constructor(c: Case, args: string[], readonly cols = 120, readonly rows = 34, env: Record<string, string> = {}) {
 		writeFileSync(join(c.project, "tui.json"), JSON.stringify({ plugin: [[TUI_PLUGIN, {}]] }, null, 2));
 		this.term = new Terminal({ cols, rows, allowProposedApi: true });
 		const term = this.term;
 		this.proc = Bun.spawn([OPENCODE, ...args], {
 			cwd: c.project,
-			env: { ...c.env(), TERM: "xterm-256color" },
+			env: { ...c.env(), TERM: "xterm-256color", ...env },
 			terminal: { cols, rows, data: (_terminal: unknown, data: Uint8Array) => term.write(data) },
 		} as never);
 	}

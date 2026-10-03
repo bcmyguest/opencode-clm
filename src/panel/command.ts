@@ -54,7 +54,8 @@ export function parseClmCommand(text: string): ClmCommand | undefined {
 		case "off":
 			return rest.length === 0 ? { kind: "enable", enabled: word === "on" } : { kind: "usage", text: CLM_USAGE };
 		case "reset":
-			return { kind: "server", args };
+			// Extra words are a typo, not a reset: dropping the revision cannot be undone.
+			return rest.length === 0 ? { kind: "server", args } : { kind: "usage", text: CLM_USAGE };
 		case "config": {
 			if (rest.length === 0) return { kind: "open", page: "settings" };
 			const setting = rest[0]!.toLowerCase();

@@ -38,4 +38,9 @@ describe("parseClmCommand", () => {
 		expect(parseClmCommand("/clm bogus")).toEqual({ kind: "usage", text: CLM_USAGE });
 		expect(parseClmCommand("/clm status now")).toEqual({ kind: "usage", text: CLM_USAGE });
 	});
+
+	test("/clm reset with extra words is a usage error, not a reset", () => {
+		expect(parseClmCommand("/clm reset now")).toEqual({ kind: "usage", text: CLM_USAGE });
+		expect(parseClmCommand("/clm reset   ")).toEqual({ kind: "server", args: "reset" });
+	});
 });

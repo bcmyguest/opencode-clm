@@ -6,7 +6,7 @@ import type { ClmCommand } from "../../src/panel/command.ts";
 import { interceptEnter, type FocusedPrompt } from "../../src/tui/intercept.ts";
 import { userOwnsStatusCommand } from "../../src/commands.ts";
 
-function run(text: string | undefined, options: { event?: Record<string, unknown>; owned?: boolean; focused?: FocusedPrompt | null; fail?: boolean } = {}) {
+function run(text: string | undefined, options: { event?: Record<string, unknown>; owned?: boolean; focused?: FocusedPrompt | null; fail?: boolean; serverChannel?: boolean } = {}) {
 	const calls = { consumed: 0, cleared: 0, handled: [] as ClmCommand[], reports: [] as string[] };
 	const focused = options.focused !== undefined
 		? options.focused
@@ -21,6 +21,7 @@ function run(text: string | undefined, options: { event?: Record<string, unknown
 				if (options.fail) throw new Error("boom");
 			},
 			report: (message) => calls.reports.push(message),
+			...(options.serverChannel !== undefined ? { serverChannel: () => options.serverChannel! } : {}),
 		},
 	);
 	return { result, calls };
@@ -45,6 +46,15 @@ describe("Enter intercept", () => {
 			expect(run("/clm", { event: { [modifier]: true } }).calls.consumed).toBe(0);
 		}
 		expect(run("/clm", { event: { name: "a" } }).calls.consumed).toBe(0);
+	});
+
+	test("with the server channel, /clm reset is consumed and handed over", async () => {
+		const { result, calls } = run("/clm reset", { serverChannel: true });
+		expect([result, calls.consumed, calls.cleared]).toEqual([{ kind: "server", args: "reset" }, 1, 1]);
+		await Bun.sleep(0);
+		expect(calls.handled).toEqual([{ kind: "server", args: "reset" }]);
+		expect(run("/clm reset", { serverChannel: false }).calls.consumed).toBe(0);
+		expect(run("/clm reset", { serverChannel: true, owned: false }).calls.consumed).toBe(0);
 	});
 
 	test("fails open without the prompt internals", () => {
@@ -88,5 +98,13 @@ describe("Enter intercept ownership errors", () => {
 		);
 		expect([result, consumed]).toEqual([undefined, 0]);
 		expect(reports).toEqual(["CLM: budget must be a number of tokens"]);
+	});
+
+	test("/clm reset with extra words keeps the text and hands nothing to the server", async () => {
+		const { result, calls } = run("/clm reset please", { serverChannel: true });
+		expect(result?.kind).toBe("usage");
+		expect([calls.consumed, calls.cleared]).toEqual([1, 0]);
+		await Bun.sleep(0);
+		expect(calls.handled.map((command) => command.kind)).toEqual(["usage"]);
 	});
 });

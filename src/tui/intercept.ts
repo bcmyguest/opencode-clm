@@ -1,5 +1,6 @@
-// The TUI's Enter intercept for typed `/clm …` lines: handled in the TUI with no model turn,
-// except `/clm reset` (the server owns state.json). Host-free so it can be unit-tested with
+// The TUI's Enter intercept for typed `/clm …` lines: handled in the TUI with no model turn.
+// `/clm reset` (the server owns state.json) is consumed only when `serverChannel` says the
+// TUI can hand it to the server plugin without a turn (src/channel.ts). Host-free so it can be unit-tested with
 // a fake key context and focused prompt. Written for this package.
 
 import { parseClmCommand, type ClmCommand } from "../panel/command.ts";
@@ -20,8 +21,10 @@ export interface InterceptDeps {
 	focused(): FocusedPrompt | null | undefined;
 	/** False when `/clm` is not this package's to handle (`commands: false`, or a user-defined `/clm`). */
 	owned(): boolean;
-	/** Runs a command the TUI handles. */
-	handle(command: Exclude<ClmCommand, { kind: "server" }>): Promise<void>;
+	/** Runs a command the TUI handles (a `server` one only when `serverChannel()` is true). */
+	handle(command: ClmCommand): Promise<void>;
+	/** True when `server` commands (`/clm reset`) go over the turn-free channel; absent = pass through. */
+	serverChannel?(): boolean;
 	/** Shows an error from `handle`. */
 	report(message: string): void;
 }
@@ -31,7 +34,7 @@ export interface InterceptDeps {
  * handles; everything else passes through untouched: other text, `/clm-compact`, `/clm
  * reset`, modified Enter, a prompt without the expected internals, and every `/clm` line
  * when the command belongs to someone else. A usage error keeps the typed text so it can be
- * fixed. Returns the command handled, for tests.
+ * fixed. With `serverChannel`, `/clm reset` is consumed as well. Returns the command handled, for tests.
  */
 export function interceptEnter(context: InterceptContext, deps: InterceptDeps): ClmCommand | undefined {
 	const event = context.event;
@@ -39,7 +42,8 @@ export function interceptEnter(context: InterceptContext, deps: InterceptDeps): 
 	const focused = deps.focused();
 	if (!focused || typeof focused.plainText !== "string" || typeof focused.setText !== "function") return undefined;
 	const command = parseClmCommand(focused.plainText);
-	if (!command || command.kind === "server") return undefined;
+	if (!command) return undefined;
+	if (command.kind === "server" && !deps.serverChannel?.()) return undefined;
 	// A throw here would land in the host's key handling: fail open, let the line through.
 	let owned: boolean;
 	try {

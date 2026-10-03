@@ -27,6 +27,9 @@
  * - `tool.definition` carries no session id; it runs per tool each time OpenCode builds the
  *   tool set, before the request's `messages.transform`.
  */
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+
 import { tool, type Hooks, type Plugin, type PluginInput, type PluginOptions } from "@opencode-ai/plugin";
 
 import { ClmSession } from "./src/clm.ts";
@@ -36,11 +39,12 @@ import { replaceInPlace, type OcMessage } from "./src/opencode.ts";
 import { statusText, systemGuidance } from "./src/presentation.ts";
 import { COMPACT_COMMAND, COMPACT_TEMPLATE, STATUS_COMMAND, STATUS_TEMPLATE } from "./src/commands.ts";
 import { changeSetting, resetSettings, showSetting } from "./src/overrides.ts";
+import { CHANNEL_VERSION, commandOf, decodeRequest, encodeReply, MAX_READ_BYTES, type ChannelReply, type ChannelRequest } from "./src/channel.ts";
 import { settingsText } from "./src/settings-table.ts";
 import { parseClmCommand, type Page } from "./src/panel/command.ts";
 import { buildPanelModel } from "./src/panel/model.ts";
 import { panelPageText } from "./src/panel/text.ts";
-import { readSessionDirectory } from "./src/session-files.ts";
+import { readSessionDirectory, sessionDirectory } from "./src/session-files.ts";
 import { fallbackBudget, settingsView } from "./src/tui/data.ts";
 import { resolveSettings, SKILLS_DIR, type ClmSettings } from "./src/settings.ts";
 import { loadSteeringDocument, steeringPromptSection, type SteeringDocument } from "./src/steering.ts";
@@ -72,6 +76,13 @@ export function checkSessionID(sessionID: unknown): string {
 		throw new Error(`CLM refuses session id ${JSON.stringify(sessionID)}: it must not contain "/", "\\" or "..".`);
 	}
 	return sessionID;
+}
+
+/** ENOENT/ENOTDIR → undefined (missing); anything else rethrown. */
+function missingAsUndefined(error: unknown): undefined {
+	const code = (error as NodeJS.ErrnoException)?.code;
+	if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+	throw error;
 }
 
 function isHelperPrompt(system: readonly string[]): boolean {
@@ -139,6 +150,24 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		return total;
 	};
 
+	/** One setting through `changeSetting`, activated at once; returns `Label: value`. */
+	async function setSetting(clm: ClmSession, name: string, value: string): Promise<string> {
+		const result = await changeSetting(clm.changeRequest(input.directory), name, value);
+		await clm.refreshSettings(true);
+		return result.text;
+	}
+
+	async function clearSettings(clm: ClmSession): Promise<void> {
+		await resetSettings(clm.store.directory);
+		await clm.refreshSettings(true);
+		toast("CLM settings reset to the defaults.");
+	}
+
+	async function dropRevision(clm: ClmSession): Promise<void> {
+		await clm.resetProjection("/clm reset");
+		toast("CLM revision dropped");
+	}
+
 	/**
 	 * `/clm config …` as text (pi-clm's `/clm config` semantics; the TUI opens the settings
 	 * page instead). `words` keep their case: values may be paths.
@@ -149,16 +178,13 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		const format = { modelWindow: clm.limits.context };
 		if (!name) return settingsText(base, effective, format, clm.settingsWarning);
 		if (name.toLowerCase() === "reset" && valueWords.length === 0) {
-			await resetSettings(clm.store.directory);
-			await clm.refreshSettings(true);
-			toast("CLM settings reset to the defaults.");
+			await clearSettings(clm);
 			return "CLM settings reset to the defaults for this session.";
 		}
 		if (valueWords.length === 0) return showSetting(name, effective, format);
-		const result = await changeSetting(clm.changeRequest(input.directory), name, valueWords.join(" "));
-		await clm.refreshSettings(true);
-		toast(`CLM ${result.text}.`);
-		return `CLM ${result.text}. It applies from the next request.`;
+		const text = await setSetting(clm, name, valueWords.join(" "));
+		toast(`CLM ${text}.`);
+		return `CLM ${text}. It applies from the next request.`;
 	}
 
 	/** `/clm overview|input|edits|settings` outside the TUI: the panel page as plain text. */
@@ -192,22 +218,107 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			case "on":
 			case "off": {
 				// The same override the TUI and `/clm config editing` write.
-				await changeSetting(clm.changeRequest(input.directory), "editing", argument);
-				await clm.refreshSettings(true);
+				await setSetting(clm, "editing", argument);
 				toast(`CLM ${argument} for this session`);
 				return argument === "on"
 					? "CLM is on for this session: the mirror is refreshed before the next request."
 					: "CLM is off for this session: requests carry the raw history and the mirror is no longer read.";
 			}
 			case "reset": {
-				await clm.resetProjection("/clm reset");
-				toast("CLM revision dropped");
+				await dropRevision(clm);
 				return "CLM dropped the accepted revision: the next request carries the stored history, and the mirror is rewritten from it.";
 			}
 			default:
 				return `${STATUS_USAGE}\nUnknown argument: ${JSON.stringify(args)}`;
 		}
 	}
+
+	/** Session ids the server confirmed; a panel reload sends several requests per session. */
+	const knownSessions = new Set<string>();
+
+	/** False when the server does not know the session (the request came from elsewhere). */
+	async function knownSession(sessionID: string): Promise<boolean> {
+		if (knownSessions.has(sessionID) || sessions.has(sessionID)) return true;
+		const get = input.client?.session?.get;
+		if (typeof get !== "function") return true;
+		try {
+			const result = await input.client.session.get({ path: { id: sessionID } });
+			const known = Boolean(result?.data) && !result?.error;
+			if (known) knownSessions.add(sessionID);
+			return known;
+		} catch {
+			return false;
+		}
+	}
+
+	/** A request from the TUI over the channel (src/channel.ts): apply it, answer with its id. */
+	async function channelRequest(request: ChannelRequest): Promise<Omit<ChannelReply, "v" | "id">> {
+		const sessionID = checkSessionID(request.session);
+		if (!(await knownSession(sessionID))) throw new Error(`no session ${sessionID} on this server`);
+		const directory = sessionDirectory(settings.mirrorDir, sessionID);
+		switch (request.op) {
+			case "locate":
+				return { ok: true, text: "", directory, root: input.directory };
+			case "read": {
+				const path = await insideSession(directory, request.path);
+				if (path === undefined) return { ok: true, text: "" };
+				const size = (await stat(path).catch(missingAsUndefined))?.size;
+				if (size === undefined) return { ok: true, text: "" };
+				if (size > MAX_READ_BYTES) {
+					return { ok: false, text: `${request.path} is ${size} bytes, more than the ${MAX_READ_BYTES} a channel reply carries` };
+				}
+				const content = await readFile(path, "utf8").catch(missingAsUndefined);
+				return { ok: true, text: "", ...(content !== undefined ? { content } : {}) };
+			}
+			case "list": {
+				const path = await insideSession(directory, request.path);
+				if (path === undefined) return { ok: true, text: "" };
+				const names = await readdir(path).catch(missingAsUndefined);
+				return { ok: true, text: "", ...(names !== undefined ? { names } : {}) };
+			}
+		}
+		const clm = await session(sessionID);
+		await clm.refreshSettings();
+		switch (request.op) {
+			case "set": {
+				const text = await setSetting(clm, request.setting, request.value);
+				toast(`CLM ${text}.`);
+				return { ok: true, text };
+			}
+			case "settings-reset":
+				await clearSettings(clm);
+				return { ok: true, text: "CLM settings reset to the defaults." };
+			case "reset":
+				await dropRevision(clm);
+				return { ok: true, text: "CLM revision dropped" };
+		}
+	}
+
+	/**
+	 * `path` inside the session directory, else a refusal; undefined when it does not exist.
+	 * Checked twice: lexically, then with symlinks resolved on both sides, as OpenCode's own
+	 * file API does (packages/core/src/filesystem.ts:66-71), so a link the model created in
+	 * the mirror directory cannot point a `read` elsewhere.
+	 */
+	async function insideSession(directory: string, path: string): Promise<string | undefined> {
+		const outside = (root: string, target: string) => {
+			const rel = relative(root, target);
+			return isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`);
+		};
+		const target = resolve(directory, path);
+		if (outside(directory, target)) throw new Error(`${path} lies outside the session directory`);
+		const realRoot = await realpath(directory).catch(missingAsUndefined);
+		const realTarget = await realpath(target).catch(missingAsUndefined);
+		if (realRoot === undefined || realTarget === undefined) return undefined;
+		if (outside(realRoot, realTarget)) throw new Error(`${path} lies outside the session directory`);
+		return realTarget;
+	}
+
+	const reply = (value: ChannelReply) => {
+		void Promise.resolve()
+			.then(() => input.client?.tui?.publish?.({ body: { type: "tui.command.execute", properties: { command: encodeReply(value) } } as never }))
+			.catch(() => undefined);
+	};
 
 	function compactCommand(clm: ClmSession, argument: string): string {
 		return buildCompactPrompt(loadCompactPrompt(clm.settings.compactPromptPath), {
@@ -317,6 +428,20 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		},
 
 		async event({ event }) {
+			const command = commandOf(event);
+			if (command !== undefined) {
+				const request = decodeRequest(command);
+				if (!request) return;
+				let answer: Omit<ChannelReply, "v" | "id">;
+				try {
+					answer = await channelRequest(request);
+				} catch (error) {
+					answer = { ok: false, text: describe(error) };
+					log("warn", `channel ${request.op} for ${request.session}: ${answer.text}`);
+				}
+				reply({ ...answer, v: CHANNEL_VERSION, id: request.id });
+				return;
+			}
 			if (event.type !== "session.compacted") return;
 			const clm = await opened(event.properties.sessionID);
 			if (clm) clm.compacted = true;
