@@ -360,7 +360,7 @@ export function budgetNoticeText(
  * odd sample cannot run away.
  */
 export class EstimateCalibrator {
-	private pending: { estimate: number; rawCount: number } | undefined;
+	private pending: { estimate: number; rawCount: number; offset: number } | undefined;
 	private current = 1;
 	private samples = 0;
 
@@ -390,9 +390,11 @@ export class EstimateCalibrator {
 	 * Remember the raw (uncalibrated) estimate of the request about to be sent. The estimate
 	 * must cover the same scope as the provider count it will be compared with; an estimate
 	 * that omits the system prompt and tool schemas reads their size as undercounting.
+	 * `offset`: tokens of the provider count the estimate does not cover, already measured
+	 * (the fixed overhead); they are subtracted from the observation before the comparison.
 	 */
-	record(estimate: number, rawCount: number): void {
-		if (estimate > 0) this.pending = { estimate, rawCount };
+	record(estimate: number, rawCount: number, offset = 0): void {
+		if (estimate > 0) this.pending = { estimate, rawCount, offset };
 	}
 
 	/**
@@ -402,7 +404,7 @@ export class EstimateCalibrator {
 	 */
 	observe(observed: { tokens: number; index: number } | undefined): number {
 		if (!observed || !this.pending || observed.index < this.pending.rawCount) return this.current;
-		const sample = observed.tokens / this.pending.estimate;
+		const sample = (observed.tokens - this.pending.offset) / this.pending.estimate;
 		this.pending = undefined;
 		if (!Number.isFinite(sample) || sample <= 0) return this.current;
 		const smoothing = this.options.smoothing ?? 0.5;

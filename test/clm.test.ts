@@ -5,6 +5,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { ClmSession, lastProviderReported, pinnedCount } from "../src/clm.ts";
+import { flatten } from "../src/opencode.ts";
 import { AnnotationStore } from "../src/continuity.ts";
 import { loadLiveContextState, saveLiveContextState, statePath } from "../src/state.ts";
 import { statusText } from "../src/presentation.ts";
@@ -319,7 +320,7 @@ describe("session lifecycle", () => {
 });
 
 describe("estimates and persistence", () => {
-	test("calibration needs the system prompt and tool sizes", async () => {
+	test("calibration needs the system prompt and tool sizes, or a measured overhead", async () => {
 		const clm = await ClmSession.open(SESSION, settings());
 		const raw = conversation();
 		await clm.transform(structuredClone(raw));
@@ -330,6 +331,12 @@ describe("estimates and persistence", () => {
 		scoped.scope = { systemTokens: 1000, toolTokens: 500 };
 		await scoped.transform(structuredClone(raw));
 		await scoped.transform([...structuredClone(raw), assistant("msg_a3", "ok", [], 3200)]);
+		// Request 2 measures the overhead from the provider count and drops the samples taken
+		// against the hook sizes; request 3 calibrates the conversation alone.
+		expect(scoped.state.budgetCheck?.source).toBe("provider");
+		expect(scoped.calibrator.sampleCount).toBe(0);
+		const overhead = scoped.state.budgetCheck!.overhead;
+		await scoped.transform([...structuredClone(raw), assistant("msg_a3", "ok", [], 3200), assistant("msg_a4", "ok", [], overhead + 4000)]);
 		expect(scoped.calibrator.sampleCount).toBe(1);
 		expect(scoped.calibrator.factor).toBeGreaterThan(1.5);
 	});
@@ -512,5 +519,26 @@ describe("budget-too-small check", () => {
 		// Request 1 ran at the configured budget; nothing is withheld once the raise applies.
 		const names = events(clm).map((event) => event.event);
 		expect(names.slice(names.indexOf("budget-too-small"))).not.toContain("overflow-guard");
+	});
+});
+
+describe("calibration after a measured overhead", () => {
+	test("hook sizes below the real overhead do not inflate estimates; new tool results are delivered", async () => {
+		// Real overhead 18,000; the hooks see 6,000 (built-in tool schemas unmeasured). The
+		// provider reports the overhead plus the conversation actually sent, at chars/4.
+		const clm = await ClmSession.open(SESSION, settings({ budget: 12_000 }));
+		clm.scope = { systemTokens: 4000, toolTokens: 2000 };
+		const raw = conversation();
+		let sent = (await clm.transform(structuredClone(raw))).messages;
+		for (let step = 0; step < 8; step++) {
+			const reported = 18_000 + clm.rawTokens(flatten(sent));
+			raw.push(assistant(`msg_s${step}`, "Reading.", [{ callID: `call_s${step}`, output: `${step}`.repeat(12_000) }], reported));
+			const result = await clm.transform(structuredClone(raw));
+			sent = result.messages;
+			const newest = String(toolOutput(sent.find((message) => message.info.id === `msg_s${step}`), `call_s${step}`));
+			expect(newest).toBe(`${step}`.repeat(12_000));
+			expect(clm.calibrator.factor).toBeLessThan(1.2);
+		}
+		expect(clm.state.budgetCheck).toMatchObject({ source: "provider", raised: true });
 	});
 });

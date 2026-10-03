@@ -327,24 +327,33 @@ describe("continuity tools", () => {
 });
 
 describe("tool.definition", () => {
-	/** Calibration factor of the second request, whose predecessor the provider measured. */
-	async function calibrationAfterMeasurement(defineTools: boolean): Promise<number> {
+	/**
+	 * Calibration factors of request 2, which measures the overhead from the provider's
+	 * count of request 1, and of request 3, the first one calibrated against that overhead.
+	 */
+	async function calibrationAfterMeasurement(defineTools: boolean): Promise<[number, number]> {
 		const harness = await load();
 		if (defineTools) {
 			await harness.hooks["tool.definition"]!({ toolID: "bash" }, { description: "d".repeat(400), parameters: {} });
 			await harness.hooks["tool.definition"]!({ toolID: "mcp_x" }, { description: "", parameters: {}, jsonSchema: { a: "b" } } as never);
 		}
+		const events = () => readFileSync(join(harness.directory, "mirrors", `clm-${SESSION}`, "events.jsonl"), "utf8")
+			.trim().split("\n").map((line) => JSON.parse(line));
+		const measured = [...structuredClone(conversation()), assistant("msg_a3", "measured", [], 100_000)];
 		await system(harness.hooks, SESSION, ["base"]);
 		await transform(harness.hooks, structuredClone(conversation()));
-		await transform(harness.hooks, [...structuredClone(conversation()), assistant("msg_a3", "measured", [], 100_000)]);
-		const events = readFileSync(join(harness.directory, "mirrors", `clm-${SESSION}`, "events.jsonl"), "utf8")
-			.trim().split("\n").map((line) => JSON.parse(line)).filter((event) => event.event === "request");
-		return events.at(-1).calibration;
+		await transform(harness.hooks, structuredClone(measured));
+		const overhead = events().find((event) => typeof event.overhead === "number").overhead as number;
+		await transform(harness.hooks, [...structuredClone(measured), assistant("msg_a4", "more", [], overhead + 20_000)]);
+		const requests = events().filter((event) => event.event === "request");
+		return [requests[1].calibration, requests[2].calibration];
 	}
 
-	test("tool schema sizes complete the calibration scope; without them the estimator is not calibrated", async () => {
-		expect(await calibrationAfterMeasurement(true)).toBeGreaterThan(1);
-		expect(await calibrationAfterMeasurement(false)).toBe(1);
+	test("a measured overhead replaces the hook sizes: calibration restarts there, with or without tool schema sizes", async () => {
+		expect(await calibrationAfterMeasurement(true)).toEqual([1, expect.any(Number)]);
+		expect((await calibrationAfterMeasurement(true))[1]).toBeGreaterThan(1);
+		expect(await calibrationAfterMeasurement(false)).toEqual([1, expect.any(Number)]);
+		expect((await calibrationAfterMeasurement(false))[1]).toBeGreaterThan(1);
 	});
 });
 

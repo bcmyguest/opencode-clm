@@ -854,6 +854,9 @@ export class ClmSession {
 		// Before the guard and the reading, so a raise applies to this request already.
 		const measured = this.state.budgetCheck?.source === "provider" ? undefined : this.measureOverhead(raw, observed);
 		const alert = measured ? await this.checkBudget(measured) : undefined;
+		// Samples taken before the overhead was measured read the unmeasured part of the
+		// overhead (built-in tool schemas) as undercounting; start calibration over.
+		if (measured?.source === "provider") this.calibrator.reset();
 
 		let projection = applyProjection(source, this.state.checkpoint);
 		// A late or repeated compaction signal must not swallow a later revert: rebase only
@@ -893,9 +896,15 @@ export class ClmSession {
 		const resolved = this.resolvedBudget();
 		const limit = resolved ? overflowGuardLimit(resolved.budget, resolved.reserve) : undefined;
 		// System prompt and tool schemas, when the hooks reported them (one request late).
+		// A provider-measured overhead replaces them: it is in real tokens, so it is not
+		// calibrated, and it includes the built-in tool schemas the hooks cannot size. The
+		// hook sizes stay a floor, since they count text that is certainly sent.
 		const { systemTokens, toolTokens } = this.scope;
-		const scopeTokens = this.calibrator.apply((systemTokens ?? 0) + (toolTokens ?? 0));
-		const excluded = [
+		const measuredOverhead = this.state.budgetCheck?.source === "provider"
+			? Math.max(this.state.budgetCheck.overhead, (systemTokens ?? 0) + (toolTokens ?? 0))
+			: undefined;
+		const scopeTokens = measuredOverhead ?? this.calibrator.apply((systemTokens ?? 0) + (toolTokens ?? 0));
+		const excluded = measuredOverhead !== undefined ? [] : [
 			...(systemTokens === undefined ? ["the system prompt"] : []),
 			...(toolTokens === undefined ? ["tool schemas"] : []),
 		];
@@ -986,11 +995,15 @@ export class ClmSession {
 		];
 
 		// Calibrate only against a same-scope estimate: the provider count includes the system
-		// prompt and tool schemas, so both sizes must be known.
-		if (systemTokens !== undefined && toolTokens !== undefined) {
-			const conversation = this.rawTokens(flatten(pinnedMessages)) + this.rawTokens(effective) +
-				(continuity ? this.textTokens(continuity) : 0) + this.noticeTokens(notices);
-			this.calibrator.record(systemTokens + toolTokens + conversation, raw.length);
+		// prompt and tool schemas. With a measured overhead the calibrator compares the
+		// conversation with the provider count minus that overhead; otherwise both hook sizes
+		// must be known.
+		const conversationRaw = this.rawTokens(flatten(pinnedMessages)) + this.rawTokens(effective) +
+			(continuity ? this.textTokens(continuity) : 0) + this.noticeTokens(notices);
+		if (measuredOverhead !== undefined) {
+			this.calibrator.record(conversationRaw, raw.length, measuredOverhead);
+		} else if (systemTokens !== undefined && toolTokens !== undefined) {
+			this.calibrator.record(systemTokens + toolTokens + conversationRaw, raw.length);
 		}
 
 		this.previousRequest = { rawCount: raw.length, conversation: conversationTokens + this.calibrator.apply(this.noticeTokens(notices)) };
