@@ -7,14 +7,14 @@
  *
  * Two measurements are kept apart and always labelled:
  *
- * - `estimated`: the harness estimate of the conversation in the *next* request (pinned
- *   task + editable context + notices). Available before every call.
+ * - `estimated`: the harness estimate of the *next* request (pinned task + editable
+ *   context + notices, plus the system prompt and tool schemas once their sizes are
+ *   known). Available before every call.
  * - `observed`: the provider-reported input size of the *previous* request (OpenCode's
- *   assistant `tokens`). Authoritative but one call late, and it includes the system
- *   prompt and tool schemas, which the budget does not cover.
+ *   assistant `tokens`). Authoritative but one call late.
  *
- * The estimate alone governs reminder tiers and the reminder text; `observed` is shown
- * for reference only, because it covers more than the budget does. The harness never
+ * The estimate alone governs reminder tiers and the reminder text; `observed` calibrates
+ * the estimate and is shown for reference. The harness never
  * blocks a request; the overflow guard (overflow.ts) withholds old tool output when the
  * estimate exceeds budget - reserve.
  */

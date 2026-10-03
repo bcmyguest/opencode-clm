@@ -5,8 +5,7 @@
  * instead of running with a guess.
  *
  * Setting set adapted from pi-clm src/settings.ts (MIT, Copyright 2026 Emanuel Casco).
- * pi-clm's per-session overrides (`/clm config` panel) are not ported: OpenCode commands
- * cannot open a panel.
+ * Per-session overrides (`/clm config`) live in src/settings-table.ts and src/overrides.ts.
  */
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
