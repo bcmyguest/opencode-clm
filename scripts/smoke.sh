@@ -113,10 +113,10 @@ PACK_JSON=$TMP/pack.json
 if node -e '
 	const [p] = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 	const files = p.files.map((f) => f.path).sort();
-	const required = ["index.ts", "skills/clm-context/SKILL.md", "steering/house-brief.md", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "package.json"];
-	const isSrc = (f) => /^src\/[^/]+\.ts$/.test(f) && !/\.test\.ts$/.test(f);
+	const required = ["index.ts", "tui.ts", "skills/clm-context/SKILL.md", "steering/house-brief.md", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "package.json"];
+	const isSrc = (f) => /^src\/(panel\/|tui\/)?[^/]+\.ts$/.test(f) && !/\.test\.ts$/.test(f);
 	const bad = required.filter((f) => !files.includes(f)).map((f) => `missing ${f}`);
-	if (!files.some(isSrc)) bad.push("missing src/*.ts");
+	for (const dir of ["src/", "src/panel/", "src/tui/"]) if (!files.some((f) => isSrc(f) && f.startsWith(dir) && !f.slice(dir.length).includes("/"))) bad.push(`missing ${dir}*.ts`);
 	for (const f of files) if (!required.includes(f) && !isSrc(f)) bad.push(`unexpected file shipped: ${f}`);
 	console.log(`  ${p.name}@${p.version}: ${p.entryCount} files, ${p.size} B packed, ${p.unpackedSize} B unpacked`);
 	for (const f of files) console.log(`    ${f}`);
