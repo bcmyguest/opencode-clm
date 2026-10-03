@@ -30,7 +30,7 @@ Values keep their case (paths), names do not. Relative paths resolve against the
 | `reminders`      | budget fractions at which a `[CLM BUDGET]` note reaches the model; `off` also drops the budget − reserve one | `25/50/75%`, `50/75/90%`, `75/90%`, `90%`, `off`           | `25/50/75%` |
 | `gate`           | edits that grow the context: `fit` accepts them within budget − reserve, `shrink` never, `none` without a check | `fit`, `shrink`, `none`                                  | `fit`       |
 | `guard`          | overflow guard: above budget − reserve, withhold the oldest tool results                                 | `on`, `off`                                                   | `on`        |
-| `compaction`     | OpenCode's automatic compaction: `off` turns it off; `auto` and `on` keep your `compaction.auto` (see Notes) | `auto`, `off`, `on`                                       | `auto`      |
+| `compaction`     | OpenCode's automatic compaction: `off` turns it off; `auto` pauses it while the guard enforces a budget; `on` keeps your `compaction.auto` (see Notes) | `auto`, `off`, `on`                                       | `auto`      |
 | `cap`            | max characters kept per tool result (head + tail), at least 200                                          | `10k`, `10000`, `10k:0.5` (head fraction), `off`              | off         |
 | `steering`       | markdown file with your context-management strategy, appended to the system prompt                      | `house` (the bundled `steering/house-brief.md`), a path, `none` | none      |
 | `one-tool`       | run only the first tool call of each model response; later ones fail with a note to repeat them          | `on`, `off`                                                   | `off`       |
@@ -84,10 +84,14 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
   compaction and for recovery from a provider overflow error. Before each request the
   plugin sets it from that session's setting, so sessions served by one OpenCode process at
   the same time overwrite each other's value. `off` also turns off overflow recovery: the
-  error is shown and the model is told to shrink its context. `auto` and `on` change
-  nothing (pi's `auto` pauses threshold compaction; here the overflow guard already keeps
-  requests below OpenCode's threshold). Manual `/compact`
-  always works.
+  error is shown and the model is told to shrink its context. `auto`, as in pi, pauses
+  threshold compaction while the guard enforces a budget: the flag is off for each request
+  whose estimate plus the model's output cap reaches OpenCode's threshold (context − output
+  cap, or `limit.input` − `compaction.reserved`, which defaults to the smaller of 20,000
+  and the output cap), and your value otherwise. A paused request also gets no overflow
+  recovery. A subagent's requests set the flag too; the parent's value returns after each
+  of its tool calls. When a step's count crossed the threshold under the paused flag, a
+  toast says so, once per crossing; under `off` the model also gets a notice. `on` changes nothing. Manual `/compact` always works.
 - **Compact prompt.** A template may use `{{mirror}}`, `{{current}}`, `{{budget}}` and
   `{{instructions}}`; unknown placeholders stay as written, and text typed after
   `/clm-compact` is always included. The plugin rereads the template on every use.
@@ -106,7 +110,10 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
   compaction is the only way to shrink). The session's files go to a private directory
   under the OS temp directory, removed when the server exits normally; `state.json`,
   `overrides.json` and `annotations.jsonl` still readable in the failed session directory
-  are copied there first. One error toast names the directories that failed. Only when
+  are copied there first. The annotations are also kept in OpenCode's session metadata
+  (at most 64 KiB of UTF-8 JSON, open ones first) after each change, and restored when the
+  session runs without a mirror again; a session that has its mirror back drops that copy,
+  and a fork keeps only the annotations made up to the fork point. One error toast names the directories that failed. Only when
   the temp directory fails too do requests carry the bare raw history.
 - **TUI panel.** The panel reads `mirrorDir` from the server plugin's entry in
   `opencode.json`, falling back to its own `tui.json` entry.

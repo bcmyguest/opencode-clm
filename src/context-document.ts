@@ -132,7 +132,8 @@ export function estimateContextCharacters(messages: LiveContextMessage[]): numbe
 	return messages.reduce((total, message) => total + renderMessage(message).length, 0);
 }
 
-function blockId(message: LiveContextMessage, index: number): string {
+/** The mirror block id of `message` at position `index` of the rendered messages. */
+export function blockId(message: LiveContextMessage, index: number): string {
 	const digest = createHash("sha256").update(canonicalMessage(message)).digest("hex").slice(0, 12);
 	return `${index + 1}-${digest}`;
 }

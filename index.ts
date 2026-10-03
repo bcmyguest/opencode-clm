@@ -36,9 +36,26 @@ import { tool, type Hooks, type Plugin, type PluginInput, type PluginOptions } f
 import { formatTokens } from "./src/budget.ts";
 import { ClmSession } from "./src/clm.ts";
 import { copyPrivateFile, MirrorDirectoryError, privateTemporaryParent } from "./src/mirror-store.ts";
-import { applyCompactionMode, nativeCompactionText, oneToolText, overflowNotCompactedText, ToolCallCounter } from "./src/compaction.ts";
+import {
+	applyCompactionMode,
+	compactionAuto,
+	lastFinishedStep,
+	nativeCompactionText,
+	oneToolText,
+	openCodeMaxOutput,
+	openCodeUsable,
+	OPENCODE_OUTPUT_TOKEN_MAX,
+	outputTokenMaxFlag,
+	overflowNotCompactedText,
+	thresholdCancelledNoticeText,
+	thresholdCancelledText,
+	thresholdPausedText,
+	thresholdReachable,
+	ThresholdWatch,
+	ToolCallCounter,
+} from "./src/compaction.ts";
 import { buildCompactPrompt, loadCompactPrompt } from "./src/compact.ts";
-import { ANNOTATIONS_FILE, continuityTools } from "./src/continuity.ts";
+import { ANNOTATIONS_FILE, continuityTools, persistAnnotations, restorePersisted } from "./src/continuity.ts";
 import { filterCompacted, replaceInPlace, type OcMessage } from "./src/opencode.ts";
 import { statusText, systemGuidance } from "./src/presentation.ts";
 import { COMPACT_COMMAND, COMPACT_TEMPLATE, STATUS_COMMAND, STATUS_TEMPLATE } from "./src/commands.ts";
@@ -139,8 +156,55 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	 * The live config object from the `config` hook, and the user's own `compaction.auto`
 	 * (undefined = not set) for the `compaction` setting. See src/compaction.ts.
 	 */
-	let liveConfig: { compaction?: { auto?: boolean } } | undefined;
+	let liveConfig: { compaction?: { auto?: boolean; reserved?: number } } | undefined;
 	let userAutoCompaction: boolean | undefined;
+	/** Which requests ran with the flag turned off by the plugin, and crossings reported (K1, K5). */
+	const thresholds = new ThresholdWatch();
+	/** Whether the user's config had a `compaction` object; one the plugin added is removed again. */
+	let userHadCompaction = false;
+	/**
+	 * The `compaction.auto` value each session's newest request decided (undefined = the user's
+	 * value). Re-applied after each of the session's tool calls: a subagent (`task` tool) runs
+	 * its own requests inside the parent's step and overwrites the instance-wide flag before
+	 * OpenCode's finish-step check of the parent reads it (session/processor.ts:491).
+	 */
+	const flagDecisions = new Map<string, boolean | undefined>();
+	const applyFlag = (value: boolean | undefined) => {
+		if (!liveConfig) return;
+		if (value !== undefined) {
+			(liveConfig.compaction ??= {}).auto = value;
+			return;
+		}
+		applyCompactionMode(liveConfig, "auto", userAutoCompaction);
+		if (!userHadCompaction && liveConfig.compaction && Object.keys(liveConfig.compaction).length === 0) delete liveConfig.compaction;
+	};
+	const decideFlag = (sessionID: string, value: boolean | undefined) => {
+		if (!liveConfig) return;
+		// Re-inserted, so the map's order is the order of the newest decisions.
+		flagDecisions.delete(sessionID);
+		flagDecisions.set(sessionID, value);
+		applyFlag(value);
+	};
+	/**
+	 * A session went idle (`session.idle`, session/status.ts:41-44; e.g. a subagent finished,
+	 * also when the parent's `task` call then threw, which skips `tool.execute.after`,
+	 * session/tools.ts:111): its decision no longer governs anything, so
+	 * the newest decision of another session takes the flag back. With no other session the
+	 * flag stays: the idle session's own next prompt is checked against it first
+	 * (prompt.ts:1161). Best effort: the event reaches the plugin through the bus and can
+	 * arrive after the parent's finish-step check.
+	 */
+	const endFlag = (sessionID: string) => {
+		if (!flagDecisions.delete(sessionID) || flagDecisions.size === 0) return;
+		applyFlag([...flagDecisions.values()].at(-1));
+	};
+	/** A request that goes out without CLM (fail-open): the user's flag, no pause left behind. */
+	const releaseFlag = (sessionID: string) => {
+		decideFlag(sessionID, undefined);
+		thresholds.set(sessionID, undefined);
+	};
+	/** OpenCode's threshold for the session's model (src/compaction.ts `openCodeUsable`). */
+	const thresholdOf = (clm: ClmSession) => openCodeUsable(clm.limits, liveConfig?.compaction?.reserved, outputTokenMaxFlag());
 	/** Sessions whose newest transform was OpenCode's compaction request (no overflow notice for it). */
 	const compactionRequests = new Set<string>();
 	/** Tool calls per session since its last model request (`one-tool`). */
@@ -160,13 +224,13 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	 * unavailable; a failed call is logged as `stamp-error`. The v1 SDK's `Session` type omits
 	 * `metadata`.
 	 */
-	const sessionRecord = async (clm: ClmSession): Promise<{ metadata: Record<string, unknown>; child: boolean } | undefined> => {
+	const sessionRecord = async (clm: ClmSession): Promise<{ metadata: Record<string, unknown>; child: boolean; created?: number } | undefined> => {
 		const get = input.client?.session?.get;
 		if (typeof get !== "function") return undefined;
 		try {
 			const result = await input.client.session.get({ path: { id: clm.sessionID } });
 			const failed = (result as { error?: unknown } | undefined)?.error;
-			const data = (result as { data?: { metadata?: unknown; parentID?: unknown } } | undefined)?.data;
+			const data = (result as { data?: { metadata?: unknown; parentID?: unknown; time?: { created?: unknown } } } | undefined)?.data;
 			if (failed !== undefined || !data) {
 				await clm.log({ event: "stamp-error", stage: "get", error: JSON.stringify(failed ?? "no data") });
 				return undefined;
@@ -175,12 +239,29 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			return {
 				metadata: metadata && typeof metadata === "object" && !Array.isArray(metadata) ? (metadata as Record<string, unknown>) : {},
 				child: typeof data.parentID === "string" && data.parentID !== "",
+				...(typeof data.time?.created === "number" ? { created: data.time.created } : {}),
 			};
 		} catch (error) {
 			await clm.log({ event: "stamp-error", stage: "get", error: describe(error) });
 			return undefined;
 		}
 	};
+	/**
+	 * Read-modify-write of a session's metadata, one at a time per session: `PATCH
+	 * /session/:id` replaces the whole record, so concurrent writers (the fork stamp, two
+	 * annotation changes in one step) must each build their body from the previous result.
+	 */
+	const metadataChains = new Map<string, Promise<unknown>>();
+	const inMetadataChain = <T>(sessionID: string, task: () => Promise<T>): Promise<T> => {
+		const run = (metadataChains.get(sessionID) ?? Promise.resolve()).then(task, task);
+		const tail = run.catch(() => undefined);
+		metadataChains.set(sessionID, tail);
+		void tail.then(() => {
+			if (metadataChains.get(sessionID) === tail) metadataChains.delete(sessionID);
+		});
+		return run;
+	};
+
 	/** Sessions whose stamp was handled in this process (`linkFork`). */
 	const linked = new Set<string>();
 
@@ -191,29 +272,41 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	 * first request (clm.ts `restoreFromFork`); the stamp is then rewritten to the fork's id.
 	 * `PATCH /session/:id` replaces the whole metadata record, so the other keys are copied.
 	 */
-	const linkFork = async (clm: ClmSession): Promise<void> => {
+	const linkFork = (clm: ClmSession): Promise<void> => inMetadataChain(clm.sessionID, async () => {
 		const record = await sessionRecord(clm);
 		// Child (subagent) sessions are never forked: no stamp, no PATCH bumping their time.
 		if (!record || record.child) return;
 		const metadata = record.metadata;
 		const stamp = metadata.clm && typeof metadata.clm === "object" && !Array.isArray(metadata.clm) ? (metadata.clm as Record<string, unknown>) : {};
 		const origin = stamp.origin;
-		if (origin === clm.sessionID) return;
-		if (typeof origin === "string" && !clm.state.checkpoint && clm.state.revision === 0) {
+		// `annotations` is the store of a session without a mirror (M1). A session with a mirror
+		// drops it, so a later run without one does not restore a stale set; a fork drops the
+		// origin's copy and persists its own after its first request.
+		const own = origin === clm.sessionID;
+		const fork = typeof origin === "string" && !own;
+		const dropAnnotations = "annotations" in stamp && (fork || clm.mirrorUnavailable === undefined);
+		if (own && !dropAnnotations) return;
+		if (!own && typeof origin === "string" && !clm.state.checkpoint && clm.state.revision === 0) {
 			try {
-				clm.forkOrigin = { sessionID: origin, directory: sessionDirectory(settings.mirrorDir, checkSessionID(origin)) };
+				clm.forkOrigin = {
+					sessionID: origin,
+					directory: sessionDirectory(settings.mirrorDir, checkSessionID(origin)),
+					...(record.created !== undefined ? { created: record.created } : {}),
+				};
 			} catch {
 				// a foreign stamp that is not a usable session id: ignore it
 			}
 		}
 		try {
-			const result = await input.client?.session?.update?.({ path: { id: clm.sessionID }, body: { metadata: { ...metadata, clm: { ...stamp, origin: clm.sessionID } } } } as never);
+			const { annotations: _dropped, ...kept } = stamp;
+			const next = { ...(dropAnnotations ? kept : stamp), origin: clm.sessionID };
+			const result = await input.client?.session?.update?.({ path: { id: clm.sessionID }, body: { metadata: { ...metadata, clm: next } } } as never);
 			const error = (result as { error?: unknown } | undefined)?.error;
 			if (error) await clm.log({ event: "stamp-error", stage: "update", error: JSON.stringify(error) });
 		} catch (error) {
 			await clm.log({ event: "stamp-error", stage: "update", error: describe(error) });
 		}
-	};
+	});
 
 	/** The project's default mirror parent, inside the project (no external-directory prompts). */
 	const projectMirrorDir = defaultMirrorDir(input.directory);
@@ -298,12 +391,63 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			throw new Error(`no mirror directory could be used (${reason}), and no temporary directory either: ${describe(error)}`);
 		}
 		clm.mirrorUnavailable = reason;
+		await restoreAnnotations(clm);
 		const kept = copiedFrom ? `${copied.join(", ")} copied from ${copiedFrom}; changes stay` : "No saved session files found; the session's files are";
 		const message = `CLM editing not active for session ${id}: no mirror directory could be used (${reason}). Requests carry the raw history plus the continuity annotations and their size notice. ${kept} in ${clm.store.directory} for this server process only.`;
 		log("error", message);
 		toast(message, "error");
 		await clm.log({ event: "mirror-unavailable", reason, directory: clm.store.directory, ...(copiedFrom ? { copiedFrom, copied } : {}) });
 		return clm;
+	};
+
+	/** `metadata.clm` of a session record, or an empty object. */
+	const clmStamp = (metadata: Record<string, unknown>): Record<string, unknown> =>
+		metadata.clm && typeof metadata.clm === "object" && !Array.isArray(metadata.clm) ? (metadata.clm as Record<string, unknown>) : {};
+
+	/**
+	 * M1: a session without a mirror keeps its files in a per-process temp directory, so its
+	 * annotations (resolutions made while degraded, and the snapshots copied in) would be lost
+	 * at restart; pi keeps them in session entries. They go to OpenCode's session metadata
+	 * (`metadata.clm.annotations`, bounded by PERSISTED_ANNOTATIONS_BYTES) after each change
+	 * and are restored when the session opens without a mirror again.
+	 */
+	const restoreAnnotations = async (clm: ClmSession): Promise<void> => {
+		const record = await inMetadataChain(clm.sessionID, () => sessionRecord(clm));
+		const stamp = record ? clmStamp(record.metadata) : {};
+		const persisted = stamp.annotations;
+		if (persisted === undefined) return;
+		// A fork's metadata is the origin's clone: the fork's first request applies the
+		// fork-point cutoff to that set (clm.ts `copyForkAnnotations`) instead.
+		if (typeof stamp.origin === "string" && stamp.origin !== clm.sessionID && !record!.child) {
+			clm.forkPersisted = restorePersisted([], persisted);
+			return;
+		}
+		try {
+			const snapshots = restorePersisted(await clm.annotations.list(), persisted);
+			await clm.annotations.appendAll(snapshots);
+			if (snapshots.length > 0) await clm.log({ event: "annotations-restored", count: snapshots.length });
+		} catch (error) {
+			await clm.log({ event: "annotations-restore-error", error: describe(error) });
+		}
+	};
+	const persistAnnotationsOf = async (sessionID: string): Promise<void> => {
+		const clm = await opened(sessionID);
+		if (!clm || clm.mirrorUnavailable === undefined) return;
+		await inMetadataChain(sessionID, () => persistNow(clm));
+	};
+	const persistNow = async (clm: ClmSession): Promise<void> => {
+		const record = await sessionRecord(clm);
+		if (!record) return;
+		try {
+			const annotations = persistAnnotations(await clm.annotations.list());
+			const metadata = { ...record.metadata, clm: { ...clmStamp(record.metadata), annotations } };
+			const result = await input.client?.session?.update?.({ path: { id: clm.sessionID }, body: { metadata } } as never);
+			const error = (result as { error?: unknown } | undefined)?.error;
+			if (error) throw new Error(JSON.stringify(error));
+			await clm.log({ event: "annotations-persisted", count: annotations.annotations.length, resolved: annotations.resolved.length });
+		} catch (error) {
+			await clm.log({ event: "annotations-persist-error", error: describe(error) });
+		}
 	};
 
 	const session = (sessionID: string): Promise<ClmSession> => {
@@ -625,9 +769,10 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 
 	const hooks: Hooks = {
 		async config(config) {
-			liveConfig = config as { compaction?: { auto?: boolean } };
+			liveConfig = config as { compaction?: { auto?: boolean; reserved?: number } };
 			const auto = liveConfig.compaction?.auto;
 			userAutoCompaction = typeof auto === "boolean" ? auto : undefined;
+			userHadCompaction = liveConfig.compaction !== undefined;
 			// `enabled: false` returns no hooks at all (above), so this runs only with CLM enabled;
 			// the guard keeps it that way if that early return ever moves.
 			if (settings.enabled && settings.compaction !== "auto") applyCompactionMode(liveConfig, settings.compaction, userAutoCompaction);
@@ -676,8 +821,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			await clm.refreshSettings();
 			// Without a mirror the model gets no protocol text (pi-clm's before_agent_start).
 			if (!clm.enabled || clm.mirrorUnavailable !== undefined) return;
-			const limit = (hookInput.model as { limit?: { context?: number; output?: number } } | undefined)?.limit;
-			if (limit) clm.limits = { context: limit.context || undefined, output: limit.output || undefined };
+			const limit = (hookInput.model as { limit?: { context?: number; input?: number; output?: number } } | undefined)?.limit;
+			if (limit) clm.limits = { context: limit.context || undefined, output: limit.output || undefined, ...(limit.input ? { input: limit.input } : {}) };
 			const sections = [systemGuidance(clm.mirrorPath, clm.resolvedBudget()?.budget)];
 			if (clm.steering) sections.push(steeringPromptSection(clm.steering));
 			output.system.push(sections.join("\n\n"));
@@ -702,6 +847,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 					toast(`not active for session ${sessionID}, requests carry the raw history: ${describe(error)}`, "error");
 					log("error", `not active for session ${sessionID}: ${describe(error)}`);
 				}
+				releaseFlag(sessionID);
 				return;
 			}
 			// Stamp (and detect a fork) once per process, only while CLM edits this session:
@@ -718,16 +864,44 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			const compaction = clm.compacting;
 			if (compaction) compactionRequests.add(sessionID);
 			else compactionRequests.delete(sessionID);
+			if (!compaction) {
+				// K5: the step before this request reached OpenCode's threshold while the flag this
+				// session set was false, so OpenCode skipped a threshold compaction (prompt.ts:1161).
+				const usable = thresholdOf(clm);
+				const cancelled = thresholds.observe(sessionID, lastFinishedStep(raw), usable);
+				if (cancelled && usable !== undefined) {
+					await clm.log({ event: "compaction-cancelled", reason: "threshold", setting: cancelled.by, count: cancelled.count, usable });
+					if (cancelled.by === "off") {
+						clm.queueNotice(thresholdCancelledNoticeText(clm.mirrorPath));
+						toast(thresholdCancelledText(cancelled.count, usable));
+					} else toast(thresholdPausedText(cancelled.count, usable, clm.guardLimit()));
+				}
+			}
 			try {
 				const result = await clm.transform(raw);
 				replaceInPlace(raw, result.messages);
+				if (clm.annotationsImported) {
+					clm.annotationsImported = false;
+					await persistAnnotationsOf(sessionID);
+				}
 				// Instance-wide flag, set per request from this session's setting: OpenCode reads
 				// it after this step and before the next one (src/compaction.ts). Sessions running
 				// concurrently in one server overwrite each other's value.
 				if (!compaction && liveConfig) {
 					// Without a mirror, OpenCode's compaction is the only way to shrink: leave it as configured.
-					const mode = clm.settings.enabled && clm.enabled && clm.mirrorUnavailable === undefined ? clm.settings.compaction : "auto";
-					applyCompactionMode(liveConfig, mode, userAutoCompaction);
+					const active = clm.settings.enabled && clm.enabled && clm.mirrorUnavailable === undefined;
+					const mode = active ? clm.settings.compaction : "auto";
+					// K1, pi's `auto`: while the guard enforces a budget, pause threshold compaction for
+					// a request whose count can reach OpenCode's threshold (src/compaction.ts).
+					const usable = thresholdOf(clm);
+					const pause = active && mode === "auto" && userAutoCompaction !== false && clm.settings.guard !== "off" &&
+						clm.guardLimit() !== undefined && result.estimated !== undefined && usable !== undefined &&
+						thresholdReachable(result.estimated, usable, openCodeMaxOutput(clm.limits.output, Math.max(OPENCODE_OUTPUT_TOKEN_MAX, outputTokenMaxFlag() ?? 0)));
+					decideFlag(sessionID, pause ? false : compactionAuto(mode, userAutoCompaction));
+					if (pause !== (thresholds.by(sessionID) === "auto")) {
+						await clm.log({ event: "compaction-pause", paused: pause, estimated: result.estimated, usable });
+					}
+					thresholds.set(sessionID, pause ? "auto" : active && mode === "off" && userAutoCompaction !== false ? "off" : undefined);
 				}
 				if (result.alert) {
 					toast(result.alert, "warning");
@@ -738,7 +912,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 					log("error", `${sessionID}: ${error}`);
 				}
 			} catch (error) {
-				// Fail open: the request goes out with the raw history.
+				// Fail open: the request goes out with the raw history, under the user's flag.
+				if (!compaction) releaseFlag(sessionID);
 				await clm.log({ event: "error", message: describe(error), stack: error instanceof Error ? error.stack : undefined });
 				toast(`transform failed: ${describe(error)}`, "error");
 			}
@@ -765,6 +940,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			const clm = await opened(hookInput.sessionID);
 			if (!clm) return;
 			clm.compacted = true;
+			thresholds.reset(hookInput.sessionID);
 			if (!clm.settings.enabled || !clm.enabled) return;
 			// Automatic compaction only (manual /compact does not reach this hook).
 			const overflow = hookInput.overflow === true;
@@ -789,7 +965,11 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			}
 			if (event.type === "session.idle" || event.type === "session.error") {
 				const ended = (event.properties as { sessionID?: string }).sessionID;
-				if (ended) compactPending.delete(ended);
+				if (ended) {
+					compactPending.delete(ended);
+					// Not on session.error: the overflow check below reads the flag OpenCode read.
+					if (event.type === "session.idle") endFlag(ended);
+				}
 			}
 			if (event.type === "session.error") {
 				const { sessionID, error } = event.properties as { sessionID?: string; error?: { name?: string } };
@@ -814,6 +994,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			if (event.type !== "session.compacted") return;
 			const clm = await opened(event.properties.sessionID);
 			if (clm) clm.compacted = true;
+			thresholds.reset(event.properties.sessionID);
 		},
 
 		async "tool.definition"(hookInput, output) {
@@ -843,6 +1024,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		},
 
 		async "tool.execute.after"(hookInput, output) {
+			// Before any await: the session's own flag back after a subagent's requests.
+			if (flagDecisions.has(hookInput.sessionID)) applyFlag(flagDecisions.get(hookInput.sessionID));
 			const clm = await opened(hookInput.sessionID);
 			if (!clm || typeof output.output !== "string") return;
 			// Runs inside the tool's own call: a throw here would fail the model's command.
@@ -888,6 +1071,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			schema: tool.schema,
 			store: async (sessionID) => (await session(sessionID)).annotations,
 			block: async (sessionID, blockId) => (await session(sessionID)).blockSource(blockId),
+			onChange: persistAnnotationsOf,
 		}),
 	};
 	return hooks;

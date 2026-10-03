@@ -33,6 +33,35 @@ describe.skipIf(!ENABLED)("opencode-clm settings: compaction, one-tool, trailer"
 		expect(c.mock.main()).toHaveLength(2);
 	}, CASE_TIMEOUT_MS);
 
+	// K1/K5: a 6k window leaves OpenCode a 3,952-token threshold (6,000 - 2,048), which the
+	// request estimate (system prompt and tool schemas) plus the 2,048-token output cap reaches.
+	const SMALL_WINDOW = { context: 6_000, output: 2_048 };
+	const OVER_THRESHOLD = { prompt_tokens: 5_000, completion_tokens: 10 };
+
+	test("compaction auto: a request that can reach the threshold runs with it paused", async () => {
+		const c = new Case("setting-compaction-auto-pause", steps(
+			bash("echo FIRST_$((1+1))", "first"),
+			bash("echo SECOND_$((1+2))", "second", OVER_THRESHOLD),
+			text("E2E_DONE"),
+		), { limit: SMALL_WINDOW, autocompact: true, config: { compaction: { tail_turns: 0 } } });
+		await c.run(["Run the e2e script."]);
+		expect(c.mock.ofKind("compaction")).toHaveLength(0);
+		expect(c.mock.main()).toHaveLength(3);
+		expect(c.events().some((event) => event.event === "compaction-pause" && event.paused === true)).toBe(true);
+		expect(c.events().filter((event) => event.event === "compaction-cancelled")).toMatchObject([{ reason: "threshold", setting: "auto", count: 5_010, usable: 3_952 }]);
+	}, CASE_TIMEOUT_MS);
+
+	test("compaction on, same script: OpenCode compacts at the threshold", async () => {
+		const c = new Case("setting-compaction-on-small", steps(
+			bash("echo FIRST_$((1+1))", "first"),
+			bash("echo SECOND_$((1+2))", "second", OVER_THRESHOLD),
+			text("E2E_DONE"),
+		), { plugin: { compaction: "on" }, limit: SMALL_WINDOW, autocompact: true, config: { compaction: { tail_turns: 0 } } });
+		await c.run(["Run the e2e script."]);
+		expect(c.mock.ofKind("compaction")).toHaveLength(1);
+		expect(c.events().some((event) => event.event === "compaction-cancelled")).toBe(false);
+	}, CASE_TIMEOUT_MS);
+
 	test("one-tool: the second call of a response fails; the model sees why", async () => {
 		const c = new Case("setting-one-tool", steps(
 			{ tools: [

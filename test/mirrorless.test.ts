@@ -13,7 +13,7 @@ import { buildPanelModel } from "../src/panel/model.ts";
 import { readSessionDirectory } from "../src/session-files.ts";
 import { initialLiveContextState, saveLiveContextState } from "../src/state.ts";
 import { ClmSession } from "../src/clm.ts";
-import { ANNOTATIONS_FILE, AnnotationStore } from "../src/continuity.ts";
+import { ANNOTATIONS_FILE, AnnotationStore, PERSISTED_ANNOTATIONS_BYTES, persistAnnotations, restorePersisted } from "../src/continuity.ts";
 import { copyPrivateFile, MirrorDirectoryError } from "../src/mirror-store.ts";
 import type { OcMessage } from "../src/opencode.ts";
 import { conversation, SESSION, settings, tempDir } from "./fixtures.ts";
@@ -305,5 +305,182 @@ describe("plugin: no mirror directory can be used", () => {
 		const h = await load({ compaction: "off" }, blockDefault);
 		await transform(h.hooks, structuredClone(conversation()));
 		expect(h.config.compaction?.auto).not.toBe(false);
+	});
+});
+
+// ---- M1: annotations of a session without a mirror survive a restart (session metadata) ----
+
+describe("annotations persisted in OpenCode's session metadata", () => {
+	test("persistAnnotations: resolutions always, snapshots active first within the bound", async () => {
+		const directory = tempDir();
+		const active = await annotate(directory, "Active", "a".repeat(2_000));
+		const done = await annotate(directory, "Done", "d".repeat(2_000));
+		const store = new AnnotationStore(directory);
+		await store.resolve(done.id, "finished");
+		const all = await store.list();
+		const full = persistAnnotations(all);
+		expect(full.resolved).toEqual([{ id: done.id, resolvedAt: expect.any(String), resolution: "finished" }]);
+		expect(full.annotations.map((annotation) => annotation.id)).toEqual([active.id, done.id]);
+		// Room for one snapshot: the active one is kept, the resolution still recorded.
+		const tight = persistAnnotations(all, 3_000);
+		expect(JSON.stringify(tight).length).toBeLessThanOrEqual(3_000);
+		expect(tight.annotations.map((annotation) => annotation.id)).toEqual([active.id]);
+		expect(tight.resolved).toHaveLength(1);
+		expect(JSON.stringify(persistAnnotations(all, PERSISTED_ANNOTATIONS_BYTES)).length).toBeLessThanOrEqual(PERSISTED_ANNOTATIONS_BYTES);
+	});
+
+	test("restorePersisted: adds missing snapshots, applies resolutions, ignores junk", async () => {
+		const directory = tempDir();
+		const keep = await annotate(directory, "Keep", "k");
+		const gone = await annotate(directory, "Gone", "g");
+		const store = new AnnotationStore(directory);
+		await store.resolve(gone.id, "ok");
+		const persisted = persistAnnotations(await store.list());
+		// A store that only has `gone`, unresolved (the copy from the failed directory).
+		const restored = restorePersisted([gone], persisted);
+		expect(restored.map((annotation) => [annotation.id, annotation.resolvedAt !== undefined])).toEqual([[keep.id, false], [gone.id, true]]);
+		expect(restorePersisted([], { version: 2 })).toEqual([]);
+		expect(restorePersisted([], "x")).toEqual([]);
+		expect(restorePersisted([], { version: 1, annotations: [{ id: "bad" }], resolved: [{ id: 1 }] })).toEqual([]);
+	});
+
+	test("a resolution made without a mirror is still in force after a restart", async () => {
+		const metadata: Record<string, unknown> = { other: 1 };
+		const start = async () => {
+			const directory = tempDir("clm-persist-");
+			writeFileSync(join(directory, ".opencode"), "");
+			const toasts: string[] = [];
+			const input = {
+				directory,
+				worktree: directory,
+				client: {
+					tui: { showToast: async ({ body }: { body: { message: string } }) => toasts.push(body.message) },
+					app: { log: async () => undefined },
+					session: {
+						get: async () => ({ data: { id: SESSION, metadata: structuredClone(metadata) } }),
+						update: async (options: { body: { metadata: Record<string, unknown> } }) => {
+							for (const key of Object.keys(metadata)) delete metadata[key];
+							Object.assign(metadata, structuredClone(options.body.metadata));
+							return { data: {} };
+						},
+					},
+				},
+			} as unknown as PluginInput;
+			const hooks = await server(input, {});
+			await hooks.config!({} as never);
+			const sent = await transform(hooks, structuredClone(conversation()));
+			const sessionDir = /stay in (\S+) for this server process only|files are in (\S+) for this server process only/.exec(toasts.join("\n"))!;
+			return { hooks, sent, sessionDir: (sessionDir[1] ?? sessionDir[2])! };
+		};
+		// Process 1: two annotations (as copied from a failed directory); one is resolved.
+		const first = await start();
+		const keep = await annotate(first.sessionDir, "Still open", "Keep the release checklist.");
+		const done = await annotate(first.sessionDir, "Already done", "Old task.");
+		const context = { sessionID: SESSION, messageID: "m", agent: "build", abort: new AbortController().signal } as never;
+		await first.hooks.tool!.clm_annotate!.execute({ action: "resolve", id: done.id, resolution: "shipped" } as never, context);
+		const stamp = (metadata.clm ?? {}) as { annotations?: { resolved: unknown[]; annotations: unknown[] } };
+		expect(metadata.other).toBe(1);
+		expect(stamp.annotations!.resolved).toHaveLength(1);
+		expect(stamp.annotations!.annotations).toHaveLength(2);
+		// Process 2: a fresh temporary directory; the annotations come back from the metadata.
+		const second = await start();
+		expect(second.sessionDir).not.toBe(first.sessionDir);
+		const continuity = text(second.sent);
+		expect(continuity).toContain("Still open");
+		expect(continuity).not.toContain("Already done");
+		const restored = await new AnnotationStore(second.sessionDir).list();
+		expect(restored.find((annotation) => annotation.id === done.id)!.resolution).toBe("shipped");
+		expect(restored.find((annotation) => annotation.id === keep.id)!.resolvedAt).toBeUndefined();
+		expect(readFileSync(join(second.sessionDir, "events.jsonl"), "utf8")).toContain('"annotations-restored"');
+	});
+
+	/** A plugin whose OpenCode client keeps one session's metadata; get and update yield first. */
+	async function withMetadata(metadata: Record<string, unknown>, options: { created?: number; blocked?: boolean; sessionID?: string; getDelays?: number[] } = {}) {
+		const directory = tempDir("clm-meta-");
+		if (options.blocked !== false) writeFileSync(join(directory, ".opencode"), "");
+		const toasts: string[] = [];
+		const input = {
+			directory,
+			worktree: directory,
+			client: {
+				tui: { showToast: async ({ body }: { body: { message: string } }) => toasts.push(body.message) },
+				app: { log: async () => undefined },
+				session: {
+					get: async () => {
+						// Read when the request arrives, answered later.
+						const data = { id: options.sessionID ?? SESSION, metadata: structuredClone(metadata), ...(options.created !== undefined ? { time: { created: options.created } } : {}) };
+						await Bun.sleep(options.getDelays?.shift() ?? 2);
+						return { data };
+					},
+					update: async (request: { body: { metadata: Record<string, unknown> } }) => {
+						await Bun.sleep(2);
+						for (const key of Object.keys(metadata)) delete metadata[key];
+						Object.assign(metadata, structuredClone(request.body.metadata));
+						return { data: {} };
+					},
+				},
+			},
+		} as unknown as PluginInput;
+		const hooks = await server(input, {});
+		await hooks.config!({} as never);
+		const sessionDir = () => {
+			const match = /(?:stay|files are) in (\S+) for this server process only/.exec(toasts.join("\n"))!;
+			return match[1]!;
+		};
+		return { hooks, directory, sessionDir };
+	}
+	const toolContext = { sessionID: SESSION, messageID: "m", agent: "build", abort: new AbortController().signal } as never;
+
+	test("parallel changes and the fork stamp are written one after another (no lost update)", async () => {
+		const metadata: Record<string, unknown> = { other: 1 };
+		// The open's own read, then a slow read for the stamp, then fast ones.
+		const h = await withMetadata(metadata, { getDelays: [1, 30] });
+		await command(h.hooks, "status"); // opens the session, no stamp yet
+		const one = await annotate(h.sessionDir(), "One", "1");
+		const two = await annotate(h.sessionDir(), "Two", "2");
+		const resolve = (id: string) => h.hooks.tool!.clm_annotate!.execute({ action: "resolve", id } as never, toolContext);
+		// The stamp's read is slow: unserialized, its PATCH would land last and drop the annotations.
+		await Promise.all([transform(h.hooks, structuredClone(conversation())), resolve(one.id), resolve(two.id)]);
+		const stamp = metadata.clm as { origin: string; annotations: { resolved: Array<{ id: string }> } };
+		expect(stamp.origin).toBe(SESSION);
+		expect(stamp.annotations.resolved.map((entry) => entry.id).sort()).toEqual([one.id, two.id].sort());
+		expect(metadata.other).toBe(1);
+	});
+
+	test("the byte bound counts UTF-8 bytes", async () => {
+		const directory = tempDir();
+		await annotate(directory, "Wide", "\u00e9\u4e2d".repeat(1_000));
+		const all = await new AnnotationStore(directory).list();
+		const json = JSON.stringify(all[0]);
+		const bound = json.length + 200;
+		// Fits by UTF-16 length, not by bytes: left out.
+		expect(Buffer.byteLength(json)).toBeGreaterThan(bound);
+		expect(persistAnnotations(all, bound).annotations).toEqual([]);
+	});
+
+	test("a session that has its mirror again drops the stale set", async () => {
+		const persisted = persistAnnotations([]);
+		const metadata: Record<string, unknown> = { clm: { origin: SESSION, annotations: persisted }, other: 1 };
+		const h = await withMetadata(metadata, { blocked: false });
+		await transform(h.hooks, structuredClone(conversation()));
+		expect(metadata).toEqual({ clm: { origin: SESSION }, other: 1 });
+	});
+
+	test("a fork without a mirror applies the fork-point cutoff to the origin's persisted set", async () => {
+		const source = tempDir();
+		const at = (ms: number) => new AnnotationStore(source, { now: () => new Date(ms) });
+		const make = (ms: number, title: string) => at(ms).create({ sessionId: "ses_origin", blockId: "2-0123456789ab", revision: 0, message: { role: "user", content: title, timestamp: 1 } as never, title, reason: "r", futureAction: "n", retention: "continuity" });
+		await make(2, "Before the fork");
+		await make(10, "After the fork");
+		const metadata: Record<string, unknown> = { clm: { origin: "ses_origin", annotations: persistAnnotations(await new AnnotationStore(source).list()) } };
+		// Fixture messages complete at 3 ms; the fork was created at 5 ms.
+		const h = await withMetadata(metadata, { created: 5 });
+		const sent = text(await transform(h.hooks, structuredClone(conversation())));
+		expect(sent).toContain("Before the fork");
+		expect(sent).not.toContain("After the fork");
+		// The fork's own set replaces the clone, under its own stamp.
+		const stamp = metadata.clm as { origin: string; annotations: { annotations: Array<{ title: string }> } };
+		expect(stamp.origin).toBe(SESSION);
+		expect(stamp.annotations.annotations.map((annotation) => annotation.title)).toEqual(["Before the fork"]);
 	});
 });

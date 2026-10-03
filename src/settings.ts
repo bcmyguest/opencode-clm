@@ -38,8 +38,9 @@ export interface ClmSettings {
 	/** Write every transformed request to `<session dir>/requests/nN.json` (debugging). */
 	dumpRequests: boolean;
 	/**
-	 * OpenCode's automatic compaction (`compaction.auto`): `off` turns it off; `auto` and
-	 * `on` leave the user's config value (pi's names). Manual /compact always works.
+	 * OpenCode's automatic compaction (`compaction.auto`): `off` turns it off; `auto` pauses it
+	 * while the guard enforces a budget (src/compaction.ts); `on` leaves the user's config value
+	 * (pi's names). Manual /compact always works.
 	 */
 	compaction: CompactionMode;
 	/** Run only the first tool call of each model response (paper-harness parity). */

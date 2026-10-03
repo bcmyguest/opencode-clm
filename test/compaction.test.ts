@@ -11,16 +11,23 @@ import { ClmSession } from "../src/clm.ts";
 import {
 	applyCompactionMode,
 	compactionAuto,
+	lastFinishedStep,
 	nativeCompactionText,
 	oneToolText,
+	openCodeCount,
+	openCodeMaxOutput,
+	openCodeUsable,
+	outputTokenMaxFlag,
 	overflowNotCompactedText,
 	sizeTrailer,
+	thresholdReachable,
+	ThresholdWatch,
 	ToolCallCounter,
 } from "../src/compaction.ts";
 import type { OcMessage } from "../src/opencode.ts";
 import { resolveSettings } from "../src/settings.ts";
 import { applyOverrides, sanitizeOverrides, settingDescriptor, settingsAsOverrides } from "../src/settings-table.ts";
-import { conversation, SESSION, settings, tempDir, toolOutput } from "./fixtures.ts";
+import { assistant, conversation, SESSION, settings, tempDir, toolOutput } from "./fixtures.ts";
 import { blockId, replaceBody } from "./helpers.ts";
 
 describe("compaction mode", () => {
@@ -293,5 +300,205 @@ describe("hooks", () => {
 		const unchanged = { title: "", output: "y", metadata: {} };
 		await plain.hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "c1", args: {} }, unchanged);
 		expect(unchanged.output).toBe("y");
+	});
+});
+
+// ---- K1 / K5: OpenCode's threshold, paused under `auto` -----------------------------------
+
+describe("OpenCode threshold", () => {
+	test("usable and count follow session/overflow.ts", () => {
+		// No input limit: window minus min(output, 32k) (or 32k when output is 0).
+		expect(openCodeUsable({ context: 128_000, output: 8_000 }, undefined)).toBe(120_000);
+		expect(openCodeUsable({ context: 128_000, output: 64_000 }, undefined)).toBe(96_000);
+		expect(openCodeUsable({ context: 128_000 }, undefined)).toBe(96_000);
+		// Input limit: minus `compaction.reserved`, else min(20k, max output).
+		expect(openCodeUsable({ context: 200_000, input: 150_000, output: 8_000 }, undefined)).toBe(142_000);
+		expect(openCodeUsable({ context: 200_000, input: 150_000, output: 64_000 }, undefined)).toBe(130_000);
+		expect(openCodeUsable({ context: 200_000, input: 150_000, output: 64_000 }, 5_000)).toBe(145_000);
+		// The output-cap flag: the lower of the two call sites wins.
+		expect(openCodeUsable({ context: 128_000, output: 64_000 }, undefined, 48_000)).toBe(80_000);
+		expect(openCodeUsable({ context: 128_000, output: 64_000 }, undefined, 16_000)).toBe(96_000);
+		expect([openCodeUsable({}, undefined), openCodeUsable({ context: 0 }, undefined)]).toEqual([undefined, undefined]);
+		expect([openCodeMaxOutput(8_000), openCodeMaxOutput(undefined), openCodeMaxOutput(64_000, 48_000)]).toEqual([8_000, 32_000, 48_000]);
+		expect([outputTokenMaxFlag({ OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: "4096" }), outputTokenMaxFlag({ OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: "-1" }), outputTokenMaxFlag({})]).toEqual([4096, undefined, undefined]);
+		expect(openCodeCount({ total: 900, input: 1 })).toBe(900);
+		expect(openCodeCount({ input: 100, output: 20, cache: { read: 300, write: 4 } })).toBe(424);
+		expect([thresholdReachable(90_000, 120_000, 30_000), thresholdReachable(89_999, 120_000, 30_000)]).toEqual([true, false]);
+	});
+
+	test("lastFinishedStep: the newest finished assistant, summaries skipped", () => {
+		const raw = conversation();
+		expect(lastFinishedStep(raw)?.id).toBe("msg_a2");
+		const open = assistant("msg_a3", "streaming", [], 99);
+		delete (open.info as { finish?: string }).finish;
+		expect(lastFinishedStep([...raw, open])?.id).toBe("msg_a2");
+		const summary = assistant("msg_a4", "summary", [], 5);
+		summary.info.summary = true;
+		expect(lastFinishedStep([...raw, summary])).toBeUndefined();
+		expect(lastFinishedStep([raw[0]!])).toBeUndefined();
+	});
+
+	test("ThresholdWatch: one report per crossing, only under the plugin's flag", () => {
+		const watch = new ThresholdWatch();
+		expect(watch.observe("s", { id: "a", count: 500 }, 100)).toBeUndefined(); // nothing recorded yet
+		watch.set("s", undefined);
+		expect(watch.observe("s", { id: "b", count: 500 }, 100)).toBeUndefined(); // the user's flag: OpenCode compacted
+		watch.set("s", "auto");
+		expect(watch.observe("s", { id: "c", count: 500 }, 100)).toEqual({ count: 500, by: "auto" });
+		expect(watch.observe("s", { id: "c", count: 500 }, 100)).toBeUndefined(); // same step
+		expect(watch.observe("s", { id: "d", count: 600 }, 100)).toBeUndefined(); // same crossing
+		expect(watch.observe("s", { id: "e", count: 50 }, 100)).toBeUndefined(); // below: re-armed
+		watch.set("s", "off");
+		expect(watch.observe("s", { id: "f", count: 200 }, 100)).toEqual({ count: 200, by: "off" });
+		watch.reset("s");
+		expect(watch.observe("s", { id: "g", count: 200 }, 100)).toEqual({ count: 200, by: "off" });
+		expect(watch.observe("s", { id: "h", count: 200 }, undefined)).toBeUndefined();
+	});
+});
+
+describe("hooks: threshold compaction under auto (K1, K5)", () => {
+	const limits = (hooks: Hooks, limit: Record<string, number>) =>
+		hooks["experimental.chat.system.transform"]!({ sessionID: SESSION, model: { limit } } as never, { system: [] });
+	/** The conversation plus one finished step whose provider count is `count`. */
+	const withStep = (id: string, count: number) => [...conversation(), assistant(id, "step", [], count - 10)];
+
+	test("the flag is off only for requests that can reach the threshold", async () => {
+		const h = await load({}, { compaction: { auto: true } });
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction.auto).toBe(true); // no model limits yet
+		await limits(h.hooks, { context: 200_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction.auto).toBe(true); // ~1k + 8k output, far below 192k
+		await limits(h.hooks, { context: 10_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction.auto).toBe(false); // usable 2k: paused
+		await limits(h.hooks, { context: 200_000, input: 100_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction.auto).toBe(true); // usable 92k: restored
+		expect(h.toasts).toEqual([]);
+	});
+
+	test("no pause with the guard off, the user's auto false, or a mode other than auto", async () => {
+		for (const [options, config, expected] of [
+			[{ guard: "off" }, { compaction: { auto: true } }, true],
+			[{}, { compaction: { auto: false } }, false],
+			[{ compaction: "on" }, { compaction: { auto: true } }, true],
+		] as const) {
+			const h = await load(options, structuredClone(config));
+			await limits(h.hooks, { context: 10_000, output: 8_000 });
+			await transform(h.hooks, withStep("msg_a3", 5_000));
+			await transform(h.hooks, withStep("msg_a4", 6_000));
+			expect(h.config.compaction.auto).toBe(expected);
+			expect(h.toasts.filter((toast) => toast.includes("threshold compaction"))).toEqual([]);
+		}
+	});
+
+	test("a paused threshold compaction is reported once per crossing (toast, no notice)", async () => {
+		const h = await load({}, { compaction: { auto: true } });
+		await limits(h.hooks, { context: 10_000, output: 8_000 });
+		await transform(h.hooks, conversation()); // paused for this request
+		const sent = await transform(h.hooks, withStep("msg_a3", 5_000));
+		const paused = h.toasts.filter((toast) => toast.includes("Paused OpenCode's threshold compaction"));
+		expect(paused).toHaveLength(1);
+		expect(paused[0]).toContain("counted 5,000 of OpenCode's 2,000-token threshold");
+		expect(JSON.stringify(sent)).not.toContain("was cancelled");
+		await transform(h.hooks, withStep("msg_a4", 5_500));
+		expect(h.toasts.filter((toast) => toast.includes("Paused"))).toHaveLength(1);
+		// A compaction re-arms it.
+		await h.hooks.event!({ event: { type: "session.compacted", properties: { sessionID: SESSION } } as never });
+		await transform(h.hooks, withStep("msg_a5", 5_500));
+		expect(h.toasts.filter((toast) => toast.includes("Paused"))).toHaveLength(2);
+		const events = readFileSync(join(h.mirror, `clm-${SESSION}`, "events.jsonl"), "utf8");
+		expect(events).toContain('"compaction-cancelled"');
+		expect(events).toContain('"compaction-pause"');
+	});
+
+	test("off: a cancelled threshold compaction gets a notice and a toast", async () => {
+		const h = await load({ compaction: "off" }, { compaction: { auto: true } });
+		await limits(h.hooks, { context: 10_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		const sent = await transform(h.hooks, withStep("msg_a3", 5_000));
+		expect(JSON.stringify(sent)).toContain("automatic compaction (threshold) was cancelled");
+		expect(h.toasts.filter((toast) => toast.includes("Cancelled OpenCode's threshold compaction"))).toHaveLength(1);
+		// Below the threshold nothing is said.
+		const quiet = await load({ compaction: "off" }, { compaction: { auto: true } });
+		await limits(quiet.hooks, { context: 10_000, output: 8_000 });
+		await transform(quiet.hooks, conversation());
+		await transform(quiet.hooks, withStep("msg_a3", 1_000));
+		expect(quiet.toasts).toEqual([]);
+	});
+
+	test("a subagent's request does not undo the parent's pause: its tool call re-applies it", async () => {
+		const h = await load({}, { compaction: { auto: true } });
+		await limits(h.hooks, { context: 10_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction.auto).toBe(false);
+		// The `task` tool's child session: no model limits, so not paused, the user's value.
+		const child = conversation().map((message) => ({ ...message, info: { ...message.info, sessionID: "ses_child" } }));
+		await transform(h.hooks, child);
+		expect(h.config.compaction.auto).toBe(true);
+		// The parent's task call returns before OpenCode's finish-step check of the parent.
+		await h.hooks["tool.execute.after"]!({ tool: "task", sessionID: SESSION, callID: "c_task", args: {} }, { title: "", output: "done", metadata: {} });
+		expect(h.config.compaction.auto).toBe(false);
+		// The child's own tool calls keep the child's value.
+		await h.hooks["tool.execute.after"]!({ tool: "bash", sessionID: "ses_child", callID: "c_b", args: {} }, { title: "", output: "x", metadata: {} });
+		expect(h.config.compaction.auto).toBe(true);
+	});
+
+	test("a finished subagent hands the flag back to the newest other session's decision", async () => {
+		const h = await load({}, { compaction: { auto: true } });
+		await limits(h.hooks, { context: 10_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		const child = conversation().map((message) => ({ ...message, info: { ...message.info, sessionID: "ses_child" } }));
+		await transform(h.hooks, child);
+		expect(h.config.compaction.auto).toBe(true);
+		// The parent's task call threw (no tool.execute.after); the child's idle event restores the parent's pause.
+		await h.hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_child" } } as never });
+		expect(h.config.compaction.auto).toBe(false);
+		// The last session going idle keeps its own value for its next prompt's pre-step check.
+		await h.hooks.event!({ event: { type: "session.idle", properties: { sessionID: SESSION } } as never });
+		expect(h.config.compaction.auto).toBe(false);
+	});
+
+	test("a failed transform or open leaves no pause behind", async () => {
+		const h = await load({}, { compaction: { auto: true } });
+		await limits(h.hooks, { context: 10_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction.auto).toBe(false);
+		const original = ClmSession.prototype.transform;
+		ClmSession.prototype.transform = async () => {
+			throw new Error("boom");
+		};
+		try {
+			await transform(h.hooks, conversation());
+		} finally {
+			ClmSession.prototype.transform = original;
+		}
+		expect(h.config.compaction.auto).toBe(true);
+		expect(h.toasts.some((toast) => toast.includes("transform failed: boom"))).toBe(true);
+		// Paused again, then a session that cannot open (an invalid id) sends raw history.
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction.auto).toBe(false);
+		await transform(h.hooks, conversation().map((message) => ({ ...message, info: { ...message.info, sessionID: "bad/id" } })));
+		expect(h.config.compaction.auto).toBe(true);
+	});
+
+	test("a pause on a config without `compaction` leaves none behind", async () => {
+		const h = await load({});
+		await limits(h.hooks, { context: 10_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction).toEqual({ auto: false });
+		await limits(h.hooks, { context: 200_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction).toBeUndefined();
+	});
+
+	test("a provider overflow while paused still gets the overflow notice", async () => {
+		const h = await load({}, { compaction: { auto: true } });
+		await limits(h.hooks, { context: 10_000, output: 8_000 });
+		await transform(h.hooks, conversation());
+		expect(h.config.compaction.auto).toBe(false);
+		await h.hooks.event!({ event: { type: "session.error", properties: { sessionID: SESSION, error: { name: "ContextOverflowError" } } } as never });
+		expect(h.toasts.filter((toast) => toast.includes("too long"))).toHaveLength(1);
 	});
 });

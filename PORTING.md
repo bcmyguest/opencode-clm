@@ -43,13 +43,13 @@ Not ported, by reason (OpenCode v1.18.34 source):
   plugin completes inline instead: Tab on a `/clm …` line (`src/tui/complete.ts`).
 - **Chosen differently.** Without the TUI plugin, `/clm` costs one model turn: OpenCode
   cannot cancel a command's prompt short of failing it (`session/prompt.ts:1460`). With the
-  TUI plugin typed `/clm` lines cost none. `compaction: auto` keeps the user's
-  `compaction.auto` rather than pausing threshold compaction, since the guard keeps
-  requests below OpenCode's threshold.
+  TUI plugin typed `/clm` lines cost none. `compaction: auto` pauses threshold compaction
+  per request (OpenCode has no cancel hook): the flag is off only for a request that can
+  reach OpenCode's threshold, which also turns off overflow recovery for that request.
 - **Without a usable mirror directory** the session runs as pi-clm's store-less mode
-  (raw history, continuity, size notice), from a private temp directory. Annotations made
-  then are lost at restart, `clm_annotate` cannot create one (no mirror block ids), and
-  there are no budget notices or size trailers.
+  (raw history, continuity, size notice), from a private temp directory. Its annotations
+  survive a restart in OpenCode's session metadata (bounded), `clm_annotate` cannot create
+  one (no mirror block ids), and there are no budget notices or size trailers.
 - **`opencode attach`.** The panel reads the session directory locally when it can, else
   through the server: OpenCode's file API inside the server's directory, or the server
   plugin over the `tui.command.execute` channel. Settings changes and `/clm reset` go over

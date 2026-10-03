@@ -94,4 +94,40 @@ describe.skipIf(!ENABLED)("checkpoint history in opencode", () => {
 		expect(forkDir).toBeDefined();
 		expect(events(forkDir!).find((event) => event.event === "restored")).toMatchObject({ revision: 1, from: 1, origin });
 	}, CASE_TIMEOUT_MS);
+
+	test("opencode run --fork carries the origin's annotations into the fork", async () => {
+		const NOTE = "FORK_CARRIED_NOTE";
+		const c = new Case("fork-annotations", steps(
+			bash(MARKER_COMMAND, "Print the marker"),
+			(request) => ({
+				tools: [{
+					name: "clm_annotate",
+					args: {
+						action: "create",
+						source: /^\[\[CTX_TURN [^\n]* role=toolResult id=(\S+) /m.exec(request.mirrorText!)![1]!,
+						title: NOTE,
+						reason: "e2e fork",
+						futureAction: "keep it",
+						retention: "pin",
+					},
+				}],
+			}),
+			text("A_DONE"),
+			text("FORK_DONE"),
+		), { plugin: { budget: "16k", reserve: 512 } });
+		await c.run(["Run the e2e script."]);
+		const origin = c.sessionID();
+		await c.run(["--session", origin, "--fork", "Continue in the fork."]);
+		const main = c.mock.main();
+		expect(main.length).toBe(4);
+		const notes = userTexts(main[3]!).join("\n");
+		expect(notes).toContain(NOTE);
+		// The pinned tool result is still in the fork's conversation, so its text is not repeated.
+		expect(notes).toContain("The pinned source is still in the conversation above.");
+		const forkDir = c.sessionDirs().find((directory) => !directory.endsWith(`clm-${origin}`))!;
+		expect(events(forkDir).find((event) => event.event === "annotations-forked")).toMatchObject({ origin, count: 1, mapped: 1 });
+		const copied = JSON.parse(readFileSync(join(forkDir, "annotations.jsonl"), "utf8").trim().split("\n").at(-1)!);
+		expect(copied.title).toBe(NOTE);
+		expect(copied.source.sessionId).toBe(forkDir.split("clm-").at(-1));
+	}, CASE_TIMEOUT_MS);
 });

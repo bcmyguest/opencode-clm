@@ -54,6 +54,7 @@ import {
 	AnnotationStore,
 	ContinuitySizeTracker,
 	continuitySizeNoticeText,
+	forkAnnotations,
 	formatContinuityMessage,
 	type ContinuityBlockSource,
 	type LiveContextAnnotation,
@@ -88,6 +89,8 @@ export interface ModelLimits {
 	context?: number;
 	/** Model output limit, tokens; subtracted from the window by `resolveBudget`. */
 	output?: number;
+	/** Model input limit, tokens, when the provider sets one; only OpenCode's threshold reads it (src/compaction.ts). */
+	input?: number;
 }
 
 /** Sizes of the request parts the plugin does not see in the messages hook. */
@@ -210,7 +213,11 @@ export class ClmSession {
 	 * (a fork, `Session.fork` copies metadata). The first transform restores the newest of the
 	 * origin's checkpoints whose source the forked history still contains, then clears it.
 	 */
-	forkOrigin?: { sessionID: string; directory: string };
+	forkOrigin?: { sessionID: string; directory: string; /** The fork's creation time (ms), when OpenCode reported it. */ created?: number };
+	/** The origin's annotations from cloned session metadata (a fork without a mirror); used when the origin's store yields none. */
+	forkPersisted?: LiveContextAnnotation[];
+	/** Set when a fork's first request copied annotations in; the plugin then persists them (no mirror). */
+	annotationsImported = false;
 	/**
 	 * Why no mirror directory could be used, set by the plugin (M1). The store then sits in a
 	 * private temporary directory the model is never told about; requests carry the raw
@@ -1047,6 +1054,51 @@ export class ClmSession {
 		return false;
 	}
 
+	/**
+	 * First request of a forked session: copy the origin's annotations made up to the fork
+	 * point, their sources re-pointed at the fork's messages (`forkAnnotations`). The fork
+	 * point is the newest completion among the messages created before the fork itself
+	 * (OpenCode keeps message times in a fork); newer messages are the fork's own.
+	 */
+	private async copyForkAnnotations(origin: { sessionID: string; directory: string; created?: number }, raw: readonly OcMessage[], effective: readonly LiveContextMessage[]): Promise<void> {
+		let annotations: LiveContextAnnotation[] = [];
+		try {
+			annotations = await new AnnotationStore(origin.directory).list();
+		} catch (error) {
+			await this.log({ event: "annotations-unreadable", origin: origin.sessionID, error: describe(error) });
+		}
+		// Without a mirror the origin's directory is usually out of reach too: fall back to the
+		// set the origin kept in OpenCode's metadata, which the fork cloned (index.ts).
+		if (annotations.length === 0) annotations = this.forkPersisted ?? [];
+		this.forkPersisted = undefined;
+		if (annotations.length === 0) return;
+		let cutoff: number | undefined;
+		for (const { info } of raw) {
+			const created = Number(info.time?.created ?? 0);
+			if (origin.created !== undefined && created >= origin.created) continue;
+			const end = Number(info.time?.completed ?? 0) || created;
+			if (cutoff === undefined || end > cutoff) cutoff = end;
+		}
+		const copied = forkAnnotations(annotations, effective, { sessionId: this.sessionID, ...(cutoff !== undefined ? { cutoff } : {}) });
+		try {
+			const written = await this.annotations.importAll(copied);
+			// Without the fork's creation time the fork's own new messages count too, so origin
+			// annotations made between the fork and its first request are carried as well.
+			if (written > 0) {
+				this.annotationsImported = true;
+				await this.log({
+					event: "annotations-forked",
+					origin: origin.sessionID,
+					count: written,
+					mapped: copied.filter((annotation) => annotation.source.sessionId === this.sessionID).length,
+					cutoff: origin.created === undefined ? "unbounded" : cutoff ?? null,
+				});
+			}
+		} catch (error) {
+			await this.log({ event: "annotations-fork-error", origin: origin.sessionID, error: describe(error) });
+		}
+	}
+
 	private async loadAnnotations(): Promise<LiveContextAnnotation[]> {
 		try {
 			return await this.annotations.list();
@@ -1070,6 +1122,9 @@ export class ClmSession {
 			return { messages: raw, notices: [] };
 		}
 		this.requests += 1;
+		const origin = this.forkOrigin;
+		this.forkOrigin = undefined;
+		if (origin) await this.copyForkAnnotations(origin, raw, flatten(raw));
 		const continuity = formatContinuityMessage({ annotations: await this.loadAnnotations(), effectiveMessages: flatten(raw) });
 		const tokens = continuity ? this.textTokens(continuity) : 0;
 		const notices = this.continuitySize.observe(tokens) ? [continuitySizeNoticeText(tokens)] : [];
@@ -1168,6 +1223,7 @@ export class ClmSession {
 		if (!this.settings.reasoning) effective = withoutReasoning(effective);
 		effective = capObservations(effective, this.settings.observationCap);
 
+		if (origin) await this.copyForkAnnotations(origin, raw, effective);
 		const annotations = await this.loadAnnotations();
 		const continuityText = (messages: LiveContextMessage[]) =>
 			formatContinuityMessage({ annotations, effectiveMessages: messages });

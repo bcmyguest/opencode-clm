@@ -17,7 +17,7 @@ import { resolve } from "node:path";
 
 import type { ToolContext, ToolDefinition, tool } from "@opencode-ai/plugin";
 
-import { digestMessages, renderMessage } from "./context-document.ts";
+import { blockId, digestMessages, renderMessage } from "./context-document.ts";
 import type { LiveContextMessage } from "./types.ts";
 
 export const ANNOTATIONS_FILE = "annotations.jsonl";
@@ -413,6 +413,113 @@ export interface CreateAnnotationInput {
  */
 const fileQueues = new Map<string, Promise<unknown>>();
 
+/**
+ * The origin's annotations as a fork of it carries them (pi: a branch carries the annotation
+ * entries on its path). OpenCode's `Session.fork` copies messages with new ids
+ * (session/session.ts:691-730) and keeps their times, and an annotation's `contentHash` and
+ * block id digest the source message with its id. So:
+ * - an annotation created after `cutoff` (ms; the fork's newest copied message) belongs to
+ *   the origin's later history and is left out; one resolved after it is carried unresolved;
+ * - a source found in the fork's `messages` by its rendered text (role and text, or the head
+ *   of a truncated snapshot) is re-pointed at the fork's copy: hash, block id (its position
+ *   in `messages`) and session; an unmatched source keeps the origin's values and
+ *   stays recallable from its stored text. Identical messages (a repeated prompt, the same
+ *   tool output twice) map to the first copy: same text and hash, possibly another block id.
+ *   Block ids index `messages` as the caller passes them (the effective messages before the
+ *   overflow guard, which replaces results in place and so keeps positions).
+ * Ids, titles, text, creation times and `source.revision` (the origin's revision) are kept.
+ */
+export function forkAnnotations(
+	annotations: readonly LiveContextAnnotation[],
+	messages: readonly LiveContextMessage[],
+	options: { sessionId: string; cutoff?: number },
+): LiveContextAnnotation[] {
+	const rendered = messages.map((message) => renderMessage(message));
+	const before = (iso: string | undefined) => iso !== undefined && (options.cutoff === undefined || Date.parse(iso) <= options.cutoff);
+	const out: LiveContextAnnotation[] = [];
+	for (const annotation of annotations) {
+		if (!before(annotation.createdAt)) continue;
+		const copy: LiveContextAnnotation = { ...annotation, source: { ...annotation.source } };
+		if (copy.resolvedAt !== undefined && !before(copy.resolvedAt)) {
+			delete copy.resolvedAt;
+			delete copy.resolution;
+		}
+		const { source } = copy;
+		const index = messages.findIndex((message, position) =>
+			message.role === source.role &&
+			(source.truncated ? rendered[position]!.startsWith(source.text) : rendered[position] === source.text));
+		if (index >= 0) {
+			copy.source = { ...source, sessionId: options.sessionId, contentHash: sourceContentHash(messages[index]!), blockId: blockId(messages[index]!, index) };
+		}
+		out.push(copy);
+	}
+	return out;
+}
+
+/** Bound on the annotations a session without a mirror keeps in OpenCode's session metadata, bytes of JSON. */
+export const PERSISTED_ANNOTATIONS_BYTES = 64 * 1024;
+
+/**
+ * Annotations of a session without a mirror, as kept in OpenCode's session metadata
+ * (`metadata.clm.annotations`) so they survive a restart; the session's files then live in a
+ * per-process temp directory. `resolved` records every resolution (small); `annotations`
+ * holds full snapshots, active ones first, as many as fit the byte bound.
+ */
+export interface PersistedAnnotations {
+	version: 1;
+	resolved: Array<{ id: string; resolvedAt: string; resolution?: string }>;
+	annotations: LiveContextAnnotation[];
+}
+
+/** The record for `metadata.clm.annotations`, at most `maxBytes` of JSON. */
+export function persistAnnotations(annotations: readonly LiveContextAnnotation[], maxBytes = PERSISTED_ANNOTATIONS_BYTES): PersistedAnnotations {
+	const out: PersistedAnnotations = { version: 1, resolved: [], annotations: [] };
+	let size = Buffer.byteLength(JSON.stringify(out));
+	const fits = (value: unknown) => {
+		const added = Buffer.byteLength(JSON.stringify(value)) + 1;
+		if (size + added > maxBytes) return false;
+		size += added;
+		return true;
+	};
+	for (const annotation of annotations) {
+		if (annotation.resolvedAt === undefined) continue;
+		const stub = { id: annotation.id, resolvedAt: annotation.resolvedAt, ...(annotation.resolution !== undefined ? { resolution: annotation.resolution } : {}) };
+		if (fits(stub)) out.resolved.push(stub);
+	}
+	const rank = (annotation: LiveContextAnnotation) => (annotation.resolvedAt === undefined && annotation.retention !== "archive" ? 0 : 1);
+	for (const annotation of [...annotations].sort((left, right) => rank(left) - rank(right))) {
+		if (fits(annotation)) out.annotations.push(annotation);
+	}
+	return out;
+}
+
+/**
+ * Snapshots to append to a store holding `current` so it reflects `persisted` (a
+ * `PersistedAnnotations` read back from metadata; anything else yields nothing): annotations
+ * the store lacks, then resolutions of ones it holds unresolved.
+ */
+export function restorePersisted(current: readonly LiveContextAnnotation[], persisted: unknown): LiveContextAnnotation[] {
+	if (!persisted || typeof persisted !== "object") return [];
+	const record = persisted as Partial<PersistedAnnotations>;
+	if (record.version !== 1) return [];
+	const byId = new Map(current.map((annotation) => [annotation.id, annotation]));
+	const out: LiveContextAnnotation[] = [];
+	for (const annotation of Array.isArray(record.annotations) ? record.annotations : []) {
+		if (!isLiveContextAnnotation(annotation) || byId.has(annotation.id)) continue;
+		byId.set(annotation.id, annotation);
+		out.push(annotation);
+	}
+	for (const stub of Array.isArray(record.resolved) ? record.resolved : []) {
+		if (!stub || typeof stub !== "object" || typeof stub.id !== "string" || typeof stub.resolvedAt !== "string") continue;
+		const annotation = byId.get(stub.id);
+		if (!annotation || annotation.resolvedAt !== undefined) continue;
+		const resolved = resolveAnnotation(annotation, typeof stub.resolution === "string" ? stub.resolution : undefined, stub.resolvedAt);
+		byId.set(stub.id, resolved);
+		out.push(resolved);
+	}
+	return out;
+}
+
 /** Append-only `annotations.jsonl` in one session directory. */
 export class AnnotationStore {
 	readonly filePath: string;
@@ -489,6 +596,25 @@ export class AnnotationStore {
 			const resolved = resolveAnnotation(existing, resolution, this.now().toISOString());
 			await this.append(resolved);
 			return resolved;
+		});
+	}
+
+	/** Appends snapshots as they are (`restorePersisted`); the latest per id wins on load. */
+	appendAll(annotations: readonly LiveContextAnnotation[]): Promise<void> {
+		return this.serialize(async () => {
+			for (const annotation of annotations) await this.append(annotation);
+		});
+	}
+
+	/**
+	 * Writes another session's annotations into this store as they are (`forkAnnotations`),
+	 * only while this store holds none; returns how many were written.
+	 */
+	importAll(annotations: readonly LiveContextAnnotation[]): Promise<number> {
+		return this.serialize(async () => {
+			if (annotations.length === 0 || (await this.list()).length > 0) return 0;
+			for (const annotation of annotations) await this.append(annotation);
+			return annotations.length;
 		});
 	}
 

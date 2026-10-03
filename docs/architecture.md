@@ -192,7 +192,8 @@ error is a line in `events.jsonl`.
   `restored` event. The plugin stamps `metadata.clm.origin` on each OpenCode session; a fork
   copies the metadata, so a fork's first request restores the origin's newest checkpoint
   whose source the fork starts with (compared without message ids). `/clm reset` clears
-  the history. Annotations do not carry into a fork.
+  the history. The fork's first request also copies the origin's annotations made up to the
+  fork point, their sources re-pointed at the fork's copies of the messages.
 - Any other prefix mismatch drops the revision: the next request carries the stored
   history, and the model gets a notice. Two consecutive drops add a warning that edits
   keep being dropped until the start of the history stops changing.
