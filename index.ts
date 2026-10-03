@@ -37,6 +37,11 @@ import { statusText, systemGuidance } from "./src/presentation.ts";
 import { COMPACT_COMMAND, COMPACT_TEMPLATE, STATUS_COMMAND, STATUS_TEMPLATE } from "./src/commands.ts";
 import { changeSetting, resetSettings, showSetting } from "./src/overrides.ts";
 import { settingsText } from "./src/settings-table.ts";
+import { parseClmCommand, type Page } from "./src/panel/command.ts";
+import { buildPanelModel } from "./src/panel/model.ts";
+import { panelPageText } from "./src/panel/text.ts";
+import { readSessionDirectory } from "./src/session-files.ts";
+import { fallbackBudget, settingsView } from "./src/tui/data.ts";
 import { resolveSettings, SKILLS_DIR, type ClmSettings } from "./src/settings.ts";
 import { loadSteeringDocument, steeringPromptSection, type SteeringDocument } from "./src/steering.ts";
 
@@ -50,7 +55,7 @@ const HELPER_PROMPTS = [
 	"You are a context summarization agent",
 ];
 
-const STATUS_USAGE = "Usage: /clm [status | path | on | off | reset | config [setting [value] | reset]]";
+const STATUS_USAGE = "Usage: /clm [overview | input | edits | settings | status | path | on | off | reset | config [setting [value] | reset]]";
 
 type ToastVariant = "info" | "success" | "warning" | "error";
 
@@ -156,11 +161,24 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		return `CLM ${result.text}. It applies from the next request.`;
 	}
 
+	/** `/clm overview|input|edits|settings` outside the TUI: the panel page as plain text. */
+	async function pageCommand(clm: ClmSession, page: Page): Promise<string> {
+		const files = await readSessionDirectory(clm.store.directory, clm.sessionID);
+		const budget = fallbackBudget(clm.settings, clm.limits);
+		const model = buildPanelModel(files, budget ? { budget } : {});
+		model.enabled = clm.enabled;
+		const format = { ...(clm.limits.context ? { modelWindow: clm.limits.context } : {}) };
+		model.settings = settingsView(clm.settingsValues(), model, { format, ...(clm.settingsWarning ? { warning: clm.settingsWarning } : {}) });
+		return panelPageText(model, page);
+	}
+
 	async function statusCommand(clm: ClmSession, args: string): Promise<string> {
 		await clm.refreshSettings();
 		const words = args.split(/\s+/).filter(Boolean);
 		const argument = (words[0] ?? "").toLowerCase();
 		if (argument === "config") return configCommand(clm, words.slice(1));
+		const command = parseClmCommand(`/clm ${args}`);
+		if (args !== "" && command?.kind === "open") return pageCommand(clm, command.page);
 		if (words.length > 1) return `${STATUS_USAGE}\nUnknown argument: ${JSON.stringify(args)}`;
 		switch (argument) {
 			case "":

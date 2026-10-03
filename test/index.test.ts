@@ -503,3 +503,18 @@ describe("/clm config", () => {
 		expect((await system(harness.hooks, "ses_other", ["base"])).join("\n")).not.toContain("BRIEF_TEXT");
 	});
 });
+
+describe("/clm pages as text", () => {
+	test("overview, input, edits and settings print the panel page; no argument keeps the status", async () => {
+		const harness = await load({ budget: "16k" });
+		await transform(harness.hooks, structuredClone(conversation()));
+		const overview = await command(harness.hooks, STATUS_COMMAND, "overview");
+		expect(overview).toContain("CLM overview · r0");
+		expect(overview).toContain("Context size · 1 request");
+		expect(await command(harness.hooks, STATUS_COMMAND, "input")).toContain("Current input");
+		expect(await command(harness.hooks, STATUS_COMMAND, "edits")).toContain("CLM edits");
+		const settingsPage = await command(harness.hooks, STATUS_COMMAND, "Settings");
+		expect(settingsPage).toMatch(/Budget +16k/);
+		expect(await command(harness.hooks, STATUS_COMMAND)).toContain(`CLM status for session ${SESSION}`);
+	});
+});

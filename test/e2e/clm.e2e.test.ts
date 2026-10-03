@@ -87,7 +87,7 @@ describe.skipIf(!ENABLED)("opencode-clm in opencode", () => {
 	}, CASE_TIMEOUT_MS);
 
 	test("1b. /clm path and /clm-compact run through command.execute.before", async () => {
-		const c = new Case("commands", steps(text("PATH_SHOWN"), text("COMPACT_ACK")), { plugin: { budget: "24000" } });
+		const c = new Case("commands", steps(text("PATH_SHOWN"), text("COMPACT_ACK"), text("OVERVIEW_SHOWN")), { plugin: { budget: "24000" } });
 		const first = await c.run(["--command", "clm", "path"]);
 		const [pathRequest] = c.mock.main();
 		const mirror = pathRequest!.mirrorPath!;
@@ -108,6 +108,13 @@ describe.skipIf(!ENABLED)("opencode-clm in opencode", () => {
 		// opencode run quotes a multi-word argument: the template sees `"keep the build log"`.
 		expect(compactUser).toMatch(/^Also: "?keep the build log"?$/m);
 		expect(compactUser).not.toContain("Compact your context. keep");
+
+		// `/clm overview` outside the TUI: the panel page as plain text.
+		await c.run(["--session", c.sessionID(), "--command", "clm", "overview"]);
+		const overviewUser = userTexts(c.mock.main()[2]!).join("\n");
+		expect(overviewUser).toContain("CLM overview · r0");
+		expect(overviewUser).toMatch(/Context size · \d+ requests?/);
+		expect(overviewUser).toContain("Show the CLM text above to the user exactly as written.");
 	}, CASE_TIMEOUT_MS);
 
 	test("2. the mirror is created on the first request and re-rendered on every turn", async () => {
