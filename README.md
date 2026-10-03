@@ -10,7 +10,8 @@
 | |___| |___| |  | |
  \____|_____|_|  |_|
 
-opencode-clm — the agent that manages its own context
+opencode-clm
+the agent that manages its own context
 ```
 
 `opencode-clm` is an [OpenCode](https://opencode.ai) plugin that lets the agent manage its
