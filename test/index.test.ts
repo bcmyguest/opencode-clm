@@ -463,3 +463,43 @@ describe("budget-too-small", () => {
 		expect(status).toContain("effective budget");
 	});
 });
+
+describe("/clm config", () => {
+	const overrides = (harness: Harness) =>
+		JSON.parse(readFileSync(join(harness.directory, "mirrors", `clm-${SESSION}`, "overrides.json"), "utf8"));
+
+	test("prints, shows, changes and resets settings; status lists the changes; on/off write the override", async () => {
+		const harness = await load({ budget: "16k" });
+		await transform(harness.hooks, structuredClone(conversation()));
+		const page = await command(harness.hooks, STATUS_COMMAND, "config");
+		expect(page).toContain("CLM settings for this session");
+		expect(page).toMatch(/Budget +16k/);
+		expect(await command(harness.hooks, STATUS_COMMAND, "config Overflow")).toContain("Overflow guard: on — ");
+		expect(await command(harness.hooks, STATUS_COMMAND, "config budget 20k")).toContain("CLM Budget: 20k. It applies from the next request.");
+		expect(await command(harness.hooks, STATUS_COMMAND, "config guard off")).toContain("CLM Overflow guard: off.");
+		expect(overrides(harness)).toEqual({ version: 1, overrides: { budget: 20_000, guard: "off" } });
+		expect(await command(harness.hooks, STATUS_COMMAND, "config budget lots")).toContain("[CLM] /clm failed: budget must be a number of tokens");
+		expect(await command(harness.hooks, STATUS_COMMAND, "config bogus 1")).toContain('Unknown setting "bogus"');
+		expect(await command(harness.hooks, STATUS_COMMAND)).toContain("Changed: budget 20k, guard off");
+
+		expect(await command(harness.hooks, STATUS_COMMAND, "off")).toContain("CLM is off");
+		expect(overrides(harness).overrides.editing).toBe(false);
+		const base = conversation();
+		expect(await transform(harness.hooks, structuredClone(base))).toEqual(base);
+		expect(await command(harness.hooks, STATUS_COMMAND, "on")).toContain("CLM is on");
+		expect(overrides(harness).overrides.editing).toBeUndefined();
+
+		expect(await command(harness.hooks, STATUS_COMMAND, "config reset")).toContain("reset to the defaults");
+		expect(overrides(harness)).toEqual({ version: 1, overrides: {} });
+		expect(await command(harness.hooks, STATUS_COMMAND)).not.toContain("Changed:");
+	});
+
+	test("a steering override reaches this session's system prompt", async () => {
+		const harness = await load();
+		writeFileSync(join(harness.directory, "brief.md"), "BRIEF_TEXT");
+		await transform(harness.hooks, structuredClone(conversation()));
+		await command(harness.hooks, STATUS_COMMAND, `config steering ${join(harness.directory, "brief.md")}`);
+		expect((await system(harness.hooks, SESSION, ["base"])).join("\n")).toContain("BRIEF_TEXT");
+		expect((await system(harness.hooks, "ses_other", ["base"])).join("\n")).not.toContain("BRIEF_TEXT");
+	});
+});

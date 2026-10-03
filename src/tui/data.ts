@@ -6,23 +6,40 @@ import { resolveBudget } from "../budget.ts";
 import type { LatestUsage, PanelModel, PanelSettings, SettingRow } from "../panel/model.ts";
 import { formatTokenCount } from "../panel/timeline.ts";
 import type { ClmSettings } from "../settings.ts";
-
-/** `opencode-clm`, `opencode-clm@1.2.3`, or a scoped/aliased path ending in it. */
-const NPM_SPEC = /(^|\/)opencode-clm(@[^/]*)?$/;
+import { applyOverrides, changedSettings, sanitizeOverrides, SETTINGS_TABLE, type FormatContext, type SettingsValues } from "../settings-table.ts";
 
 /**
- * Options of the server plugin entry in `api.state.config.plugin`: a spec naming the
- * package, or a `file://` URL equal to the package's own index.ts. Undefined when no entry
- * matches (the caller falls back to the TUI plugin's options).
+ * The package by name, with any version, tag or source after `@` (`opencode-clm`,
+ * `opencode-clm@0.2.0`, `opencode-clm@latest`, `opencode-clm@file:/x/opencode-clm-0.2.0.tgz`
+ * as `opencode plugin <tarball>` writes it), optionally behind `npm:`.
+ */
+const NPM_SPEC = /^(?:npm:)?opencode-clm(?:@.*)?$/;
+/** A path or URL whose last segment names the package (a checkout, an unpacked or packed copy). */
+const PATH_NAME = /(?:^|\/)opencode-clm(?:@[^/]*|-\d[^/]*\.tgz)?\/?$/;
+
+/** True when a server plugin spec names this package. */
+export function isPackageSpec(spec: string, packageIndexUrl: string): boolean {
+	if (NPM_SPEC.test(spec)) return true;
+	// Another package's `name@version-or-source`: the source may be a path, but the name decides.
+	if (/^(?:npm:)?(?:@[^/@]+\/)?[^@/.~][^@/]*@/.test(spec)) return false;
+	const target = normalizeUrl(packageIndexUrl);
+	const packageDirectory = target.replace(/\/index\.ts$/, "");
+	const path = spec.startsWith("file:") ? normalizeUrl(spec) : spec.includes("/") ? spec.replace(/\/+$/, "") : undefined;
+	if (path === undefined) return false;
+	if (path === target || path === packageDirectory) return true;
+	return PATH_NAME.test(path) || /(?:^|\/)opencode-clm\/index\.ts$/.test(path);
+}
+
+/**
+ * Options of the server plugin entry in `api.state.config.plugin` (see `isPackageSpec`).
+ * Undefined when no entry matches (the caller falls back to the TUI plugin's options).
  */
 export function serverPluginOptions(entries: unknown, packageIndexUrl: string): Record<string, unknown> | undefined {
 	if (!Array.isArray(entries)) return undefined;
-	const target = normalizeUrl(packageIndexUrl);
 	for (const entry of entries) {
 		const [spec, options] = Array.isArray(entry) ? entry : [entry, undefined];
 		if (typeof spec !== "string") continue;
-		const matches = spec.startsWith("file:") ? normalizeUrl(spec) === target : NPM_SPEC.test(spec);
-		if (!matches) continue;
+		if (!isPackageSpec(spec, packageIndexUrl)) continue;
 		return options && typeof options === "object" && !Array.isArray(options) ? (options as Record<string, unknown>) : {};
 	}
 	return undefined;
@@ -86,25 +103,59 @@ export function fallbackBudget(settings: ClmSettings, limits: { context?: number
 }
 
 /**
- * Read-only settings rows until `/clm config` lands: the values in force, with choices or
- * a placeholder so Enter produces the apply/prompt effect the reducer defines.
+ * Settings page rows from the settings table: the values in force (base + this session's
+ * overrides.json), marked when changed, with choices or a placeholder so Enter cycles or
+ * prompts. `base` is what the session would use without overrides.
  */
-export function settingsView(settings: ClmSettings, model: Pick<PanelModel, "enabled" | "budgetInfo" | "timeline" | "mirrorPath">): PanelSettings {
-	const onOff = (value: boolean) => (value ? "on" : "off");
-	const budget = settings.budget.contextBudget === undefined ? "window" : formatTokenCount(settings.budget.contextBudget);
-	const rows: SettingRow[] = [
-		{ key: "editing", label: "CLM editing", value: onOff(model.enabled), choices: ["on", "off"], description: "Whether the model's mirror edits are applied. Env: CLM_ENABLED" },
-		{ key: "budget", label: "Budget", value: budget, placeholder: "32k, 1.5m or window", description: "Context budget the reminders and the overflow guard measure against. Env: CLM_BUDGET" },
-		{ key: "reserve", label: "Reserve", value: formatTokenCount(settings.budget.reserve), placeholder: "2k", description: "Room kept free below the budget. Env: CLM_RESERVE" },
-		{ key: "gate", label: "Edit gate", value: settings.gate, choices: ["fit", "shrink", "none"], description: "Which growing edits are accepted. Env: CLM_EDIT_GATE" },
-		{ key: "guard", label: "Overflow guard", value: settings.guard === "off" ? "off" : "on", choices: ["on", "off"], description: "Withhold the oldest tool results above budget − reserve. Env: CLM_OVERFLOW" },
-		{ key: "reasoning", label: "Reasoning", value: onOff(settings.reasoning), choices: ["on", "off"], description: "Show assistant reasoning in the mirror. Env: CLM_REASONING" },
-	];
+export function settingsView(
+	values: { base: SettingsValues; effective: SettingsValues },
+	model: Pick<PanelModel, "budgetInfo" | "timeline" | "mirrorPath">,
+	options: { format?: FormatContext; warning?: string } = {},
+): PanelSettings {
+	const changed = new Set<string>(changedSettings(values.base, values.effective));
+	const rows: SettingRow[] = SETTINGS_TABLE.map((item) => ({
+		key: item.name,
+		label: item.label,
+		value: item.format(values.effective, options.format),
+		description: `${item.description} Default: ${item.format(values.base, options.format)}.`,
+		...(changed.has(item.key) ? { changed: true } : {}),
+		...(item.choices ? { choices: item.choices } : {}),
+		...(item.placeholder ? { placeholder: item.placeholder } : {}),
+	}));
 	const latest = model.timeline.points.at(-1);
 	const summary: string[] = [];
 	if (latest) summary.push(`Size last request ${latest.measured ? "" : "~"}${formatTokenCount(latest.tokens)}${latest.measured ? " (provider count)" : " (estimate)"}`);
 	const info = model.budgetInfo;
 	if (info?.overhead !== undefined) summary.push(`Fixed overhead ~${formatTokenCount(info.overhead)} · usable ${formatTokenCount(info.usable ?? 0)}`);
 	summary.push(`Files mirror ${model.mirrorPath}`);
-	return { rows, summary, changed: [] };
+	return {
+		rows,
+		summary,
+		changed: SETTINGS_TABLE.filter((item) => changed.has(item.key)).map((item) => item.name),
+		...(options.warning ? { warning: options.warning } : {}),
+	};
+}
+
+/**
+ * The server's base settings, from snapshot.json `base` (the server writes it each
+ * request), applied over the TUI's own resolution so non-table settings (mirrorDir…) stay.
+ * `tui` when there is no usable snapshot base yet.
+ */
+export function serverBase(own: ClmSettings, snapshot: unknown): { base: ClmSettings; source: "server" | "tui" } {
+	const raw = snapshot && typeof snapshot === "object" ? (snapshot as { base?: unknown }).base : undefined;
+	if (!raw || typeof raw !== "object") return { base: own, source: "tui" };
+	const { overrides } = sanitizeOverrides(raw);
+	try {
+		return { base: applyOverrides(own, overrides), source: "server" };
+	} catch {
+		return { base: own, source: "tui" };
+	}
+}
+
+/** True when overrides.json (mtime, ms) is newer than snapshot.json's `at`, or there is no snapshot. */
+export function overridesNewer(overridesAt: number | undefined, snapshot: unknown): boolean {
+	if (overridesAt === undefined) return false;
+	const at = snapshot && typeof snapshot === "object" ? (snapshot as { at?: unknown }).at : undefined;
+	const snapshotAt = typeof at === "string" ? Date.parse(at) : Number.NaN;
+	return !Number.isFinite(snapshotAt) || overridesAt > snapshotAt;
 }

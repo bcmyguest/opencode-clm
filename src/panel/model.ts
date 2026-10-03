@@ -149,6 +149,11 @@ export interface PanelExtras {
 	 */
 	budget?: { budget: number; reserve: number; source?: string; cap?: number };
 	settings?: PanelSettings;
+	/**
+	 * `budget` (the effective settings) wins over snapshot.json: overrides.json changed after
+	 * the last request, so its budget applies from the next one.
+	 */
+	preferSettings?: boolean;
 }
 
 const EDIT_KINDS = new Set<string>(["kept", "edited", "removed", "restored", "normalized", "added"]);
@@ -194,8 +199,9 @@ function timeOf(value: number | string | undefined): number | undefined {
  * Points from `request` events (requests flagged `compaction` excluded) and markers from
  * outcome events. Every size is the server's measure: input + cache read + cache write of
  * the reply (no output). A request's provider count is the next request event's
- * `observedPrevious`, unless that equals this request's own `observedPrevious` (the reply
- * failed and the count is the older one again). The newest request takes `latest` when that
+ * `observedPrevious`, unless the next event names the same reporting message
+ * (`observedMessage`) as this one: the reply failed and the count is the older one again.
+ * Events without `observedMessage` fall back to comparing the counts. The newest request takes `latest` when that
  * reply completed after the request was sent; otherwise the logged `estimated`
  * (`measured: false`).
  */
@@ -211,7 +217,15 @@ export function buildTimeline(events: readonly ClmEvent[], latest?: LatestUsage)
 		const next = requests[index + 1];
 		const observed = next ? num(next.event.observedPrevious) : undefined;
 		if (observed === undefined || observed <= 0) return;
-		if (observed === num(event.observedPrevious)) return; // repeated: the reply to this request failed
+		// The same reporting message again: the reply to this request failed or reported no
+		// usage, so the count is the older one. Without the id (logs before v0.2.0), an equal
+		// count stands in for "same message".
+		const nextMessage = str(next!.event.observedMessage);
+		if (nextMessage !== undefined) {
+			if (nextMessage === str(event.observedMessage)) return;
+		} else if (observed === num(event.observedPrevious)) {
+			return;
+		}
 		observedAfter.set(position, observed);
 	});
 	const lastRequest = requests.filter(({ event }) => event.compaction !== true).at(-1);
@@ -302,8 +316,9 @@ function editFromRow(row: unknown): EditView | undefined {
 	const afterRole = str(row.afterRole) ?? role;
 	const sourceIndex = count(row.sourceIndex);
 	const outputIndex = count(row.outputIndex);
-	const before = kind === "added" ? undefined : str(row.before);
-	const after = kind === "removed" ? undefined : str(row.after);
+	// `text` stands for both sides of an unchanged row (written since v0.2.0 block 3 fixes).
+	const before = kind === "added" ? undefined : str(row.before) ?? str(row.text);
+	const after = kind === "removed" ? undefined : str(row.after) ?? str(row.text);
 	const view: EditView = { kind };
 	if (sourceIndex !== undefined) view.sourceIndex = sourceIndex + 1;
 	if (outputIndex !== undefined) view.outputIndex = outputIndex + 1;
@@ -425,7 +440,9 @@ function outcomeFrom(value: unknown): LiveContextOutcome | undefined {
  * resolved settings), else the stored check, else the newest check event. Overhead:
  * snapshot.json, else `state.budgetCheck`, else the newest `budget-too-small` /
  * `budget-check` event. The raise is recomputed with `budgetFit`, as the server does on
- * every request, so a stored decision never outlives a config change. Event fields are
+ * every request, so a stored decision never outlives a config change. With
+ * `preferFallback` (overrides.json newer than snapshot.json) the snapshot's budget, reserve
+ * and limit are ignored and `fallback` (the effective settings) is used. Event fields are
  * read under the names clm.ts logs (`configured`, `effective`) and the short names
  * (`budget`, `effectiveBudget`); unknown fields are ignored.
  */
@@ -434,8 +451,9 @@ export function buildBudget(
 	state: Record<string, unknown> | undefined,
 	events: readonly ClmEvent[],
 	fallback?: PanelExtras["budget"],
+	preferFallback = false,
 ): BudgetView | undefined {
-	const snapshotBudget = isObject(snapshot?.budget) ? snapshot.budget : undefined;
+	const snapshotBudget = isObject(snapshot?.budget) && !(preferFallback && fallback) ? snapshot.budget : undefined;
 	const check = isObject(state?.budgetCheck) ? state.budgetCheck : undefined;
 	let checkEvent: ClmEvent | undefined;
 	let tooSmallEvent = false;
@@ -495,7 +513,7 @@ export function buildPanelModel(files: SessionFiles, extras: PanelExtras = {}): 
 	if (files.skippedEventLines > 0) {
 		warnings.push(`Skipped ${files.skippedEventLines} unreadable line${files.skippedEventLines === 1 ? "" : "s"} in events.jsonl.`);
 	}
-	const budgetInfo = buildBudget(snapshot, state, files.events, extras.budget);
+	const budgetInfo = buildBudget(snapshot, state, files.events, extras.budget, extras.preferSettings === true);
 	const model: PanelModel = {
 		sessionID: files.sessionID,
 		directory: files.directory,

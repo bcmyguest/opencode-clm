@@ -113,6 +113,56 @@ describe("tui panel", () => {
 		expect(calls.dropped).toBe(1);
 	});
 
+	test("ctrl+c closes; removing the panel from the screen releases its key mode", async () => {
+		setup = await createTestRenderer({ width: 100, height: 30 });
+		const { api, calls } = fakeApi(setup.renderer);
+		let closed = 0;
+		let disposed = 0;
+		const panel = createPanel(api, { page: "overview", load: async () => richModel(), apply: async () => undefined, onClose: () => closed++, onDispose: () => disposed++ });
+		setup.renderer.root.add(panel.renderable);
+		await panel.reload();
+		press(calls, "ctrl+c");
+		expect([closed, calls.popped, calls.dropped, disposed]).toEqual([1, 1, 1, 1]);
+
+		const second = fakeApi(setup.renderer);
+		const other = createPanel(second.api, { page: "overview", load: async () => richModel(), apply: async () => undefined, onClose: () => closed++, onDispose: () => disposed++ });
+		setup.renderer.root.add(other.renderable);
+		await other.reload();
+		// The host unmounts the route without q/Esc (another navigate): no close, but the mode goes.
+		setup.renderer.root.remove(other.renderable);
+		expect([closed, second.calls.popped, second.calls.dropped, disposed]).toEqual([1, 1, 1, 2]);
+	});
+
+	test("settings apply: Enter cycles the value through apply, reloads, and confirms the value in force", async () => {
+		setup = await createTestRenderer({ width: 100, height: 30 });
+		const { api, calls } = fakeApi(setup.renderer);
+		const applied: Array<[string, string]> = [];
+		let editing = "on";
+		const panel = createPanel(api, {
+			page: "settings",
+			load: async () => {
+				const model = richModel();
+				model.settings = { ...model.settings, rows: model.settings.rows.map((row) => (row.key === "editing" ? { ...row, value: editing, changed: editing === "off" } : row)) };
+				return model;
+			},
+			apply: async (setting, value) => {
+				applied.push([setting, value]);
+				editing = value;
+				return undefined;
+			},
+			onClose: () => undefined,
+		});
+		setup.renderer.root.add(panel.renderable);
+		await panel.reload();
+		press(calls, "return");
+		await Bun.sleep(10);
+		await setup.renderOnce();
+		expect(applied).toEqual([["editing", "off"]]);
+		const frame = setup.captureCharFrame();
+		expect(frame).toContain("✓ CLM editing: off");
+		expect(frame).toMatch(/› CLM editing • +off/);
+	});
+
 	test("every panel key has a host binding", () => {
 		const keys = new Set<Key>(KEY_BINDINGS.map(([, key]) => key));
 		for (const key of ["1", "2", "3", "4", "tab", "shift+tab", "left", "right", "up", "down", "pageup", "pagedown", "home", "end", "g", "G", "enter", "space", "a", "z", "r", "q", "escape"] as Key[]) {

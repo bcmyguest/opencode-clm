@@ -52,6 +52,15 @@ export function parseEvents(text: string): { events: ClmEvent[]; skipped: number
  */
 const revisionCache = new Map<string, { mtimeMs: number; size: number; value: unknown }>();
 const REVISION_CACHE_LIMIT = 2_000;
+/** Total file bytes kept; the oldest entries go first once it is exceeded. */
+const REVISION_CACHE_BYTES = 32 * 1024 * 1024;
+let revisionCacheBytes = 0;
+
+function evictRevision(): void {
+	const [path, entry] = revisionCache.entries().next().value!;
+	revisionCache.delete(path);
+	revisionCacheBytes -= entry.size;
+}
 
 async function readCached(path: string, kind: "json" | "md", warnings: string[]): Promise<unknown> {
 	let info;
@@ -65,8 +74,13 @@ async function readCached(path: string, kind: "json" | "md", warnings: string[])
 	if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached.value;
 	const value = kind === "json" ? await readJson(path, warnings) : await readText(path, warnings);
 	if (value !== undefined) {
-		if (revisionCache.size >= REVISION_CACHE_LIMIT) revisionCache.delete(revisionCache.keys().next().value!);
+		if (cached) {
+			revisionCache.delete(path);
+			revisionCacheBytes -= cached.size;
+		}
+		while (revisionCache.size > 0 && (revisionCache.size >= REVISION_CACHE_LIMIT || revisionCacheBytes + info.size > REVISION_CACHE_BYTES)) evictRevision();
 		revisionCache.set(path, { mtimeMs: info.mtimeMs, size: info.size, value });
+		revisionCacheBytes += info.size;
 	}
 	return value;
 }

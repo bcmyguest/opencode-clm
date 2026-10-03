@@ -34,12 +34,14 @@ import { buildCompactPrompt, loadCompactPrompt } from "./src/compact.ts";
 import { continuityTools } from "./src/continuity.ts";
 import { replaceInPlace, type OcMessage } from "./src/opencode.ts";
 import { statusText, systemGuidance } from "./src/presentation.ts";
+import { COMPACT_COMMAND, COMPACT_TEMPLATE, STATUS_COMMAND, STATUS_TEMPLATE } from "./src/commands.ts";
+import { changeSetting, resetSettings, showSetting } from "./src/overrides.ts";
+import { settingsText } from "./src/settings-table.ts";
 import { resolveSettings, SKILLS_DIR, type ClmSettings } from "./src/settings.ts";
 import { loadSteeringDocument, steeringPromptSection, type SteeringDocument } from "./src/steering.ts";
 
 export const PLUGIN_ID = "opencode-clm";
-export const STATUS_COMMAND = "clm";
-export const COMPACT_COMMAND = "clm-compact";
+export { COMPACT_COMMAND, STATUS_COMMAND } from "./src/commands.ts";
 
 /** Opening words of the system prompts of OpenCode 1.18 helper agents (title, summary, compaction). */
 const HELPER_PROMPTS = [
@@ -48,7 +50,7 @@ const HELPER_PROMPTS = [
 	"You are a context summarization agent",
 ];
 
-const STATUS_USAGE = "Usage: /clm [status | path | on | off | reset]";
+const STATUS_USAGE = "Usage: /clm [status | path | on | off | reset | config [setting [value] | reset]]";
 
 type ToastVariant = "info" | "success" | "warning" | "error";
 
@@ -107,7 +109,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		const id = checkSessionID(sessionID);
 		let existing = sessions.get(id);
 		if (!existing) {
-			existing = ClmSession.open(id, settings).then((clm) => {
+			existing = ClmSession.open(id, settings, { steering }).then((clm) => {
 				if (clm.loadWarning) toast(`state reset for ${id}: ${clm.loadWarning}`, "warning");
 				return clm;
 			});
@@ -132,11 +134,38 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		return total;
 	};
 
-	async function statusCommand(clm: ClmSession, argument: string): Promise<string> {
+	/**
+	 * `/clm config …` as text (pi-clm's `/clm config` semantics; the TUI opens the settings
+	 * page instead). `words` keep their case: values may be paths.
+	 */
+	async function configCommand(clm: ClmSession, words: string[]): Promise<string> {
+		const [name, ...valueWords] = words;
+		const { base, effective } = clm.settingsValues();
+		const format = { modelWindow: clm.limits.context };
+		if (!name) return settingsText(base, effective, format, clm.settingsWarning);
+		if (name.toLowerCase() === "reset" && valueWords.length === 0) {
+			await resetSettings(clm.store.directory);
+			await clm.refreshSettings(true);
+			toast("CLM settings reset to the defaults.");
+			return "CLM settings reset to the defaults for this session.";
+		}
+		if (valueWords.length === 0) return showSetting(name, effective, format);
+		const result = await changeSetting(clm.changeRequest(input.directory), name, valueWords.join(" "));
+		await clm.refreshSettings(true);
+		toast(`CLM ${result.text}.`);
+		return `CLM ${result.text}. It applies from the next request.`;
+	}
+
+	async function statusCommand(clm: ClmSession, args: string): Promise<string> {
+		await clm.refreshSettings();
+		const words = args.split(/\s+/).filter(Boolean);
+		const argument = (words[0] ?? "").toLowerCase();
+		if (argument === "config") return configCommand(clm, words.slice(1));
+		if (words.length > 1) return `${STATUS_USAGE}\nUnknown argument: ${JSON.stringify(args)}`;
 		switch (argument) {
 			case "":
 			case "status": {
-				const text = statusText(clm.status(steering));
+				const text = statusText(clm.status());
 				toast(text.split("\n").slice(0, 3).join("\n"));
 				return text;
 			}
@@ -144,7 +173,9 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				return `CLM mirror: ${clm.mirrorPath}`;
 			case "on":
 			case "off": {
-				await clm.setEnabled(argument === "on");
+				// The same override the TUI and `/clm config editing` write.
+				await changeSetting(clm.changeRequest(input.directory), "editing", argument);
+				await clm.refreshSettings(true);
 				toast(`CLM ${argument} for this session`);
 				return argument === "on"
 					? "CLM is on for this session: the mirror is refreshed before the next request."
@@ -156,12 +187,12 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				return "CLM dropped the accepted revision: the next request carries the stored history, and the mirror is rewritten from it.";
 			}
 			default:
-				return `${STATUS_USAGE}\nUnknown argument: ${JSON.stringify(argument)}`;
+				return `${STATUS_USAGE}\nUnknown argument: ${JSON.stringify(args)}`;
 		}
 	}
 
 	function compactCommand(clm: ClmSession, argument: string): string {
-		return buildCompactPrompt(loadCompactPrompt(settings.compactPromptPath), {
+		return buildCompactPrompt(loadCompactPrompt(clm.settings.compactPromptPath), {
 			mirror: clm.mirrorPath,
 			current: clm.lastReading?.estimated ?? 0,
 			budget: clm.resolvedBudget()?.budget,
@@ -176,11 +207,11 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				const ours = {
 					[STATUS_COMMAND]: {
 						description: "CLM: status of the editable context; /clm path | on | off | reset",
-						template: "Show the CLM status. $ARGUMENTS",
+						template: STATUS_TEMPLATE,
 					},
 					[COMPACT_COMMAND]: {
 						description: "CLM: ask the model to compact its context by editing the mirror",
-						template: "Compact your context. $ARGUMENTS",
+						template: COMPACT_TEMPLATE,
 					},
 				};
 				for (const [name, definition] of Object.entries(ours)) {
@@ -213,11 +244,12 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			} catch {
 				return;
 			}
-			if (!clm.state.enabled) return;
+			await clm.refreshSettings();
+			if (!clm.enabled) return;
 			const limit = (hookInput.model as { limit?: { context?: number; output?: number } } | undefined)?.limit;
 			if (limit) clm.limits = { context: limit.context || undefined, output: limit.output || undefined };
 			const sections = [systemGuidance(clm.mirrorPath, clm.resolvedBudget()?.budget)];
-			if (steering) sections.push(steeringPromptSection(steering));
+			if (clm.steering) sections.push(steeringPromptSection(clm.steering));
 			output.system.push(sections.join("\n\n"));
 			clm.scope = { ...clm.scope, systemTokens: clm.textTokens(output.system.join("\n")) };
 		},
@@ -310,7 +342,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				const clm = await session(hookInput.sessionID);
 				const argument = (hookInput.arguments ?? "").trim();
 				text = hookInput.command === STATUS_COMMAND
-					? relay(await statusCommand(clm, argument.toLowerCase()))
+					? relay(await statusCommand(clm, argument))
 					: compactCommand(clm, argument);
 			} catch (error) {
 				const message = `/${hookInput.command} failed: ${describe(error)}`;

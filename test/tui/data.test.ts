@@ -4,7 +4,8 @@ import { describe, expect, test } from "bun:test";
 
 import { buildPanelModel } from "../../src/panel/model.ts";
 import { resolveSettings } from "../../src/settings.ts";
-import { fallbackBudget, latestUsage, modelLimits, serverPluginOptions, settingsView } from "../../src/tui/data.ts";
+import { fallbackBudget, latestUsage, modelLimits, overridesNewer, serverBase, serverPluginOptions, settingsView } from "../../src/tui/data.ts";
+import { settingsAsOverrides } from "../../src/settings-table.ts";
 import { statusSummary } from "../../src/tui/plugin.ts";
 import { basicEvents, files } from "../panel/fixtures.ts";
 
@@ -17,6 +18,26 @@ describe("serverPluginOptions", () => {
 		expect(serverPluginOptions([["file:///home/u/opencode-clm/index.ts", { budget: "20k" }]], INDEX)).toEqual({ budget: "20k" });
 		expect(serverPluginOptions([["file:///elsewhere/index.ts", {}], "other-plugin"], INDEX)).toBeUndefined();
 		expect(serverPluginOptions(undefined, INDEX)).toBeUndefined();
+	});
+
+	test("matches any version, tag or file: source, and paths naming the package", () => {
+		for (const spec of [
+			"opencode-clm@latest",
+			"opencode-clm@^0.2",
+			"opencode-clm@file:/tmp/opencode-clm-0.2.0.tgz",
+			"opencode-clm@file:../opencode-clm",
+			"npm:opencode-clm@0.2.0",
+			"file:///home/u/opencode-clm",
+			"file:///srv/checkouts/opencode-clm/index.ts",
+			"/srv/opencode-clm",
+			"../opencode-clm/",
+			"/tmp/opencode-clm-0.2.0.tgz",
+		]) {
+			expect([spec, serverPluginOptions([[spec, { mirrorDir: "/m" }]], INDEX)]).toEqual([spec, { mirrorDir: "/m" }]);
+		}
+		for (const spec of ["opencode-clm-extra", "other@file:/x/opencode-clm", "file:///srv/other/index.ts", "/srv/opencode-clm-fork", "my-opencode-clm"]) {
+			expect([spec, serverPluginOptions([[spec, {}]], INDEX)]).toEqual([spec, undefined]);
+		}
 	});
 });
 
@@ -44,17 +65,49 @@ describe("host messages", () => {
 });
 
 describe("settings view and status", () => {
-	test("read-only rows carry choices or placeholders", () => {
+	test("rows come from the settings table, carry choices or placeholders, and mark changes", () => {
 		const model = buildPanelModel(files({ events: basicEvents }));
-		const view = settingsView(resolveSettings({}, {}, "/tmp"), model);
-		expect(view.rows.map((row) => row.key)).toEqual(["editing", "budget", "reserve", "gate", "guard", "reasoning"]);
+		const base = { editing: true, settings: resolveSettings({}, {}, "/tmp") };
+		const view = settingsView({ base, effective: base }, model);
+		expect(view.rows.map((row) => row.key)).toEqual(["editing", "budget", "reserve", "reminders", "gate", "guard", "cap", "steering", "compact-prompt", "reasoning"]);
 		expect(view.rows[0]).toMatchObject({ value: "on", choices: ["on", "off"] });
 		expect(view.rows[1]?.placeholder).toBeDefined();
 		expect(view.summary.at(-1)).toMatch(/^Files mirror /);
+		expect(view.changed).toEqual([]);
+
+		const effective = { editing: false, settings: resolveSettings({ budget: "20k", guard: "off" }, {}, "/tmp") };
+		const changed = settingsView({ base, effective }, model, { warning: "w" });
+		expect(changed.changed).toEqual(["editing", "budget", "guard"]);
+		expect(changed.rows.find((row) => row.key === "budget")).toMatchObject({ value: "20k", changed: true });
+		expect(changed.rows.find((row) => row.key === "budget")!.description).toContain("Default: 32k.");
+		expect(changed.warning).toBe("w");
 	});
 
 	test("status toast text", () => {
 		expect(statusSummary(buildPanelModel(files({ events: basicEvents })))).toBe("CLM on · revision 2 · last request ~6.8k");
 		expect(statusSummary(buildPanelModel(files({ found: false })))).toMatch(/^No CLM data/);
+	});
+});
+
+describe("server authority over the settings base", () => {
+	test("snapshot.json's base replaces the TUI's own resolution; mirrorDir stays the TUI's", () => {
+		const own = resolveSettings({ mirrorDir: "/m" }, { CLM_BUDGET: "50k" }, "/tmp");
+		const server = resolveSettings({ budget: "16k", guard: "off" }, {}, "/tmp");
+		const result = serverBase(own, { base: settingsAsOverrides(server) });
+		expect(result.source).toBe("server");
+		expect(result.base.budget.contextBudget).toBe(16_000);
+		expect(result.base.guard).toBe("off");
+		expect(result.base.mirrorDir).toBe("/m");
+		expect(serverBase(own, {}).source).toBe("tui");
+		expect(serverBase(own, undefined).base).toBe(own);
+		expect(serverBase(own, { base: { reserve: -5 } }).base.budget.reserve).toBe(own.budget.reserve);
+	});
+
+	test("overrides newer than the snapshot", () => {
+		const at = "2026-10-03T10:00:00.000Z";
+		expect(overridesNewer(Date.parse(at) + 1, { at })).toBe(true);
+		expect(overridesNewer(Date.parse(at) - 1, { at })).toBe(false);
+		expect(overridesNewer(undefined, { at })).toBe(false);
+		expect(overridesNewer(1, undefined)).toBe(true);
 	});
 });

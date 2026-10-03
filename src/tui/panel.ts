@@ -24,7 +24,7 @@ export const KEY_BINDINGS: ReadonlyArray<readonly [string, Key]> = [
 	["pageup", "pageup"], ["pagedown", "pagedown"],
 	["home", "home"], ["end", "end"], ["g", "g"], ["shift+g", "G"],
 	["return", "enter"], ["space", "space"],
-	["a", "a"], ["z", "z"], ["r", "r"], ["q", "q"], ["escape", "escape"],
+	["a", "a"], ["z", "z"], ["r", "r"], ["q", "q"], ["escape", "escape"], ["ctrl+c", "q"],
 	["j", "j"], ["k", "k"], ["[", "["], ["]", "]"],
 ];
 
@@ -72,8 +72,10 @@ export interface PanelOptions {
 	load: () => Promise<PanelModel>;
 	/** Applies a setting; resolves to an error message, or undefined on success. */
 	apply: (setting: string, value: string) => Promise<string | undefined>;
-	/** Called once after the panel released its key layer and mode. */
+	/** Called once after the panel released its key layer and mode (q, Esc, ctrl+c). */
 	onClose: () => void;
+	/** Called once when the panel is disposed for any reason, including the host unmounting the route. */
+	onDispose?: () => void;
 }
 
 export interface PanelController {
@@ -105,6 +107,11 @@ export function createPanel(api: PanelApi, options: PanelOptions): PanelControll
 		text.content = toStyledText(renderPanel(model, state, size()), api.theme.current);
 	};
 	box.onSizeChange = render;
+	// Leaving the route any other way (another plugin's navigate, a session event) removes or
+	// destroys the box: release the key mode then, or the prompt's base-mode keys stay dead.
+	const unmounted = () => controller.dispose();
+	(box as unknown as { onRemove: () => void }).onRemove = unmounted;
+	(box as unknown as { on?: (event: string, fn: () => void) => void }).on?.("destroyed", unmounted);
 
 	const popMode = api.mode.push(PANEL_MODE);
 	const dropLayer = api.keymap.registerLayer({
@@ -145,8 +152,9 @@ export function createPanel(api: PanelApi, options: PanelOptions): PanelControll
 	const applySetting = async (setting: string, value: string) => {
 		const error = await options.apply(setting, value).catch((cause: unknown) => (cause instanceof Error ? cause.message : String(cause)));
 		await controller.reload();
-		const label = model?.settings.rows.find((row) => row.key === setting)?.label ?? setting;
-		state = { ...state, message: error ? { text: error, warning: true } : { text: `${label}: ${value}`, warning: false } };
+		const row = model?.settings.rows.find((candidate) => candidate.key === setting);
+		const shown = `${row?.label ?? setting}: ${row?.value ?? value}`;
+		state = { ...state, message: error ? { text: error, warning: true } : { text: shown, warning: false } };
 		render();
 	};
 
@@ -178,6 +186,7 @@ export function createPanel(api: PanelApi, options: PanelOptions): PanelControll
 			disposed = true;
 			dropLayer();
 			popMode();
+			options.onDispose?.();
 		},
 	};
 	void controller.reload();

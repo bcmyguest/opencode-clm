@@ -94,6 +94,10 @@ export interface ClmStatus {
 	checkpoint?: { revision: number; anchorCount: number; beforeEstimate: number; afterEstimate: number };
 	lastRequest?: { rawMessages: number; sentMessages: number; mirrorBlocks: number };
 	steering?: SteeringDocument;
+	/** Settings changed for this session (`budget 20k, guard off`); absent when none. */
+	changed?: string;
+	/** Saved settings that could not be used. */
+	settingsWarning?: string;
 }
 
 /** One line for a toast. */
@@ -126,5 +130,7 @@ export function statusText(status: ClmStatus): string {
 		lines.push(`last request: ${request.rawMessages} raw messages → ${request.sentMessages} sent, ${request.mirrorBlocks} mirror blocks`);
 	}
 	lines.push(steeringStatusLine(status.steering));
+	if (status.changed) lines.push(`Changed: ${status.changed}`);
+	if (status.settingsWarning) lines.push(`settings warning: ${status.settingsWarning}`);
 	return lines.join("\n");
 }

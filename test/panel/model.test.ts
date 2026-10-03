@@ -51,6 +51,17 @@ describe("timeline from events", () => {
 		expect(timeline.points.map((p) => [p.tokens, p.measured])).toEqual([[150, true], [200, false], [300, false]]);
 	});
 
+	test("the reporting message id decides: equal counts from two replies are both measured", () => {
+		const timeline = buildTimeline([
+			request(100, 1),
+			request(200, 2, { observedPrevious: 150, observedMessage: "msg_a" }),
+			request(300, 3, { observedPrevious: 150, observedMessage: "msg_b" }),
+			request(400, 4, { observedPrevious: 150, observedMessage: "msg_b" }),
+		]);
+		// msg_b answered request 2; request 3's reply reported nothing new (same id again).
+		expect(timeline.points.map((p) => [p.tokens, p.measured])).toEqual([[150, true], [150, true], [300, false], [400, false]]);
+	});
+
 	test("compaction requests are not points but their observedPrevious still sizes the request before", () => {
 		const timeline = buildTimeline([
 			request(100, 1),
@@ -189,6 +200,27 @@ describe("buildPanelModel", () => {
 			["added", undefined, 3, undefined, "user"],
 		]);
 		expect(revision!.edits[1]).toMatchObject({ beforeText: "long\nanswer", afterText: "short\nanswer", beforePreview: "long answer" });
+	});
+
+	test("a kept row stored as one `text` field shows on both sides", () => {
+		const revisions = buildRevisions({
+			events: [],
+			revisionTexts: new Map(),
+			revisions: new Map([[1, { version: 1, revision: 1, sourceRevision: 0, at: "x", beforeTokens: 2, afterTokens: 2, rows: [
+				{ kind: "kept", sourceIndex: 0, outputIndex: 0, role: "user", text: "same" },
+				{ kind: "edited", sourceIndex: 1, outputIndex: 1, role: "toolResult", before: "old", after: "new" },
+			] }]]),
+		});
+		expect(revisions[0]!.edits.map((edit) => [edit.beforeText, edit.afterText])).toEqual([["same", "same"], ["old", "new"]]);
+	});
+
+	test("an override newer than the snapshot sets the budget figures", () => {
+		const snapshot = { at: "x", budget: { budget: 16_000, reserve: 2048, limit: 13_952, source: "config" }, overhead: 9_000 };
+		const stale = buildBudget(snapshot, undefined, [], { budget: 40_000, reserve: 2048, source: "config" });
+		expect(stale).toMatchObject({ configured: 16_000, limit: 13_952 });
+		const fresh = buildBudget(snapshot, undefined, [], { budget: 40_000, reserve: 2048, source: "config" }, true);
+		expect(fresh).toMatchObject({ configured: 40_000, budget: 40_000, usable: 40_000 - 2048 - 9_000, overhead: 9_000 });
+		expect(fresh?.limit).toBeUndefined();
 	});
 
 	test("invalid revision files fall back; bad rows are dropped; warnings collected", () => {

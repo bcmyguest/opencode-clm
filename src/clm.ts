@@ -33,7 +33,7 @@
  * included) was estimated; without those sizes it stays at 1.
  */
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -75,7 +75,11 @@ import {
 	type LiveContextState,
 } from "./state.ts";
 import type { SteeringDocument } from "./steering.ts";
-import type { ContextDocumentSnapshot, LiveContextMessage, TurnBaseline } from "./types.ts";
+import { overridesPath, readOverrides, stageSettings, type ChangeRequest, type StagedSettings } from "./overrides.ts";
+import { changedSummary, settingsAsOverrides, type ClmOverrides, type SettingsValues } from "./settings-table.ts";
+import type { ContextDocumentSnapshot, ContextEditTrace, LiveContextMessage, TurnBaseline } from "./types.ts";
+import { writeJsonAtomic } from "./atomic.ts";
+import { SNAPSHOT_FILE, type RevisionFile, type RevisionFileRow, type SnapshotFile } from "./panel/files.ts";
 
 export interface ModelLimits {
 	/** Model context window, tokens. */
@@ -213,26 +217,122 @@ export class ClmSession {
 	private saving: Promise<void> = Promise.resolve();
 	private running: Promise<unknown> = Promise.resolve();
 
+	/** Settings in force: `baseSettings` with this session's overrides.json applied (`refreshSettings`). */
+	settings: ClmSettings;
+	/** Overrides in force, as read from overrides.json. */
+	overrides: ClmOverrides = {};
+	/** The steering document in force for this session; undefined is protocol only. */
+	steering?: SteeringDocument;
+	/** Why saved settings or the steering document were (partly) ignored; shown by `/clm status`. */
+	settingsWarning?: string;
+	/** stat key of the overrides.json last read; a change triggers a re-read. */
+	private overridesKey = "";
+
 	private constructor(
 		readonly sessionID: string,
 		readonly store: MirrorStore,
-		readonly settings: ClmSettings,
+		readonly baseSettings: ClmSettings,
 		loaded: { state: LiveContextState; warning?: string },
+		readonly baseSteering?: SteeringDocument,
 	) {
+		this.settings = baseSettings;
+		this.steering = baseSteering;
 		this.state = loaded.state;
 		this.loadWarning = loaded.warning;
 		this.annotations = new AnnotationStore(store.directory, { estimateTokens: (text) => this.textTokens(text) });
 	}
 
-	/** Open (or resume) the session directory `<mirrorDir>/clm-<sessionID>/`. */
-	static async open(sessionID: string, settings: ClmSettings): Promise<ClmSession> {
+	/**
+	 * Open (or resume) the session directory `<mirrorDir>/clm-<sessionID>/`. `steering` is the
+	 * document the base settings name, already loaded (the plugin loads it strictly at start).
+	 */
+	static async open(sessionID: string, settings: ClmSettings, options: { steering?: SteeringDocument } = {}): Promise<ClmSession> {
 		if (!SESSION_ID_RE.test(sessionID)) throw new Error(`Invalid session id for CLM: ${JSON.stringify(sessionID)}`);
 		const store = await MirrorStore.create(sessionID, settings.mirrorDir);
 		const loaded = await loadLiveContextState(store.directory);
-		const session = new ClmSession(sessionID, store, settings, loaded);
+		const session = new ClmSession(sessionID, store, settings, loaded, options.steering);
 		if (loaded.warning) await session.log({ event: "state-warning", warning: loaded.warning });
 		if (loaded.repaired) await session.log({ event: "state-repaired", message: loaded.repaired });
+		await session.refreshSettings();
 		return session;
+	}
+
+	/** Whether CLM edits apply in this session: the `editing` override, else state.json. */
+	get enabled(): boolean {
+		return this.overrides.editing ?? this.state.enabled;
+	}
+
+	/** Base and effective values, for the settings table. */
+	settingsValues(): { base: SettingsValues; effective: SettingsValues } {
+		return {
+			base: { editing: this.state.enabled, settings: this.baseSettings },
+			effective: { editing: this.enabled, settings: this.settings },
+		};
+	}
+
+	/** For `changeSetting` (overrides.ts): where and against what a change is validated. */
+	changeRequest(projectDirectory: string): ChangeRequest {
+		return {
+			sessionDirectory: this.store.directory,
+			base: this.baseSettings,
+			baseEditing: this.state.enabled,
+			projectDirectory,
+			format: { modelWindow: this.limits.context },
+		};
+	}
+
+	/**
+	 * Re-read overrides.json when it changed (stat: mtime, size, inode) and activate it.
+	 * Runs before every request and every `/clm` command, so a change written by the TUI or
+	 * the server's `/clm config` applies from the next request. Invalid keys are dropped; a
+	 * set that does not resolve falls back to the base settings; a steering document that
+	 * does not load leaves the session protocol-only. Each case is kept in `settingsWarning`.
+	 * `force` re-reads even when the file looks unchanged.
+	 */
+	async refreshSettings(force = false): Promise<void> {
+		const path = overridesPath(this.store.directory);
+		let key = "missing";
+		try {
+			const info = await stat(path);
+			key = `${info.mtimeMs}:${info.size}:${info.ino}`;
+		} catch {
+			// missing: no overrides
+		}
+		if (!force && key === this.overridesKey) return;
+		this.overridesKey = key;
+		const read = key === "missing" ? { overrides: {} as ClmOverrides } : await readOverrides(this.store.directory);
+		const warnings: string[] = read.warning ? [read.warning] : [];
+		let staged: StagedSettings;
+		let overrides = read.overrides;
+		try {
+			staged = stageSettings(this.baseSettings, overrides, { strict: false, loaded: this.steering ?? this.baseSteering });
+		} catch (error) {
+			warnings.push(`ignored saved settings: ${describe(error)}`);
+			overrides = {};
+			staged = { settings: this.baseSettings, ...(this.baseSteering ? { steering: this.baseSteering } : {}) };
+		}
+		if (staged.steeringError) warnings.push(`steering document not loaded: ${staged.steeringError}`);
+		await this.activateSettings(staged, overrides);
+		this.settingsWarning = warnings.length > 0 ? warnings.join("; ") : undefined;
+	}
+
+	private async activateSettings(staged: StagedSettings, overrides: ClmOverrides): Promise<void> {
+		const before = this.settings.budget;
+		const after = staged.settings.budget;
+		const wasEnabled = this.enabled;
+		const changed = JSON.stringify(this.overrides) !== JSON.stringify(overrides);
+		this.settings = staged.settings;
+		this.steering = staged.steering;
+		this.overrides = overrides;
+		if (before.contextBudget !== after.contextBudget || before.reserve !== after.reserve ||
+			before.remindAtFractions.join(",") !== after.remindAtFractions.join(",") || before.remindAtReserve !== after.remindAtReserve) {
+			this.tracker.reset();
+		}
+		if (wasEnabled !== this.enabled) {
+			this.baseline = undefined;
+			if (!this.enabled) this.continuitySize.observe(0);
+		}
+		if (changed) await this.log({ event: "settings", overrides });
 	}
 
 	get mirrorPath(): string {
@@ -460,7 +560,7 @@ export class ClmSession {
 	 * calls that only read it or do not touch it.
 	 */
 	receipt(tool: string, args: Record<string, unknown> | undefined, cwd: string): string | undefined {
-		if (!this.settings.enabled || !this.state.enabled) return undefined;
+		if (!this.settings.enabled || !this.enabled) return undefined;
 		if (classifyMirrorToolCall(tool, args ?? {}, cwd, this.mirrorPath) !== "write") return undefined;
 		const check = this.validateMirror(this.store.readSync());
 		if (!check) return undefined;
@@ -545,6 +645,10 @@ export class ClmSession {
 		const revisions = join(this.store.directory, "revisions");
 		await mkdir(revisions, { recursive: true, mode: 0o700 }).catch(() => undefined);
 		await writeFile(join(revisions, `r${revision}.md`), text, { mode: 0o600 }).catch(() => undefined);
+		if (trace) {
+			await writeJsonAtomic(join(revisions, `r${revision}.json`), this.revisionFile(revision, at, baseline, result.messages, trace, sizes))
+				.catch((error: unknown) => this.log({ event: "revision-file-error", revision, error: describe(error) }));
+		}
 		const notes = result.diagnostics.length > 0 ? ` ${result.diagnostics.join(" ")}` : "";
 		this.pendingNotices.push(`[CLM] ${applied}${notes}`);
 		await this.log({
@@ -566,6 +670,101 @@ export class ClmSession {
 		});
 	}
 
+	/** `revisions/rN.json` for the panel: every row's full text and role before and after. */
+	private revisionFile(
+		revision: number,
+		at: string,
+		baseline: Baseline,
+		output: readonly LiveContextMessage[],
+		trace: ContextEditTrace,
+		sizes: { beforeEstimate: number; afterEstimate: number },
+	): RevisionFile {
+		const rows: RevisionFileRow[] = [];
+		const roleOf = (message: LiveContextMessage | undefined) => (message ? String(message.role) : "?");
+		for (const source of trace.sources) {
+			const before = baseline.snapshot.blocks[source.sourceIndex]?.source;
+			const after = source.outputIndex !== undefined ? output[source.outputIndex] : undefined;
+			const row: RevisionFileRow = { kind: source.kind, sourceIndex: source.sourceIndex, role: roleOf(after ?? before) };
+			if (source.outputIndex !== undefined) row.outputIndex = source.outputIndex;
+			if (before && after && roleOf(before) !== roleOf(after)) {
+				row.beforeRole = roleOf(before);
+				row.afterRole = roleOf(after);
+			}
+			if (before) row.beforeTokens = this.estimate([before]);
+			if (after && source.kind !== "removed") row.afterTokens = this.estimate([after]);
+			const beforeText = before ? renderMessage(before) : undefined;
+			const afterText = after && source.kind !== "removed" ? renderMessage(after) : undefined;
+			// Unchanged rows (kept, most restored) store their text once.
+			if (beforeText !== undefined && beforeText === afterText) row.text = beforeText;
+			else {
+				if (beforeText !== undefined) row.before = beforeText;
+				if (afterText !== undefined) row.after = afterText;
+			}
+			rows.push(row);
+		}
+		for (const addition of trace.additions) {
+			const after = output[addition.outputIndex];
+			rows.push({
+				kind: "added",
+				outputIndex: addition.outputIndex,
+				role: roleOf(after),
+				...(after ? { after: renderMessage(after), afterTokens: this.estimate([after]) } : {}),
+			});
+		}
+		return {
+			version: 1,
+			revision,
+			sourceRevision: trace.sourceRevision,
+			at,
+			beforeTokens: sizes.beforeEstimate,
+			afterTokens: sizes.afterEstimate,
+			rows,
+		};
+	}
+
+	/** `snapshot.json` for the panel: the request just built, replaced atomically. */
+	private snapshotFile(input: {
+		pinned: readonly LiveContextMessage[];
+		effective: readonly LiveContextMessage[];
+		sourceTokens: number;
+		raw: number;
+		sent: number;
+		suffix: number;
+		estimated: number;
+		observed?: number;
+	}): SnapshotFile | undefined {
+		const base = resolveBudget(this.settings.budget, this.limits.context, this.limits.output);
+		const resolved = this.resolvedBudget();
+		if (!base || !resolved) return undefined;
+		const shown = [...input.pinned, ...input.effective];
+		const steering = this.steering;
+		return {
+			at: new Date().toISOString(),
+			request: this.requests,
+			revision: this.state.revision,
+			enabled: this.enabled,
+			budget: { budget: base.budget, reserve: base.reserve, limit: overflowGuardLimit(resolved.budget, resolved.reserve), source: base.source },
+			calibration: { factor: this.calibrator.factor, samples: this.calibrator.sampleCount },
+			...(steering ? { steering: { name: steering.name, hash: steering.hash, path: steering.path } } : {}),
+			sizes: { estimated: input.estimated, ...(input.observed !== undefined ? { observedPrevious: input.observed } : {}) },
+			input: {
+				raw: input.raw,
+				sent: input.sent,
+				suffix: input.suffix,
+				rawTokens: input.sourceTokens,
+				effectiveTokens: this.estimate([...shown]),
+				messages: shown.map((message, index) => ({
+					index: index + 1,
+					role: String(message.role),
+					tokens: this.estimate([message]),
+					preview: renderMessage(message).replace(/\s+/g, " ").trim().slice(0, 120),
+				})),
+			},
+			...(this.state.budgetCheck ? { overhead: this.state.budgetCheck.overhead } : {}),
+			base: settingsAsOverrides(this.baseSettings) as Record<string, unknown>,
+		};
+	}
+
 	// ---- the transform -----------------------------------------------------------------
 
 	/** Transforms of one session run one at a time. */
@@ -583,7 +782,7 @@ export class ClmSession {
 
 	/** Text for `experimental.session.compacting`'s `output.context`: the instruction plus the active annotations. */
 	async compactionContext(): Promise<string | undefined> {
-		if (!this.settings.enabled || !this.state.enabled) return undefined;
+		if (!this.settings.enabled || !this.enabled) return undefined;
 		const continuity = formatContinuityMessage({ annotations: await this.loadAnnotations(), effectiveMessages: [] });
 		return continuity ? `${COMPACTION_INSTRUCTION}\n\n${continuity}` : COMPACTION_INSTRUCTION;
 	}
@@ -623,7 +822,8 @@ export class ClmSession {
 	}
 
 	private async transformNow(raw: OcMessage[]): Promise<TransformResult> {
-		if (!this.settings.enabled || !this.state.enabled) {
+		await this.refreshSettings();
+		if (!this.settings.enabled || !this.enabled) {
 			this.baseline = undefined;
 			this.compacting = false;
 			return { messages: raw, notices: [] };
@@ -800,16 +1000,33 @@ export class ClmSession {
 			await mkdir(directory, { recursive: true, mode: 0o700 }).catch(() => undefined);
 			await writeFile(join(directory, `n${this.requests}.json`), JSON.stringify(messages, null, 1), { mode: 0o600 }).catch(() => undefined);
 		}
+		const snapshotFile = this.snapshotFile({
+			pinned: flatten(pinnedMessages),
+			effective,
+			sourceTokens: pinnedTokens + this.estimate(source),
+			raw: raw.length,
+			sent: messages.length,
+			suffix: suffixLength,
+			estimated: reading?.estimated ?? requestTokens,
+			...(observed ? { observed: observed.tokens } : {}),
+		});
+		if (snapshotFile) {
+			await writeJsonAtomic(join(this.store.directory, SNAPSHOT_FILE), snapshotFile)
+				.catch((error: unknown) => this.log({ event: "snapshot-error", error: describe(error) }));
+		}
 		await this.log({
 			event: "request",
 			n: this.requests,
 			revision: this.state.revision,
+			users: raw.filter((message) => message.info.role === "user").length,
 			raw: raw.length,
 			sent: messages.length,
 			blocks: snapshot.blocks.length,
 			withheld: withheldCount,
 			estimated: reading?.estimated ?? requestTokens,
 			observedPrevious: observed?.tokens,
+			// The assistant message that reported `observedPrevious`; a new id means a new count.
+			observedMessage: observed?.messageID,
 			calibration: this.calibrator.factor,
 			notices: notices.map((notice) => notice.slice(0, 80)),
 		});
@@ -817,9 +1034,13 @@ export class ClmSession {
 	}
 
 	/** Inputs for presentation.ts `statusText` / `statusLine`. */
-	status(steering?: SteeringDocument): ClmStatus {
+	status(steering: SteeringDocument | undefined = this.steering): ClmStatus {
 		const checkpoint = this.state.checkpoint;
+		const { base, effective } = this.settingsValues();
+		const changed = changedSummary(base, effective, { modelWindow: this.limits.context });
 		return {
+			...(changed ? { changed } : {}),
+			...(this.settingsWarning ? { settingsWarning: this.settingsWarning } : {}),
 			sessionID: this.sessionID,
 			mirrorPath: this.mirrorPath,
 			revision: this.state.revision,

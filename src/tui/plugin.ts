@@ -4,12 +4,17 @@
 
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui";
 
-import { parseClmCommand, type ClmCommand, type Page } from "../panel/command.ts";
+import { userOwnsStatusCommand } from "../commands.ts";
+import { type ClmCommand, type Page } from "../panel/command.ts";
+import { changeSetting, resetSettings, sessionValues, showSetting } from "../overrides.ts";
+import type { SettingsValues } from "../settings-table.ts";
+import { interceptEnter } from "./intercept.ts";
 import { buildPanelModel, type PanelModel } from "../panel/model.ts";
 import { formatTokenCount } from "../panel/timeline.ts";
 import { readSessionFiles, sessionDirectory } from "../session-files.ts";
 import { resolveSettings, type ClmSettings } from "../settings.ts";
-import { fallbackBudget, latestUsage, modelLimits, serverPluginOptions, settingsView } from "./data.ts";
+import { fallbackBudget, latestUsage, modelLimits, overridesNewer, serverBase, serverPluginOptions, settingsView } from "./data.ts";
+import type { SessionFiles } from "../panel/files.ts";
 import { createPanel, type PanelController } from "./panel.ts";
 
 export const PANEL_ROUTE = "opencode-clm.panel";
@@ -35,15 +40,61 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 		return resolveSettings(options, process.env, api.state.path.directory);
 	};
 
+	/**
+	 * Base and effective settings of a session. The server is the authority on the base:
+	 * once it wrote snapshot.json, the base is the server's (`serverBase`), so a TUI whose
+	 * environment resolves differently still merges and validates as the server would.
+	 * Before the first request, the TUI's own resolution of the server's options stands in.
+	 * Editing base = state.json's `enabled`. Effective = base + the session's overrides.json.
+	 */
+	const sessionSettings = async (sessionID: string, files: Pick<SessionFiles, "state" | "snapshot">) => {
+		const own = settings();
+		const { base, source } = serverBase(own, files.snapshot);
+		const directory = sessionDirectory(own.mirrorDir, sessionID);
+		const stored = files.state && typeof files.state === "object" ? (files.state as { enabled?: unknown }).enabled : undefined;
+		const baseEditing = typeof stored === "boolean" ? stored : true;
+		const read = await sessionValues(directory, base, baseEditing);
+		const values: { base: SettingsValues; effective: SettingsValues } = { base: { editing: baseEditing, settings: base }, effective: read.values };
+		return { base, baseSource: source, baseEditing, directory, values, ...(read.warning ? { warning: read.warning } : {}), ...(read.mtimeMs !== undefined ? { overridesAt: read.mtimeMs } : {}) };
+	};
+
 	const loadModel = async (sessionID: string): Promise<PanelModel> => {
 		const resolved = settings();
 		const files = await readSessionFiles(resolved.mirrorDir, sessionID);
 		const messages = api.state.session.messages(sessionID);
 		const latest = latestUsage(messages);
-		const budget = fallbackBudget(resolved, modelLimits(messages, api.state.provider));
-		const model = buildPanelModel(files, { ...(latest ? { latest } : {}), ...(budget ? { budget } : {}) });
-		model.settings = settingsView(resolved, model);
+		const limits = modelLimits(messages, api.state.provider);
+		const current = await sessionSettings(sessionID, files);
+		const budget = fallbackBudget(current.values.effective.settings, limits);
+		// overrides.json written after the last request: its budget is in force from the next
+		// request, so the panel shows it rather than the snapshot's.
+		const preferSettings = overridesNewer(current.overridesAt, files.snapshot);
+		const model = buildPanelModel(files, { ...(latest ? { latest } : {}), ...(budget ? { budget } : {}), ...(preferSettings ? { preferSettings } : {}) });
+		model.enabled = current.values.effective.editing;
+		model.settings = settingsView(current.values, model, {
+			format: { ...(limits.context ? { modelWindow: limits.context } : {}) },
+			...(current.warning ? { warning: current.warning } : {}),
+		});
 		return model;
+	};
+
+	/** Validates and writes one setting to the session's overrides.json; returns `Label: value`. */
+	const applySetting = async (sessionID: string, name: string, value: string): Promise<string> => {
+		const files = await readSessionFiles(settings().mirrorDir, sessionID);
+		const current = await sessionSettings(sessionID, files);
+		const result = await changeSetting({
+			sessionDirectory: current.directory,
+			base: current.base,
+			baseEditing: current.baseEditing,
+			projectDirectory: api.state.path.directory,
+		}, name, value);
+		return result.text;
+	};
+
+	/** False when `/clm` belongs to someone else: `commands: false`, or a user-defined command. */
+	const owned = (): boolean => {
+		if (!settings().commands) return false;
+		return !userOwnsStatusCommand((api.state.config as { command?: unknown }).command);
 	};
 
 	const currentSessionID = (): string | undefined => {
@@ -75,8 +126,17 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 			const controller = createPanel(api, {
 				page,
 				load: () => loadModel(sessionID).catch((error: unknown) => errorModel(sessionID, error)),
-				apply: async (setting) =>
-					`Changing ${setting} from the panel arrives with /clm config; the value in effect is kept.`,
+				apply: async (setting, value) => {
+					try {
+						await applySetting(sessionID, setting, value);
+						return undefined;
+					} catch (error) {
+						return describe(error);
+					}
+				},
+				onDispose: () => {
+					if (active?.controller === controller) active = undefined;
+				},
 				onClose: () => {
 					if (active?.controller === controller) active = undefined;
 					if (sessionID) api.route.navigate("session", { sessionID });
@@ -105,52 +165,68 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 	const toast = (message: string, variant: "info" | "warning" = "info") =>
 		api.ui.toast({ variant, title: "CLM", message });
 
-	/** Returns false when the line must reach the server command instead. */
-	const handle = async (command: ClmCommand): Promise<boolean> => {
+	/** After a change: refresh an open panel so it shows the new value. */
+	const refreshPanel = (sessionID: string) => {
+		if (active?.sessionID === sessionID) void active.controller.reload();
+	};
+
+	/** Every `/clm …` line the intercept consumes (`/clm reset` goes to the server). */
+	const handle = async (command: Exclude<ClmCommand, { kind: "server" }>): Promise<void> => {
+		if (command.kind === "open") {
+			open(command.page);
+			return;
+		}
+		if (command.kind === "usage") {
+			toast(command.text, "warning");
+			return;
+		}
+		const sessionID = currentSessionID();
+		if (!sessionID) {
+			toast("Open a session first.", "warning");
+			return;
+		}
 		switch (command.kind) {
-			case "open":
-				open(command.page);
-				return true;
-			case "usage":
-				toast(command.text, "warning");
-				return true;
-			case "path": {
-				const sessionID = currentSessionID();
-				if (!sessionID) toast("Open a session first.", "warning");
-				else toast(sessionDirectory(settings().mirrorDir, sessionID));
-				return true;
-			}
-			case "status": {
-				const sessionID = currentSessionID();
-				if (!sessionID) {
-					toast("Open a session first.", "warning");
-					return true;
-				}
+			case "path":
+				toast(sessionDirectory(settings().mirrorDir, sessionID));
+				return;
+			case "status":
 				toast(statusSummary(await loadModel(sessionID)));
-				return true;
+				return;
+			case "config-show": {
+				const files = await readSessionFiles(settings().mirrorDir, sessionID);
+				const current = await sessionSettings(sessionID, files);
+				toast(showSetting(command.setting, current.values.effective));
+				return;
 			}
-			case "config-show":
 			case "config-set":
+				try {
+					toast(`CLM ${await applySetting(sessionID, command.setting, command.value)}.`);
+				} catch (error) {
+					toast(describe(error), "warning");
+				}
+				refreshPanel(sessionID);
+				return;
 			case "config-reset":
-				toast("/clm config arrives in the next release step; open the settings page with /clm settings.", "warning");
-				return true;
+				await resetSettings(sessionDirectory(settings().mirrorDir, sessionID));
+				toast("CLM settings reset to the defaults.");
+				refreshPanel(sessionID);
+				return;
 			case "enable":
-			case "server":
-				// The server command owns state.json (on/off and reset rewrite it).
-				return false;
+				// The same override as the server's `/clm on|off` and `/clm config editing`.
+				await applySetting(sessionID, "editing", command.enabled ? "on" : "off");
+				toast(`CLM ${command.enabled ? "on" : "off"} for this session`);
+				refreshPanel(sessionID);
+				return;
 		}
 	};
 
 	const disposeIntercept = api.keymap.intercept("key", (context) => {
-		const event = context.event;
-		if (event.name !== "return" || event.shift || event.ctrl || event.meta) return;
-		const focused = api.renderer.currentFocusedRenderable as unknown as { plainText?: unknown; setText?: (text: string) => void } | null;
-		if (!focused || typeof focused.plainText !== "string" || typeof focused.setText !== "function") return;
-		const command = parseClmCommand(focused.plainText);
-		if (!command || command.kind === "server" || command.kind === "enable") return;
-		context.consume();
-		focused.setText("");
-		void handle(command).catch((error: unknown) => toast(`CLM: ${describe(error)}`, "warning"));
+		interceptEnter(context as never, {
+			focused: () => api.renderer.currentFocusedRenderable as never,
+			owned,
+			handle,
+			report: (message) => toast(message, "warning"),
+		});
 	}, { priority: 100 });
 
 	const scheduleReload = (sessionID: unknown) => {

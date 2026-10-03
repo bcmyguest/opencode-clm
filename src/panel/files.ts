@@ -27,6 +27,8 @@ export interface RevisionFileRow {
 	before?: string;
 	/** Full rendered text after the edit (absent for `removed`). */
 	after?: string;
+	/** Full text when before and after are identical (kept rows); `before` and `after` are then absent. */
+	text?: string;
 }
 
 /** `revisions/rN.json`, written once per accepted edit (0600). */
@@ -69,6 +71,11 @@ export interface SnapshotFile {
 	};
 	/** Fixed overhead per request (system prompt + tool schemas), tokens, once measured. */
 	overhead?: number;
+	/**
+	 * The server's base settings (options, environment, defaults; before overrides), in
+	 * overrides.json form (`settingsAsOverrides`). The TUI validates changes against it.
+	 */
+	base?: Record<string, unknown>;
 }
 
 /**

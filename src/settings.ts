@@ -63,7 +63,7 @@ export function parseTokens(value: unknown, name: string): number {
 	return Math.round(Number(match[1]) * scale);
 }
 
-function parseFlag(value: unknown, name: string): boolean {
+export function parseFlag(value: unknown, name: string): boolean {
 	if (typeof value === "boolean") return value;
 	const key = String(value).trim().toLowerCase();
 	if (["1", "true", "on", "yes"].includes(key)) return true;
@@ -71,7 +71,7 @@ function parseFlag(value: unknown, name: string): boolean {
 	throw new Error(`${name} must be true or false, got ${JSON.stringify(value)}`);
 }
 
-function parseFractions(value: unknown, name: string): number[] | "off" {
+export function parseFractions(value: unknown, name: string): number[] | "off" {
 	if (value === false) return "off";
 	const parts: unknown[] = Array.isArray(value)
 		? value
