@@ -22,11 +22,11 @@ const parse = (name: string, text: string) => settingDescriptor(name)!.parse(tex
 
 describe("settings table", () => {
 	test("names, aliases and case", () => {
-		expect(SETTINGS_TABLE.map((item) => item.name)).toEqual(["editing", "budget", "reserve", "reminders", "gate", "guard", "cap", "steering", "compact-prompt", "reasoning"]);
+		expect(SETTINGS_TABLE.map((item) => item.name)).toEqual(["editing", "budget", "reserve", "reminders", "gate", "guard", "compaction", "cap", "steering", "one-tool", "trailer", "compact-prompt", "reasoning"]);
 		for (const [alias, key] of [["enabled", "editing"], ["REMIND", "reminders"], ["remind-at", "reminders"], ["overflow", "guard"], ["observation", "cap"], ["observation-cap", "cap"], ["edit-gate", "gate"], ["compactprompt", "compactPrompt"], ["Compact-Prompt", "compactPrompt"]]) {
 			expect(settingDescriptor(alias!)?.key).toBe(key as never);
 		}
-		expect(settingDescriptor("one-tool")).toBeUndefined();
+		expect(settingDescriptor("no-such-setting")).toBeUndefined();
 		for (const item of SETTINGS_TABLE.filter((entry) => entry.key !== "editing")) expect(item.description).toMatch(/Env: CLM_[A-Z_]+\.$/);
 	});
 
@@ -69,8 +69,11 @@ describe("settings table", () => {
 			reminders: "50/90%",
 			gate: "none",
 			guard: "off",
+			compaction: "auto",
 			cap: "10k chars (50% head)",
 			steering: "b.md",
+			"one-tool": "off",
+			trailer: "off",
 			"compact-prompt": "default",
 			reasoning: "off",
 		});
