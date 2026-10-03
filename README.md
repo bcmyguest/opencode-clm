@@ -30,9 +30,10 @@ opencode plugin -g opencode-clm     # global: opencode.json(c) and tui.json in ~
 ```
 
 The package holds two plugins: the server plugin (`index.ts`: mirror, edits, budget,
-`/clm`, `/clm-compact`) and the TUI plugin (`tui.ts`: the `/clm` panel). `opencode plugin`
-writes the spec to both files. By hand, add it to both `plugin` lists; options go on the
-`opencode.json` entry only, and the TUI plugin reads them from there:
+`/clm`, `/clm-compact`) and the TUI plugin (`tui.ts`: the `/clm` panel). Install both:
+without the TUI plugin there is no panel, and each `/clm` command costs a model turn.
+`opencode plugin` writes the spec to both files. By hand, add it to both `plugin` lists;
+options go on the `opencode.json` entry only, and the TUI plugin reads them from there:
 
 ```jsonc
 // opencode.json
