@@ -37,6 +37,12 @@ export interface BudgetPolicyConfig {
 	remindAtFractions: readonly number[];
 	/** Whether to fire the final "budget - reserve" reminder. */
 	remindAtReserve: boolean;
+	/**
+	 * Share of the budget (0 <= f < 1) the context must grow past its size after an accepted
+	 * edit before percentage reminders fire again; 0 turns the cooldown off. The
+	 * budget − reserve reminder is exempt.
+	 */
+	reminderCooldown: number;
 }
 
 /** Budget when a percentage budget meets an unknown model window. */
@@ -47,6 +53,7 @@ export const DEFAULT_BUDGET_POLICY: BudgetPolicyConfig = {
 	reserve: 2048,
 	remindAtFractions: [0.25, 0.5, 0.75],
 	remindAtReserve: true,
+	reminderCooldown: 0.1,
 };
 
 /**
@@ -128,6 +135,9 @@ export function resolveBudgetPolicy(overrides: Partial<BudgetPolicyConfig> | und
 		}
 	}
 	fractions.sort((left, right) => left - right);
+	if (!Number.isFinite(merged.reminderCooldown) || merged.reminderCooldown < 0 || merged.reminderCooldown >= 1) {
+		throw new Error(`reminderCooldown must be in [0, 1) (0 = off), got ${String(merged.reminderCooldown)}`);
+	}
 	return { ...merged, remindAtFractions: fractions };
 }
 
@@ -290,35 +300,93 @@ export function governingTokens(reading: Pick<BudgetReading, "estimated">): numb
 	return reading.estimated;
 }
 
+/** The outcome of one `BudgetTracker.check`. */
+export interface BudgetCheck {
+	/** The highest newly crossed tier to announce, if any. */
+	tier?: BudgetTier;
+	/** Tiers crossed during a reminder cooldown: consumed without a notice. */
+	suppressed: BudgetTier[];
+	/** Governing size at which the active cooldown ends; undefined without one. */
+	cooldownUntil?: number;
+}
+
 /**
  * Escalating, re-arming tier tracker over absolute token thresholds. Re-derives its state
  * when the tier set changes (for example after the budget changes).
+ *
+ * Reminder cooldown: `editAccepted()` marks an accepted context edit. The next check records
+ * the governing size E; until the size reaches E + cooldown × budget, crossed percentage tiers
+ * are marked fired without a notice (consumed, not deferred). The budget-reserve tier is
+ * exempt. A later accepted edit restarts the cooldown; a reset, `clearCooldown` or a tier change ends it.
  */
 export class BudgetTracker {
 	private fired = new Set<string>();
 	private tierKey = "";
+	/** An edit was accepted and the next check has not yet recorded its size. */
+	private cooldownPending = false;
+	/** Governing size recorded after the last accepted edit, while the cooldown runs. */
+	private cooldownStart: number | undefined;
 
 	reset(): void {
 		this.fired.clear();
+		this.clearCooldown();
+	}
+
+	/** End the reminder cooldown; fired tiers stay fired. */
+	clearCooldown(): void {
+		this.cooldownPending = false;
+		this.cooldownStart = undefined;
+	}
+
+	/** Start (or restart) the reminder cooldown from the next reading. */
+	editAccepted(): void {
+		this.cooldownPending = true;
+		this.cooldownStart = undefined;
 	}
 
 	/** Returns the highest newly crossed tier, or undefined when nothing new fired. */
-	observe(reading: BudgetReading, tiers: readonly BudgetTier[]): BudgetTier | undefined {
+	observe(reading: BudgetReading, tiers: readonly BudgetTier[], cooldown = 0): BudgetTier | undefined {
+		return this.check(reading, tiers, cooldown).tier;
+	}
+
+	/** `observe` with the tiers a cooldown suppressed. `cooldown`: share of the budget, 0 = off. */
+	check(reading: BudgetReading, tiers: readonly BudgetTier[], cooldown = 0): BudgetCheck {
 		const key = tiers.map((tier) => `${tier.label}:${tier.tokens}`).join("|");
 		if (key !== this.tierKey) {
 			this.tierKey = key;
 			this.fired.clear();
+			this.cooldownStart = undefined;
 		}
 		const tokens = governingTokens(reading);
 		this.fired = new Set([...this.fired].filter((label) => {
 			const tier = tiers.find((candidate) => candidate.label === label);
 			return tier !== undefined && tokens >= tier.tokens;
 		}));
-		const crossed = tiers.filter((tier) => tokens >= tier.tokens && !this.fired.has(tier.label));
-		if (crossed.length === 0) return undefined;
+		if (this.cooldownPending) {
+			this.cooldownPending = false;
+			this.cooldownStart = tokens;
+		}
+		let cooldownUntil: number | undefined;
+		if (this.cooldownStart !== undefined) {
+			const until = this.cooldownStart + cooldown * reading.budget;
+			// cooldown 0 (off, possibly set mid-cooldown) ends it outright.
+			if (cooldown > 0 && tokens < until) cooldownUntil = until;
+			else this.cooldownStart = undefined;
+		}
+		let crossed = tiers.filter((tier) => tokens >= tier.tokens && !this.fired.has(tier.label));
+		const suppressed: BudgetTier[] = [];
+		if (cooldownUntil !== undefined) {
+			for (const tier of crossed) {
+				if (tier.label === "budget-reserve") continue;
+				suppressed.push(tier);
+				this.fired.add(tier.label);
+			}
+			crossed = crossed.filter((tier) => tier.label === "budget-reserve");
+		}
+		if (crossed.length === 0) return { suppressed, cooldownUntil };
 		const top = crossed[crossed.length - 1]!;
 		for (const tier of tiers) if (tier.tokens <= top.tokens) this.fired.add(tier.label);
-		return top;
+		return { tier: top, suppressed, cooldownUntil };
 	}
 }
 

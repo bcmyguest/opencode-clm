@@ -103,7 +103,7 @@ trained models. Hosted APIs are untested.
 ## Docs
 
 - [How it works](docs/how-it-works.md) — the mirror, what runs without the model, the panel, model and server support, safety.
-- [Configuration](docs/configuration.md) — every setting (editing, budget, reserve, reminders, gate, guard, compaction, cap, steering, one-tool, trailer, compact-prompt, reasoning), plugin options and environment variables.
+- [Configuration](docs/configuration.md) — every setting (editing, budget, reserve, reminders, reminder-cooldown, gate, guard, compaction, cap, steering, one-tool, trailer, compact-prompt, reasoning), plugin options and environment variables.
 - [Architecture](docs/architecture.md) — modules, session files, design notes, known limitations.
 - [Development](docs/development.md) — setup, checks, the integration suites, releasing.
 

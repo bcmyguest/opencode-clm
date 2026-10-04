@@ -29,6 +29,7 @@ Values keep their case (paths), names do not. Relative paths resolve against the
 | `budget`         | token budget the reminders, the edit gate and the overflow guard measure against, system prompt and tool schemas included | `50%` (1–100% of the model window), `32k`, `1.5m`, `32000`, or `window` | `50%`       |
 | `reserve`        | generation headroom kept below the budget; the last reminder and the guard act at budget − reserve       | `2048`, `2k`                                                  | `2048`      |
 | `reminders`      | budget fractions at which a `[CLM BUDGET]` note reaches the model; `off` also drops the budget − reserve one | `25/50/75%`, `50/75/90%`, `75/90%`, `90%`, `off`           | `25/50/75%` |
+| `reminder-cooldown` | after an accepted edit, percentage reminders wait until the context grows by this share of the budget (see Notes); alias `cooldown` | `10%`, `0.1`, `25%`, `off` | `10%` |
 | `gate`           | edits that grow the context: `fit` accepts them within budget − reserve, `shrink` never, `none` without a check | `fit`, `shrink`, `none`                                  | `fit`       |
 | `guard`          | overflow guard: above budget − reserve, withhold the oldest tool results                                 | `on`, `off`                                                   | `on`        |
 | `compaction`     | OpenCode's automatic compaction: `off` turns it off; `auto` pauses it while the guard enforces a budget; `on` keeps your `compaction.auto` (see Notes) | `auto`, `off`, `on`                                       | `auto`      |
@@ -52,6 +53,7 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
 | `budget`         | `CLM_BUDGET`          | a percentage of the model window, `1%` to `100%` (default `50%`); tokens, e.g. `32000`, `32k`, `1.5m`; `window` for the whole model window | `budget` |
 | `reserve`        | `CLM_RESERVE`         | tokens, e.g. `2048` or `2k`                                                                          | `reserve`        |
 | `remindAt`       | `CLM_REMIND_AT`       | fractions or percentages separated by commas, spaces or `/`, e.g. `0.25,0.5,0.75` or `25/50/75%`; `off` or `none` for no reminders | `reminders` |
+| `reminderCooldown` | `CLM_REMINDER_COOLDOWN` | a share of the budget between 0 and 1, as a percentage or fraction, e.g. `10%` or `0.1` (default `10%`); `off`, `none` or `0` for no cooldown | `reminder-cooldown` |
 | `gate`           | `CLM_EDIT_GATE`       | `fit`, `shrink` or `none`                                                                            | `gate`           |
 | `guard`          | `CLM_OVERFLOW`        | `withhold`, `on` or `true`; `off` or `false`                                                         | `guard`          |
 | `compaction`     | `CLM_NATIVE_COMPACTION` | `auto`, `off` or `on`                                                                              | `compaction`     |
@@ -76,6 +78,13 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
   window minus its output limit caps a token budget. When budget − reserve leaves less
   than 8,000 tokens after the measured overhead, the session raises its effective budget
   to make room, warns with a toast and tells the model once.
+- **Reminder cooldown.** An edit that drops the context below a reminder tier re-arms it.
+  So the model is not reminded again a few steps after each edit, an accepted edit starts
+  a cooldown: until the context grows by the cooldown share of the budget beyond its size
+  after the edit, percentage reminders stay silent, and tiers crossed meanwhile are
+  skipped, not saved for later. The budget − reserve reminder always fires. A later edit
+  restarts the cooldown; changing the budget, reserve or reminders, `/clm reset`, a
+  restored or dropped revision, and turning editing off or on clear it.
 - **Calibration.** Sizes are estimated at four characters per token, then corrected with
   the provider's own count of each request. Dense content (code, random strings) can be
   twice as many tokens as the estimate; for a run that starts with such data,

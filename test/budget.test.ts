@@ -36,7 +36,7 @@ const windowPolicy = resolveBudgetPolicy({ contextBudget: undefined });
 
 describe("budget policy resolution", () => {
 	test("defaults: 50% of the model window (32,000 while unknown), 2,048 reserve, 25/50/75% plus budget-reserve", () => {
-		expect(DEFAULT_BUDGET_POLICY).toEqual({ contextFraction: 0.5, reserve: 2048, remindAtFractions: [0.25, 0.5, 0.75], remindAtReserve: true });
+		expect(DEFAULT_BUDGET_POLICY).toEqual({ contextFraction: 0.5, reserve: 2048, remindAtFractions: [0.25, 0.5, 0.75], remindAtReserve: true, reminderCooldown: 0.1 });
 		const defaults = resolveBudgetPolicy(undefined);
 		const resolved = resolveBudget(defaults, undefined)!;
 		expect(resolved).toEqual({ budget: 32000, reserve: 2048, source: "fallback", fraction: 0.5 });
@@ -388,5 +388,114 @@ describe("percentage budgets", () => {
 		expect(budgetOrigin({ source: "config" })).toBe("configured");
 		expect(formatPercent(0.5)).toBe("50%");
 		expect(formatPercent(1 / 3)).toBe("33.33%");
+	});
+});
+
+describe("reminder cooldown", () => {
+	// 32,000 budget, 50/75/90% (16,000 / 24,000 / 28,800) plus budget-reserve at 29,952.
+	const cooldown = 0.1; // 3,200 tokens
+
+	test("after an accepted edit, tiers crossed before size E + cooldown × budget are consumed", () => {
+		const tracker = new BudgetTracker();
+		expect(tracker.check(reading(17_000), tiers, cooldown).tier?.label).toBe("50%");
+		tracker.editAccepted();
+		// The edit drops the context to 15,000 (E); the 50% tier re-arms.
+		expect(tracker.check(reading(15_000), tiers, cooldown)).toEqual({ suppressed: [], cooldownUntil: 18_200 });
+		const quiet = tracker.check(reading(16_500), tiers, cooldown);
+		expect(quiet.tier).toBeUndefined();
+		expect(quiet.suppressed.map((tier) => tier.label)).toEqual(["50%"]);
+		// Past the cooldown the consumed tier stays fired; nothing is deferred.
+		expect(tracker.check(reading(18_500), tiers, cooldown)).toEqual({ suppressed: [] });
+		// A tier crossed after the cooldown fires.
+		expect(tracker.check(reading(24_500), tiers, cooldown).tier?.label).toBe("75%");
+	});
+
+	test("the cooldown ends for good once reached, even if the context shrinks again without an edit", () => {
+		const tracker = new BudgetTracker();
+		tracker.editAccepted();
+		tracker.check(reading(15_000), tiers, cooldown);
+		expect(tracker.check(reading(18_200), tiers, cooldown).tier?.label).toBe("50%");
+		expect(tracker.check(reading(10_000), tiers, cooldown).tier).toBeUndefined();
+		expect(tracker.check(reading(16_100), tiers, cooldown).tier?.label).toBe("50%");
+	});
+
+	test("the budget-reserve tier is exempt", () => {
+		const tracker = new BudgetTracker();
+		tracker.editAccepted();
+		tracker.check(reading(28_000), tiers, cooldown);
+		const result = tracker.check(reading(30_000), tiers, cooldown);
+		expect(result.tier?.label).toBe("budget-reserve");
+		expect(result.suppressed.map((tier) => tier.label)).toEqual(["90%"]);
+		expect(tracker.check(reading(30_500), tiers, cooldown).tier).toBeUndefined();
+	});
+
+	test("a second accepted edit restarts the cooldown from its own size", () => {
+		const tracker = new BudgetTracker();
+		tracker.editAccepted();
+		tracker.check(reading(15_000), tiers, cooldown);
+		tracker.editAccepted();
+		// New E = 17,000: the cooldown now runs to 20,200, past the first edit's 18,200.
+		expect(tracker.check(reading(17_000), tiers, cooldown).suppressed.map((tier) => tier.label)).toEqual(["50%"]);
+		expect(tracker.check(reading(19_000), tiers, cooldown)).toEqual({ suppressed: [], cooldownUntil: 20_200 });
+		tracker.editAccepted();
+		tracker.check(reading(12_000), tiers, cooldown); // E = 12,000, until 15,200
+		expect(tracker.check(reading(16_000), tiers, cooldown).tier?.label).toBe("50%");
+	});
+
+	test("reset, clearCooldown and a tier change end the cooldown", () => {
+		const tracker = new BudgetTracker();
+		tracker.editAccepted();
+		tracker.check(reading(15_000), tiers, cooldown);
+		tracker.reset();
+		expect(tracker.check(reading(16_500), tiers, cooldown).tier?.label).toBe("50%");
+
+		const cleared = new BudgetTracker();
+		expect(cleared.check(reading(17_000), tiers, cooldown).tier?.label).toBe("50%");
+		cleared.editAccepted();
+		cleared.check(reading(15_000), tiers, cooldown);
+		cleared.clearCooldown();
+		expect(cleared.check(reading(16_500), tiers, cooldown).tier?.label).toBe("50%");
+		expect(cleared.check(reading(17_000), tiers, cooldown).tier).toBeUndefined();
+
+		const changed = new BudgetTracker();
+		changed.editAccepted();
+		changed.check(reading(15_000), tiers, cooldown);
+		const smaller = budgetTiers(policy, 24_000, 2048);
+		expect(changed.check({ ...reading(16_500), budget: 24_000 }, smaller, cooldown).tier?.label).toBe("50%");
+	});
+
+	test("a pending cooldown waits for the first reading after the edit", () => {
+		const tracker = new BudgetTracker();
+		tracker.editAccepted();
+		tracker.reset();
+		expect(tracker.check(reading(16_500), tiers, cooldown).tier?.label).toBe("50%");
+	});
+
+	test("off (0) suppresses nothing; observe passes the cooldown through", () => {
+		const tracker = new BudgetTracker();
+		tracker.editAccepted();
+		expect(tracker.check(reading(15_000), tiers, 0)).toEqual({ suppressed: [] });
+		expect(tracker.check(reading(16_500), tiers, 0).tier?.label).toBe("50%");
+
+		const viaObserve = new BudgetTracker();
+		viaObserve.editAccepted();
+		expect(viaObserve.observe(reading(15_000), tiers, cooldown)).toBeUndefined();
+		expect(viaObserve.observe(reading(16_500), tiers, cooldown)).toBeUndefined();
+	});
+
+	test("turning the cooldown off mid-cooldown ends it, even below the post-edit size", () => {
+		const tracker = new BudgetTracker();
+		tracker.editAccepted();
+		tracker.check(reading(17_000), tiers, cooldown); // E = 17,000; 50% consumed
+		tracker.check(reading(15_500), tiers, cooldown); // dips without an edit; 50% re-arms
+		expect(tracker.check(reading(16_500), tiers, 0)).toEqual({ tier: tiers[0], suppressed: [] });
+	});
+
+	test("policy validation", () => {
+		expect(resolveBudgetPolicy(undefined).reminderCooldown).toBe(0.1);
+		expect(resolveBudgetPolicy({ reminderCooldown: 0 }).reminderCooldown).toBe(0);
+		for (const bad of [1, -0.1, Number.NaN]) {
+			expect(() => resolveBudgetPolicy({ reminderCooldown: bad })).toThrow(/^reminderCooldown must be in \[0, 1\)/);
+		}
 	});
 });

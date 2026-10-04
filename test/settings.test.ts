@@ -143,3 +143,23 @@ describe("budget percentages", () => {
 		}
 	});
 });
+
+describe("reminder cooldown", () => {
+	test("default 10%; option, env and precedence; percentages, fractions and off", () => {
+		expect(resolveSettings({}, {}, project).budget.reminderCooldown).toBe(0.1);
+		expect(resolveSettings({}, { CLM_REMINDER_COOLDOWN: "25%" }, project).budget.reminderCooldown).toBe(0.25);
+		expect(resolveSettings({ reminderCooldown: 0.05 }, { CLM_REMINDER_COOLDOWN: "25%" }, project).budget.reminderCooldown).toBe(0.05);
+		expect(resolveSettings({ reminderCooldown: "0.2" }, {}, project).budget.reminderCooldown).toBe(0.2);
+		expect(resolveSettings({}, { CLM_REMINDER_COOLDOWN: " " }, project).budget.reminderCooldown).toBe(0.1);
+		for (const off of ["off", "none", "0", "OFF", 0, false]) {
+			expect(resolveSettings({ reminderCooldown: off }, {}, project).budget.reminderCooldown).toBe(0);
+		}
+	});
+
+	test("invalid values name reminderCooldown", () => {
+		for (const bad of ["100%", "1", "10", "-5%", "lots", 1.5, "0.1.2", true]) {
+			expect(() => resolveSettings({ reminderCooldown: bad }, {}, project)).toThrow(/^reminderCooldown must be/);
+		}
+		expect(() => resolveSettings({}, { CLM_REMINDER_COOLDOWN: "150%" }, project)).toThrow(/^reminderCooldown must be/);
+	});
+});

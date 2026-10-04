@@ -140,6 +140,23 @@ export function parseFractions(value: unknown, name: string): number[] | "off" {
 	return [...new Set(fractions)];
 }
 
+const COOLDOWN_FORMS = `a share of the budget between 0 and 1, as a percentage (10%) or a fraction (0.1), or off`;
+
+/**
+ * The reminder cooldown: `10%` or `0.1` (a share of the budget, strictly between 0 and 1), or
+ * `off` / `none` / `0` for no cooldown (0).
+ */
+export function parseCooldown(value: unknown, name = "reminderCooldown"): number {
+	if (value === false) return 0;
+	const text = String(value).trim().toLowerCase();
+	if (text === "off" || text === "none" || text === "0" || text === "0%") return 0;
+	const percent = text.endsWith("%");
+	const number = percent ? text.slice(0, -1).trim() : text;
+	const parsed = /^\d*\.?\d+$/.test(number) ? Number(number) / (percent ? 100 : 1) : Number.NaN;
+	if (!(parsed > 0 && parsed < 1)) throw new Error(`${name} must be ${COOLDOWN_FORMS}, got ${JSON.stringify(value)}`);
+	return parsed;
+}
+
 function withName<T>(name: string, parse: () => T): T {
 	try {
 		return parse();
@@ -161,6 +178,7 @@ export function resolveSettings(options: Record<string, unknown> = {}, env: Env 
 	const budgetRaw = pick(options, "budget", env, "CLM_BUDGET");
 	const reserveRaw = pick(options, "reserve", env, "CLM_RESERVE");
 	const remindRaw = pick(options, "remindAt", env, "CLM_REMIND_AT");
+	const cooldownRaw = pick(options, "reminderCooldown", env, "CLM_REMINDER_COOLDOWN");
 	const gateRaw = pick(options, "gate", env, "CLM_EDIT_GATE");
 	const guardRaw = pick(options, "guard", env, "CLM_OVERFLOW");
 	const capRaw = pick(options, "observationCap", env, "CLM_OBSERVATION_CAP");
@@ -194,6 +212,7 @@ export function resolveSettings(options: Record<string, unknown> = {}, env: Env 
 			overrides.remindAtFractions = fractions;
 		}
 	}
+	if (cooldownRaw !== undefined) overrides.reminderCooldown = parseCooldown(cooldownRaw, "reminderCooldown");
 	const budget = withName("budget", () => resolveBudgetPolicy({ ...DEFAULT_BUDGET_POLICY, ...overrides }));
 
 	let guard: ClmSettings["guard"] = "withhold";

@@ -23,7 +23,7 @@ const parse = (name: string, text: string) => settingDescriptor(name)!.parse(tex
 
 describe("settings table", () => {
 	test("names, aliases and case", () => {
-		expect(SETTINGS_TABLE.map((item) => item.name)).toEqual(["editing", "budget", "reserve", "reminders", "gate", "guard", "compaction", "cap", "steering", "one-tool", "trailer", "compact-prompt", "reasoning"]);
+		expect(SETTINGS_TABLE.map((item) => item.name)).toEqual(["editing", "budget", "reserve", "reminders", "reminder-cooldown", "gate", "guard", "compaction", "cap", "steering", "one-tool", "trailer", "compact-prompt", "reasoning"]);
 		for (const [alias, key] of [["enabled", "editing"], ["REMIND", "reminders"], ["remind-at", "reminders"], ["overflow", "guard"], ["observation", "cap"], ["observation-cap", "cap"], ["edit-gate", "gate"], ["compactprompt", "compactPrompt"], ["Compact-Prompt", "compactPrompt"]]) {
 			expect(settingDescriptor(alias!)?.key).toBe(key as never);
 		}
@@ -68,6 +68,7 @@ describe("settings table", () => {
 			budget: "window (200k)",
 			reserve: "4,096",
 			reminders: "50/90%",
+			"reminder-cooldown": "10%",
 			gate: "none",
 			guard: "off",
 			compaction: "auto",
@@ -192,5 +193,41 @@ describe("budget percentages in the settings table", () => {
 			expect(sanitizeOverrides({ budget: bad })).toEqual({ overrides: {}, ignored: ["budget"] });
 		}
 		expect(() => applyOverrides(base, { budget: "0%" as never })).toThrow(/^budget must be a percentage/);
+	});
+});
+
+describe("reminder cooldown in the settings table", () => {
+	test("name, alias, parse and format", () => {
+		const item = settingDescriptor("cooldown")!;
+		expect(item.key).toBe("cooldown");
+		expect(item.name).toBe("reminder-cooldown");
+		expect(settingDescriptor("Reminder-Cooldown")?.key).toBe("cooldown");
+		expect(item.description).toMatch(/Env: CLM_REMINDER_COOLDOWN\.$/);
+		expect(parse("cooldown", "25%")).toEqual({ cooldown: 0.25 });
+		expect(parse("cooldown", "0.05")).toEqual({ cooldown: 0.05 });
+		expect(parse("cooldown", "off")).toEqual({ cooldown: 0 });
+		expect(() => parse("cooldown", "100%")).toThrow(/^reminder-cooldown must be/);
+		expect(item.format(values())).toBe("10%");
+		expect(item.format(values({ cooldown: 0 }))).toBe("off");
+		for (const choice of item.choices!) expect(item.format(values(item.parse(choice, ctx)))).toBe(choice);
+	});
+
+	test("round trip: overrides apply, merge drops the base value, sanitize checks the range", () => {
+		expect(applyOverrides(base, { cooldown: 0.25 }).budget.reminderCooldown).toBe(0.25);
+		expect(applyOverrides(base, { cooldown: 0 }).budget.reminderCooldown).toBe(0);
+		expect(applyOverrides(base, {}).budget.reminderCooldown).toBe(0.1);
+		expect(mergeOverrides(values(), {}, { cooldown: 0.1 })).toEqual({});
+		expect(mergeOverrides(values(), {}, { cooldown: 0 })).toEqual({ cooldown: 0 });
+		expect(changedSettings(values(), values({ cooldown: 0.25 }))).toEqual(["cooldown"]);
+		expect(changedSummary(values(), values({ cooldown: 0 }))).toBe("reminder-cooldown off");
+		expect(sanitizeOverrides({ cooldown: 0.25 })).toEqual({ overrides: { cooldown: 0.25 }, ignored: [] });
+		for (const bad of [1, -0.1, "10%", null]) {
+			expect(sanitizeOverrides({ cooldown: bad })).toEqual({ overrides: {}, ignored: ["cooldown"] });
+		}
+		const server = resolveSettings({ reminderCooldown: "25%" }, {}, "/project");
+		expect(settingsAsOverrides(server).cooldown).toBe(0.25);
+		const other = resolveSettings({}, { CLM_REMINDER_COOLDOWN: "off" }, "/project");
+		expect(applyOverrides(other, settingsAsOverrides(server)).budget).toEqual(server.budget);
+		expect(() => applyOverrides(base, { cooldown: 1 })).toThrow(/^reminderCooldown must be/);
 	});
 });

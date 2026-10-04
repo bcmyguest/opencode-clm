@@ -220,6 +220,13 @@ window minus its output limit (`contextFraction`, default 50%; `FALLBACK_BUDGET`
 while the window is unknown), a token count capped by that same base, or `window` for all
 of it; the reserve (default 2,048) is generation headroom. Reminders fire at 25/50/75% of
 the budget (`remindAt`) and at budget − reserve, once per tier, re-arming when usage drops.
+An accepted edit starts a cooldown (`reminderCooldown`, default 10% of the budget): the
+first reading after it records the size E, and until the estimate reaches E + cooldown ×
+budget, `BudgetTracker` marks crossed percentage tiers fired without a notice (logged as
+`budget-notice-suppressed`). The budget − reserve tier is exempt. A later accepted edit
+restarts the cooldown; a tracker reset (budget or reminder change, `/clm reset`,
+compaction, a restored revision) and an editing toggle clear it. Without the cooldown an edit that drops the
+context below a tier re-arms it, and the model hears the same reminder soon after.
 
 Two numbers are measured and always labelled separately:
 
@@ -296,8 +303,8 @@ capped block is persisted in its capped form when an edit is accepted.
 
 `src/settings.ts` resolves the plugin options (the `plugin` entry in `opencode.json`), then
 environment variables, then defaults, once at load; an invalid value fails the plugin with
-the setting's name. `src/settings-table.ts` is the one table of the thirteen settings a session
-can change — editing, budget, reserve, reminders, edit gate, overflow guard, compaction,
+the setting's name. `src/settings-table.ts` is the one table of the fourteen settings a session
+can change — editing, budget, reserve, reminders, reminder cooldown, edit gate, overflow guard, compaction,
 observation cap, steering, one-tool, trailer, compact prompt, reasoning — with each one's label, description, choices,
 formatting and parsing; values parse with the same functions as options and environment
 variables. `enabled`, `mirrorDir`, `estimateFactor`, `skill`, `commands` and
@@ -386,7 +393,7 @@ same pages and `/clm status` as text. Four pages:
   the display is bounded (400 rows for edited messages, 60 for removed or added, 2,000
   characters per line) with an explicit "diff preview truncated" row.
 - **settings** — sizes, calibration, the guard limit, the steering document and the
-  annotation counts (from `annotations.jsonl`) above the thirteen settings of §7c and a Reset
+  annotation counts (from `annotations.jsonl`) above the fourteen settings of §7c and a Reset
   row (`Enter` cycles it to "reset now", which resets at once): `Enter` cycles a setting's choices or opens a text prompt; rejected values show a
   warning and keep the value in effect.
 

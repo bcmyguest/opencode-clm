@@ -388,6 +388,7 @@ export class ClmSession {
 		}
 		if (wasEnabled !== this.enabled) {
 			this.baseline = undefined;
+			this.tracker.clearCooldown();
 			if (!this.enabled) this.continuitySize.observe(0);
 		}
 		if (changed) await this.log({ event: "settings", overrides });
@@ -597,6 +598,7 @@ export class ClmSession {
 	async setEnabled(enabled: boolean): Promise<void> {
 		await this.updateState((state) => ({ ...state, enabled }));
 		this.baseline = undefined;
+		this.tracker.clearCooldown();
 		if (!enabled) this.continuitySize.observe(0);
 	}
 
@@ -761,6 +763,7 @@ export class ClmSession {
 			return;
 		}
 		this.accepted += 1;
+		this.tracker.editAccepted();
 		await this.remember({ version: 1, checkpoint, contentDigest: digestSourceContent(baseline.rawMessages) });
 		const revisions = join(this.store.directory, "revisions");
 		await mkdir(revisions, { recursive: true, mode: 0o700 }).catch(() => undefined);
@@ -1194,6 +1197,8 @@ export class ClmSession {
 			projection = applyProjection(source, this.state.checkpoint);
 		} else if (!projection.valid) {
 			const dropped = this.state.checkpoint?.revision;
+			// The edit the cooldown measures from no longer applies.
+			this.tracker.clearCooldown();
 			this.invalidationStreak += 1;
 			const reason = projection.reason;
 			await this.updateState((state) => resetProjectionState(state, reason), true).catch(() => undefined);
@@ -1307,7 +1312,11 @@ export class ClmSession {
 				// The measured request was answered inside the prefix the active revision replaced.
 				observedStale: observed !== undefined && checkpoint !== undefined && checkpoint.sourceIds.includes(observed.messageID),
 			};
-			const tier = this.tracker.observe(reading, budgetTiers(this.settings.budget, resolved.budget, resolved.reserve));
+			const { tier, suppressed, cooldownUntil } = this.tracker.check(
+				reading, budgetTiers(this.settings.budget, resolved.budget, resolved.reserve), this.settings.budget.reminderCooldown);
+			for (const skipped of suppressed) {
+				await this.log({ event: "budget-notice-suppressed", tier: skipped.label, estimated: reading.estimated, cooldownUntil });
+			}
 			if (tier) {
 				// With the guard off nothing is withheld, so the notice must not describe it.
 				this.pendingNotices.push(budgetNoticeText(reading, tier, this.mirrorPath, this.settings.guard === "off" ? null : limit));

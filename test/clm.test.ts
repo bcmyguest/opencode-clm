@@ -218,6 +218,35 @@ describe("session lifecycle", () => {
 		expect(again.notices).toHaveLength(0);
 	});
 
+	test("after an accepted edit, a re-crossed tier stays silent until the context grows past the cooldown", async () => {
+		const run = async (reminderCooldown: string) => {
+			const clm = await ClmSession.open(SESSION, settings({ budget: 2000, reserve: 100, guard: "off", reminderCooldown }));
+			const raw1 = conversation("x".repeat(4000));
+			const first = await clm.transform(structuredClone(raw1));
+			expect(first.notices.join("\n")).toContain("[CLM BUDGET] Context crossed 50%");
+			writeFileSync(clm.mirrorPath, replaceBody(readFileSync(clm.mirrorPath, "utf8"), blockId(clm.baseline!.snapshot, "toolResult", 0), "tiny"));
+			const edited = await clm.transform(structuredClone(raw1));
+			expect(edited.notices.join("\n")).toContain("Applied revision 1");
+			const grow = (size: number) => clm.transform([...structuredClone(raw1), assistant("msg_a3", "More.", [{ callID: "call_3", output: "y".repeat(size) }])]);
+			const quarter = await grow(2400); // past 25% (500), below E + 50% of 2,000
+			const half = await grow(4800); // past 50% (1,000) and past the cooldown
+			const events = readFileSync(join(clm.store.directory, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+			return { clm, edited, quarter, half, events };
+		};
+
+		const cooled = await run("50%");
+		expect(cooled.quarter.reading!.estimated).toBeGreaterThan(500);
+		expect(cooled.quarter.reading!.estimated).toBeLessThan(cooled.edited.reading!.estimated + 1000);
+		expect(cooled.quarter.notices.join("\n")).not.toContain("[CLM BUDGET]");
+		expect(cooled.events.filter((event) => event.event === "budget-notice-suppressed").map((event) => event.tier)).toEqual(["25%"]);
+		expect(cooled.half.reading!.estimated).toBeGreaterThanOrEqual(cooled.edited.reading!.estimated + 1000);
+		expect(cooled.half.notices.join("\n")).toContain("[CLM BUDGET] Context crossed 50%");
+
+		const plain = await run("off");
+		expect(plain.quarter.notices.join("\n")).toContain("[CLM BUDGET] Context crossed 25%");
+		expect(plain.events.some((event) => event.event === "budget-notice-suppressed")).toBe(false);
+	});
+
 	test("with the guard off the budget notice does not describe the overflow guard", async () => {
 		const clm = await ClmSession.open(SESSION, settings({ budget: 2000, reserve: 100, guard: "off" }));
 		const result = await clm.transform(conversation("x".repeat(7400)));

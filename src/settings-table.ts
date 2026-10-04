@@ -13,10 +13,10 @@ import { basename, resolve } from "node:path";
 import { FALLBACK_BUDGET, formatPercent, resolveBudget, resolveBudgetPolicy, type BudgetPolicyConfig } from "./budget.ts";
 import { MIN_OBSERVATION_CAP, resolveObservationCap } from "./observation.ts";
 import { toEditGate, type EditGate } from "./policy.ts";
-import { HOUSE_STEERING, parseBudget, parseCompaction, parseFlag, parseFractions, parseTokens, type ClmSettings, type CompactionMode } from "./settings.ts";
+import { HOUSE_STEERING, parseBudget, parseCompaction, parseCooldown, parseFlag, parseFractions, parseTokens, type ClmSettings, type CompactionMode } from "./settings.ts";
 
 export type SettingKey =
-	| "editing" | "budget" | "reserve" | "reminders" | "gate" | "guard" | "compaction" | "cap" | "steering" | "oneTool" | "trailer"
+	| "editing" | "budget" | "reserve" | "reminders" | "cooldown" | "gate" | "guard" | "compaction" | "cap" | "steering" | "oneTool" | "trailer"
 	| "compactPrompt" | "reasoning";
 
 /**
@@ -31,6 +31,8 @@ export interface ClmOverrides {
 	reserve?: number;
 	/** Reminder fractions; empty disables every reminder, the budget − reserve one included. */
 	reminders?: number[];
+	/** Reminder cooldown as a share of the budget; 0 is off. */
+	cooldown?: number;
 	gate?: EditGate;
 	guard?: "withhold" | "off";
 	compaction?: CompactionMode;
@@ -202,6 +204,17 @@ export const SETTINGS_TABLE: readonly SettingDescriptor[] = [
 		parse: (text) => ({ reminders: parseReminders(text) }),
 	},
 	{
+		key: "cooldown",
+		// Named after the reminders it governs; `cooldown` is an alias.
+		name: "reminder-cooldown",
+		label: "Reminder cooldown",
+		description: "After an accepted edit, percentage reminders stay silent until the context grows by this share of the budget; tiers crossed meanwhile are skipped. The budget − reserve reminder always fires. A share (10%, 0.1) or off. Env: CLM_REMINDER_COOLDOWN.",
+		choices: ["10%", "25%", "5%", "off"],
+		placeholder: "10%, 0.1, or off",
+		format: (values) => (values.settings.budget.reminderCooldown > 0 ? formatPercent(values.settings.budget.reminderCooldown) : "off"),
+		parse: (text) => ({ cooldown: parseCooldown(text, "reminder-cooldown") }),
+	},
+	{
 		key: "gate",
 		name: "gate",
 		label: "Edit gate",
@@ -300,6 +313,9 @@ const ALIASES: Record<string, SettingKey> = {
 	remind: "reminders",
 	"remind-at": "reminders",
 	remindat: "reminders",
+	cooldown: "cooldown",
+	"reminder-cooldown": "cooldown",
+	remindercooldown: "cooldown",
 	gate: "gate",
 	"edit-gate": "gate",
 	guard: "guard",
@@ -349,6 +365,7 @@ export function applyOverrides(base: ClmSettings, overrides: ClmOverrides): ClmS
 		reserve: overrides.reserve ?? base.budget.reserve,
 		remindAtFractions: overrides.reminders ?? base.budget.remindAtFractions,
 		remindAtReserve: overrides.reminders !== undefined ? overrides.reminders.length > 0 : base.budget.remindAtReserve,
+		reminderCooldown: overrides.cooldown ?? base.budget.reminderCooldown,
 	});
 	const observationCap = resolveObservationCap({
 		maxCharacters: overrides.cap === null ? undefined : overrides.cap ?? base.observationCap.maxCharacters,
@@ -378,6 +395,7 @@ function baseValue(key: keyof ClmOverrides, values: SettingsValues): unknown {
 			(settings.budget.contextFraction !== undefined ? percentText(settings.budget.contextFraction) : null);
 		case "reserve": return settings.budget.reserve;
 		case "reminders": return settings.budget.remindAtReserve || settings.budget.remindAtFractions.length > 0 ? [...settings.budget.remindAtFractions] : [];
+		case "cooldown": return settings.budget.reminderCooldown;
 		case "gate": return settings.gate;
 		case "guard": return settings.guard;
 		case "compaction": return settings.compaction;
@@ -399,7 +417,7 @@ function baseValue(key: keyof ClmOverrides, values: SettingsValues): unknown {
  */
 export function settingsAsOverrides(settings: ClmSettings): ClmOverrides {
 	const values: SettingsValues = { editing: true, settings };
-	const keys: Array<keyof ClmOverrides> = ["budget", "reserve", "reminders", "gate", "guard", "compaction", "cap", "capHead", "steering", "oneTool", "trailer", "compactPrompt", "reasoning"];
+	const keys: Array<keyof ClmOverrides> = ["budget", "reserve", "reminders", "cooldown", "gate", "guard", "compaction", "cap", "capHead", "steering", "oneTool", "trailer", "compactPrompt", "reasoning"];
 	return Object.fromEntries(keys.map((key) => [key, baseValue(key, values)])) as ClmOverrides;
 }
 
@@ -421,6 +439,7 @@ const VALID: Record<keyof ClmOverrides, (value: unknown) => boolean> = {
 	budget: (value) => value === null || (Number.isInteger(value) && (value as number) > 0) || budgetPercentFraction(value) !== undefined,
 	reserve: (value) => Number.isInteger(value) && (value as number) >= 0,
 	reminders: (value) => Array.isArray(value) && value.every((fraction) => isNumber(fraction) && fraction > 0 && fraction < 1),
+	cooldown: (value) => isNumber(value) && value >= 0 && value < 1,
 	gate: (value) => value === "fit" || value === "shrink" || value === "none",
 	guard: (value) => value === "withhold" || value === "off",
 	compaction: (value) => value === "auto" || value === "off" || value === "on",
