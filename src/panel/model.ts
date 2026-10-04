@@ -92,7 +92,7 @@ export interface BudgetView {
 	reserve?: number;
 	/** Overflow-guard limit (budget − reserve), from snapshot.json. */
 	limit?: number;
-	/** Where the budget came from (`config`, `model-window`). */
+	/** Where the budget came from (`config`, `model-window`, `window-fraction`, `fallback`). */
 	source?: string;
 	/** Fixed overhead per request (system prompt + tool schemas), tokens. */
 	overhead?: number;

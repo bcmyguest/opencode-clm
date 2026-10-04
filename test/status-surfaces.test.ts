@@ -74,6 +74,20 @@ describe("/clm budget", () => {
 		expect(overrides).toEqual({ version: 1, overrides: { budget: 64_000 } });
 		expect(await command(h, STATUS_COMMAND, "budget lots")).toContain("failed");
 	});
+
+	test("server command: percentages and the default share", async () => {
+		const h = await load({ budget: undefined });
+		expect(await command(h, STATUS_COMMAND, "budget")).toContain("Budget: 50% — ");
+		expect(await command(h, STATUS_COMMAND, "budget 25%")).toContain("CLM Budget: 25%.");
+		const file = () => JSON.parse(readFileSync(join(h.mirror, `clm-${SESSION}`, "overrides.json"), "utf8"));
+		expect(file()).toEqual({ version: 1, overrides: { budget: "25%" } });
+		expect(await command(h, STATUS_COMMAND, "config budget 100%")).toContain("CLM Budget: 100%.");
+		expect(file()).toEqual({ version: 1, overrides: { budget: "100%" } });
+		expect(await command(h, STATUS_COMMAND, "budget 101%")).toContain("failed");
+		expect(file()).toEqual({ version: 1, overrides: { budget: "100%" } });
+		expect(await command(h, STATUS_COMMAND, "budget 50%")).toContain("CLM Budget: 50%.");
+		expect(file()).toEqual({ version: 1, overrides: {} });
+	});
 });
 
 describe("/clm-compact", () => {

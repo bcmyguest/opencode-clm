@@ -64,6 +64,7 @@ export const SKILLS_DIR = join(PACKAGE_DIR, "skills");
 type Env = Record<string, string | undefined>;
 
 const OFF_WORDS = ["none", "off"];
+const BUDGET_FORMS = `a number of tokens (32000, 32k), a percentage of the model window (1% to 100%), or "window"`;
 
 function pick(options: Record<string, unknown>, key: string, env: Env, envKey: string): unknown {
 	if (options[key] !== undefined) return options[key];
@@ -83,6 +84,34 @@ export function parseTokens(value: unknown, name: string): number {
 	if (!match) throw new Error(`${name} must be a number of tokens (e.g. 32000, 32k), got ${JSON.stringify(value)}`);
 	const scale = match[2] === "k" ? 1_000 : match[2] === "m" ? 1_000_000 : 1;
 	return Math.round(Number(match[1]) * scale);
+}
+
+export type BudgetValue =
+	| { kind: "tokens"; tokens: number }
+	| { kind: "fraction"; fraction: number }
+	| { kind: "window" };
+
+/**
+ * A budget setting: `32000` / `32k` (tokens), `50%` (of the model window minus its output
+ * limit; 1% to 100%), or `window` / `model` (the whole of it).
+ */
+export function parseBudget(value: unknown, name = "budget"): BudgetValue {
+	const text = String(value).trim().toLowerCase();
+	if (text === "window" || text === "model") return { kind: "window" };
+	if (text.endsWith("%")) {
+		const number = text.slice(0, -1).trim();
+		const percent = /^\d+(?:\.\d+)?$/.test(number) ? Number(number) : Number.NaN;
+		if (!(percent >= 1 && percent <= 100)) throw new Error(`${name} must be ${BUDGET_FORMS}, got ${JSON.stringify(value)}`);
+		return { kind: "fraction", fraction: percent / 100 };
+	}
+	let tokens: number;
+	try {
+		tokens = parseTokens(value, name);
+	} catch {
+		throw new Error(`${name} must be ${BUDGET_FORMS}, got ${JSON.stringify(value)}`);
+	}
+	if (tokens <= 0) throw new Error(`${name} must be a positive number of tokens or "window", got ${JSON.stringify(value)}`);
+	return { kind: "tokens", tokens };
 }
 
 export function parseFlag(value: unknown, name: string): boolean {
@@ -147,8 +176,9 @@ export function resolveSettings(options: Record<string, unknown> = {}, env: Env 
 
 	const overrides: Partial<BudgetPolicyConfig> = {};
 	if (budgetRaw !== undefined) {
-		overrides.contextBudget = String(budgetRaw).trim().toLowerCase() === "window" ? undefined : parseTokens(budgetRaw, "budget");
-		if (overrides.contextBudget === 0) throw new Error(`budget must be a positive number of tokens or "window", got ${JSON.stringify(budgetRaw)}`);
+		const parsed = parseBudget(budgetRaw, "budget");
+		overrides.contextBudget = parsed.kind === "tokens" ? parsed.tokens : undefined;
+		overrides.contextFraction = parsed.kind === "fraction" ? parsed.fraction : undefined;
 	}
 	if (reserveRaw !== undefined) overrides.reserve = parseTokens(reserveRaw, "reserve");
 	if (remindRaw !== undefined) {

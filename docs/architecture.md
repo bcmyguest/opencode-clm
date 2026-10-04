@@ -215,9 +215,10 @@ such a plugin.
 
 ## 7. Budget and reminders
 
-`src/budget.ts`. The budget is the `budget` setting (`CLM_BUDGET`, default 32,000, or
-`window` for the model's context window), capped by the model window minus its output
-limit; the reserve (default 2,048) is generation headroom. Reminders fire at 25/50/75% of
+`src/budget.ts`. The budget is the `budget` setting (`CLM_BUDGET`): a share of the model
+window minus its output limit (`contextFraction`, default 50%; `FALLBACK_BUDGET`, 32,000,
+while the window is unknown), a token count capped by that same base, or `window` for all
+of it; the reserve (default 2,048) is generation headroom. Reminders fire at 25/50/75% of
 the budget (`remindAt`) and at budget − reserve, once per tier, re-arming when usage drops.
 
 Two numbers are measured and always labelled separately:
@@ -535,8 +536,9 @@ come from `events.jsonl`, so the panel works on resume without extra persistence
   successful execute (`session/tools.ts:111-125`). `one-tool` counts calls in arrival
   order, and child calls of OpenCode's experimental code mode count as calls too.
 - Model limits and the system-prompt size reach the plugin one request late. On the first
-  request of a process the model window does not yet cap the budget and the estimate omits
-  the system prompt; with `budget: "window"` that request has no budget reading.
+  request of a process the model window does not yet cap the budget, a percentage budget
+  (the default) is 32,000 tokens, and the estimate omits the system prompt; with
+  `budget: "window"` that request has no budget reading.
 - Built-in tool descriptions are measured, but not their parameter schemas; the
   provider-measured overhead covers them once it arrives.
 - A checkpoint ignores changes to stored tool output inside the prefix it covers. An output

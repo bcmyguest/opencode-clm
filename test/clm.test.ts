@@ -542,3 +542,30 @@ describe("calibration after a measured overhead", () => {
 		expect(clm.state.budgetCheck).toMatchObject({ source: "provider", raised: true });
 	});
 });
+
+describe("percentage budgets in a session", () => {
+	test("the default share: 32,000 while the window is unknown, then half of window minus output", async () => {
+		const clm = await ClmSession.open(SESSION, settings());
+		expect(clm.resolvedBudget()).toEqual({ budget: 32_000, reserve: 2048, source: "fallback", fraction: 0.5 });
+		await clm.transform(conversation());
+		expect(statusText(clm.status())).toContain("budget 32,000 tok (fallback, 50% of an unknown model window, reserve 2,048)");
+		clm.limits = { context: 200_000, output: 32_000 };
+		expect(clm.resolvedBudget()).toEqual({ budget: 84_000, reserve: 2048, source: "window-fraction", fraction: 0.5 });
+		await clm.transform(conversation());
+		expect(clm.lastReading).toMatchObject({ budget: 84_000, source: "window-fraction" });
+		expect(statusText(clm.status())).toContain("budget 84,000 tok (50% of model window, reserve 2,048)");
+	});
+
+	test("the budget-too-small raise applies on top of a share", async () => {
+		const clm = await ClmSession.open(SESSION, settings({ budget: "10%" }));
+		clm.limits = { context: 100_000, output: 0 };
+		await clm.transform(conversation());
+		const second = await clm.transform([...conversation(), assistant("msg_a3", "ok", [], 18_000)]);
+		const check = clm.state.budgetCheck!;
+		expect(check).toMatchObject({ configured: 10_000, raised: true });
+		expect(check.effective).toBeGreaterThan(10_000);
+		expect(second.alert).toContain("Budget 10,000 is too small");
+		expect(second.reading).toMatchObject({ budget: check.effective, raisedFrom: 10_000, source: "window-fraction" });
+		expect(clm.budgetFit()).toMatchObject({ configured: 10_000, raised: true, effective: check.effective });
+	});
+});

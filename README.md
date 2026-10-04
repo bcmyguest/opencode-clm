@@ -52,7 +52,7 @@ options go on the `opencode.json` entry only, and the TUI plugin reads them from
 | `/clm config` | open **settings**; `/clm config <setting> <value>` changes one, `/clm config reset` drops this session's changes <br><img src="https://raw.githubusercontent.com/bcmyguest/opencode-clm/main/.github/images/settings.png" alt="The settings page: sizes, files, and every setting" width="720"> |
 | `/clm-compact [instructions]` | ask the model to compact its own context now; anything you add (e.g. what to keep) is passed along. The result shows on the **edits** page |
 | `/clm on` / `off` / `reset` / `path` | enable, use raw context, discard the accepted revision, show the mirror's path |
-| `/clm budget [value]` | show or change the budget, the same as `/clm config budget` |
+| `/clm budget [value]` | show or change the budget, the same as `/clm config budget`: a share of the model window (default `50%`), tokens (`64k`), or `window` |
 
 With the TUI plugin, typed `/clm …` lines run in the TUI and cost no model turn, and Tab
 completes their subcommands, setting names and values;

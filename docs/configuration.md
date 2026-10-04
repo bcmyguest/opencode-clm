@@ -1,8 +1,9 @@
 # Configuration
 
-Everything is optional; with no configuration, the budget is 32,000 tokens, the edit gate
-is `fit`, and the overflow guard and the reminders (at 25, 50 and 75% and at
-budget − reserve) are on.
+Everything is optional; with no configuration, the budget is 50% of the model window minus
+its output limit (32,000 tokens while the window is unknown), so CLM steps in only once the
+context is large. The edit gate is `fit`, and the overflow guard and the reminders (at 25,
+50 and 75% and at budget − reserve) are on.
 
 Plugin options in `opencode.json` set the defaults for every session; an environment
 variable applies where the option is absent. The **settings** page of the panel
@@ -25,7 +26,7 @@ Values keep their case (paths), names do not. Relative paths resolve against the
 | setting          | what it controls                                                                                         | `/clm config` values                                          | default     |
 |------------------|----------------------------------------------------------------------------------------------------------|---------------------------------------------------------------|-------------|
 | `editing`        | whether the session renders the mirror and applies the model's edits; same as `/clm on` and `/clm off`   | `on`, `off`                                                   | `on`        |
-| `budget`         | token budget the reminders, the edit gate and the overflow guard measure against, system prompt and tool schemas included | `32k`, `1.5m`, `32000`, or `window`                | `32k`       |
+| `budget`         | token budget the reminders, the edit gate and the overflow guard measure against, system prompt and tool schemas included | `50%` (1–100% of the model window), `32k`, `1.5m`, `32000`, or `window` | `50%`       |
 | `reserve`        | generation headroom kept below the budget; the last reminder and the guard act at budget − reserve       | `2048`, `2k`                                                  | `2048`      |
 | `reminders`      | budget fractions at which a `[CLM BUDGET]` note reaches the model; `off` also drops the budget − reserve one | `25/50/75%`, `50/75/90%`, `75/90%`, `90%`, `off`           | `25/50/75%` |
 | `gate`           | edits that grow the context: `fit` accepts them within budget − reserve, `shrink` never, `none` without a check | `fit`, `shrink`, `none`                                  | `fit`       |
@@ -48,7 +49,7 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
 | option           | variable              | accepted values                                                                                      | sets             |
 |------------------|-----------------------|------------------------------------------------------------------------------------------------------|------------------|
 | `enabled`        | `CLM_ENABLED`         | a flag (default on); `false` registers no hooks, and `/clm config editing on` cannot override it     | —                |
-| `budget`         | `CLM_BUDGET`          | tokens, e.g. `32000`, `32k`, `1.5m`; `window` for the model window                                   | `budget`         |
+| `budget`         | `CLM_BUDGET`          | a percentage of the model window, `1%` to `100%` (default `50%`); tokens, e.g. `32000`, `32k`, `1.5m`; `window` for the whole model window | `budget` |
 | `reserve`        | `CLM_RESERVE`         | tokens, e.g. `2048` or `2k`                                                                          | `reserve`        |
 | `remindAt`       | `CLM_REMIND_AT`       | fractions or percentages separated by commas, spaces or `/`, e.g. `0.25,0.5,0.75` or `25/50/75%`; `off` or `none` for no reminders | `reminders` |
 | `gate`           | `CLM_EDIT_GATE`       | `fit`, `shrink` or `none`                                                                            | `gate`           |
@@ -69,10 +70,12 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
 ## Notes
 
 - **Budget.** The budget counts the whole request, OpenCode's system prompt and tool
-  schemas included; `/clm status` shows their measured size. The model window minus its
-  output limit caps the budget. When budget − reserve leaves less than 8,000 tokens after
-  the measured overhead, the session raises its effective budget to make room, warns with
-  a toast and tells the model once.
+  schemas included; `/clm status` shows their measured size. A percentage budget is that
+  share of the model window minus its output limit, and 32,000 tokens while the model
+  window is unknown (`window` then has no budget until the window is known). The model
+  window minus its output limit caps a token budget. When budget − reserve leaves less
+  than 8,000 tokens after the measured overhead, the session raises its effective budget
+  to make room, warns with a toast and tells the model once.
 - **Calibration.** Sizes are estimated at four characters per token, then corrected with
   the provider's own count of each request. Dense content (code, random strings) can be
   twice as many tokens as the estimate; for a run that starts with such data,

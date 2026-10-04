@@ -44,10 +44,11 @@ room it has.
 Two things run on their own, because a single turn with many parallel tool calls can
 outrun any reminder:
 
-- **Overflow guard** — if the estimated request exceeds budget − reserve (by default
-  32,000 − 2,048 tokens, OpenCode's system prompt and tool schemas included), the oldest
-  tool results after the last accepted edit are swapped for one-line notes pointing at
-  files in `withheld/` with the full text. No tool runs again.
+- **Overflow guard** — if the estimated request exceeds budget − reserve (by default half
+  of the model window minus its output limit, less 2,048 tokens; OpenCode's system prompt
+  and tool schemas included), the oldest tool results after the last accepted edit are
+  swapped for one-line notes pointing at files in `withheld/` with the full text. No tool
+  runs again.
 - **Calibration** — the size estimate (chars/4) is corrected against the provider's own
   count of each request, so dense content (code, random strings) does not slip past the
   budget. The factor never drops below 1.

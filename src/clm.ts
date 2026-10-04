@@ -321,7 +321,7 @@ export class ClmSession {
 			base: this.baseSettings,
 			baseEditing: this.state.enabled,
 			projectDirectory,
-			format: { modelWindow: this.limits.context },
+			format: { modelWindow: this.limits.context, modelOutput: this.limits.output },
 		};
 	}
 
@@ -382,7 +382,7 @@ export class ClmSession {
 		this.settings = staged.settings;
 		this.steering = staged.steering;
 		this.overrides = overrides;
-		if (before.contextBudget !== after.contextBudget || before.reserve !== after.reserve ||
+		if (before.contextBudget !== after.contextBudget || before.contextFraction !== after.contextFraction || before.reserve !== after.reserve ||
 			before.remindAtFractions.join(",") !== after.remindAtFractions.join(",") || before.remindAtReserve !== after.remindAtReserve) {
 			this.tracker.reset();
 		}
@@ -454,10 +454,10 @@ export class ClmSession {
 	}
 
 	/**
-	 * The budget in force: the configured one (or the model window), raised when the
+	 * The budget in force: the resolved one (`resolveBudget`), raised when the
 	 * session's budget check found it too small for OpenCode's fixed overhead (`budgetFit`).
 	 */
-	resolvedBudget(): Pick<BudgetReading, "budget" | "reserve" | "source" | "raisedFrom"> | undefined {
+	resolvedBudget(): Pick<BudgetReading, "budget" | "reserve" | "source" | "fraction" | "raisedFrom"> | undefined {
 		const base = resolveBudget(this.settings.budget, this.limits.context, this.limits.output);
 		if (!base) return undefined;
 		const fit = budgetFit(base.budget, base.reserve, this.state.budgetCheck?.overhead, this.windowCap());
@@ -466,7 +466,7 @@ export class ClmSession {
 
 	/** Model window minus its output limit, when known: the ceiling for a raised budget. */
 	private windowCap(): number | undefined {
-		return resolveBudget({ ...this.settings.budget, contextBudget: undefined }, this.limits.context, this.limits.output)?.budget;
+		return resolveBudget({ ...this.settings.budget, contextBudget: undefined, contextFraction: undefined }, this.limits.context, this.limits.output)?.budget;
 	}
 
 	/**
@@ -1399,7 +1399,7 @@ export class ClmSession {
 	status(steering: SteeringDocument | undefined = this.steering): ClmStatus {
 		const checkpoint = this.state.checkpoint;
 		const { base, effective } = this.settingsValues();
-		const changed = changedSummary(base, effective, { modelWindow: this.limits.context });
+		const changed = changedSummary(base, effective, { modelWindow: this.limits.context, modelOutput: this.limits.output });
 		return {
 			...(changed ? { changed } : {}),
 			...(this.settingsWarning ? { settingsWarning: this.settingsWarning } : {}),

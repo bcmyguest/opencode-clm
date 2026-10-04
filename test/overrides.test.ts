@@ -22,7 +22,7 @@ describe("overrides.json", () => {
 		await changeSetting(request(directory), "overflow", "off");
 		expect(fileOf(directory).overrides).toEqual({ budget: 20_000, guard: "off" });
 		// Setting the base value drops the key.
-		await changeSetting(request(directory), "budget", "32000");
+		await changeSetting(request(directory), "budget", "50%");
 		expect(fileOf(directory).overrides).toEqual({ guard: "off" });
 		const read = await sessionValues(directory, base, true);
 		expect(read.values.settings.guard).toBe("off");
@@ -75,5 +75,22 @@ describe("overrides.json", () => {
 		const staged = stageSettings(base, { steering: "/nonexistent.md" }, { strict: false });
 		expect(staged.steering).toBeUndefined();
 		expect(staged.steeringError).toContain("cannot read");
+	});
+});
+
+describe("budget percentages in overrides.json", () => {
+	test("written as text, read back, and invalid shares ignored", async () => {
+		const directory = join(tempDir(), "clm-s");
+		const result = await changeSetting({ ...request(directory), format: { modelWindow: 200_000, modelOutput: 32_000 } }, "budget", "25%");
+		expect(result.text).toBe("Budget: 25% (42k)");
+		expect(fileOf(directory)).toEqual({ version: 1, overrides: { budget: "25%" } });
+		const read = await sessionValues(directory, base, true);
+		expect(read.values.settings.budget.contextFraction).toBe(0.25);
+		expect(read.warning).toBeUndefined();
+		await expect(changeSetting(request(directory), "budget", "0%")).rejects.toThrow(/^budget must be/);
+		expect(fileOf(directory).overrides).toEqual({ budget: "25%" });
+		const bad = parseOverridesText(JSON.stringify({ version: 1, overrides: { budget: "250%", guard: "off" } }));
+		expect(bad.overrides).toEqual({ guard: "off" });
+		expect(bad.warning).toContain("budget");
 	});
 });

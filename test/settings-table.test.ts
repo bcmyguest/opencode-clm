@@ -9,6 +9,7 @@ import {
 	mergeOverrides,
 	sanitizeOverrides,
 	settingDescriptor,
+	settingsAsOverrides,
 	settingsText,
 	SETTINGS_TABLE,
 	type SettingsValues,
@@ -98,7 +99,7 @@ describe("settings table", () => {
 	test("merge drops keys equal to the base", () => {
 		const baseValues = values();
 		expect(mergeOverrides(baseValues, {}, { budget: 20_000 })).toEqual({ budget: 20_000 });
-		expect(mergeOverrides(baseValues, { budget: 20_000, guard: "off" }, { budget: 32_000 })).toEqual({ guard: "off" });
+		expect(mergeOverrides(baseValues, { budget: 20_000, guard: "off" }, { budget: "50%" })).toEqual({ guard: "off" });
 		expect(mergeOverrides(baseValues, {}, { reminders: [0.25, 0.5, 0.75], gate: "fit", editing: true })).toEqual({});
 		expect(mergeOverrides(values({}, false), {}, { editing: true })).toEqual({ editing: true });
 		expect(mergeOverrides(baseValues, {}, { cap: null, steering: null })).toEqual({});
@@ -124,8 +125,72 @@ describe("settings table", () => {
 		expect(changedSettings(baseValues, values({ steering: "/a/house-brief.md" }))).toEqual(["steering"]);
 		expect(describeSetting(settingDescriptor("budget")!, effective)).toStartWith("Budget: 20k — Token budget");
 		const text = settingsText(baseValues, effective);
-		expect(text).toMatch(/Budget +20k {2}\(changed; default 32k\)/);
+		expect(text).toMatch(/Budget +20k {2}\(changed; default 50%\)/);
 		expect(text).toMatch(/Edit gate +fit\n/);
 		expect(text).toContain("/clm config reset");
+	});
+});
+
+describe("budget percentages in the settings table", () => {
+	const budget = settingDescriptor("budget")!;
+
+	test("parse: percentages are stored as text; the formatted value parses back", () => {
+		expect(parse("budget", "50%")).toEqual({ budget: "50%" });
+		expect(parse("budget", " 12.5 % ")).toEqual({ budget: "12.5%" });
+		expect(parse("budget", "100%")).toEqual({ budget: "100%" });
+		expect(parse("budget", "50% (131,072)")).toEqual({ budget: "50%" });
+		expect(parse("budget", "window (262,144)")).toEqual({ budget: null });
+		expect(parse("budget", "32k")).toEqual({ budget: 32_000 });
+		for (const bad of ["0%", "101%", "abc%"]) expect(() => parse("budget", bad)).toThrow(/^budget must be/);
+	});
+
+	test("format: the share, with the tokens when the window is known", () => {
+		expect(base.budget.contextFraction).toBe(0.5);
+		expect(budget.format(values())).toBe("50%");
+		expect(budget.format(values(), { modelWindow: 262_144 })).toBe("50% (131,072)");
+		expect(budget.format(values(), { modelWindow: 200_000, modelOutput: 32_000 })).toBe("50% (84k)");
+		expect(budget.format(values({ budget: "25%" }), { modelWindow: 200_000 })).toBe("25% (50k)");
+		expect(budget.format(values({ budget: null }), { modelWindow: 200_000 })).toBe("window (200k)");
+		expect(budget.format(values({ budget: 20_000 }), { modelWindow: 200_000 })).toBe("20k");
+		expect(budget.placeholder).toContain("50%");
+		expect(budget.description).toContain("50%");
+	});
+
+	test("round trip: parse → merge → apply → format", () => {
+		const baseValues = values();
+		for (const text of ["25%", "100%", "50% (131,072)", "window", "20k"]) {
+			const overrides = mergeOverrides(baseValues, {}, parse("budget", text));
+			const shown = budget.format(values(overrides));
+			expect(budget.parse(shown, ctx)).toEqual(text.startsWith("50%") ? { budget: "50%" } : parse("budget", text));
+		}
+		// The default share equals the base and is dropped; another share is kept.
+		expect(mergeOverrides(baseValues, { budget: 20_000 }, { budget: "50%" })).toEqual({});
+		expect(mergeOverrides(baseValues, {}, { budget: "25%" })).toEqual({ budget: "25%" });
+		const quarter = applyOverrides(base, { budget: "25%" }).budget;
+		expect(quarter.contextFraction).toBe(0.25);
+		expect(quarter).not.toHaveProperty("contextBudget");
+		expect(applyOverrides(base, { budget: 20_000 }).budget).not.toHaveProperty("contextFraction");
+		expect(applyOverrides(base, { budget: null }).budget.contextFraction).toBeUndefined();
+		// A token base with a percentage override, and back.
+		const tokenBase = resolveSettings({ budget: "64k" }, {}, "/project");
+		expect(applyOverrides(tokenBase, { budget: "30%" }).budget).toMatchObject({ contextFraction: 0.3 });
+		expect(applyOverrides(applyOverrides(tokenBase, { budget: "30%" }), {}).budget.contextFraction).toBe(0.3);
+	});
+
+	test("settingsAsOverrides carries the share, and applying it reproduces the base", () => {
+		expect(settingsAsOverrides(base).budget).toBe("50%");
+		expect(settingsAsOverrides(resolveSettings({ budget: "window" }, {}, "/project")).budget).toBeNull();
+		const server = resolveSettings({ budget: "12.5%" }, {}, "/project");
+		const other = resolveSettings({ budget: "64k" }, {}, "/project");
+		expect(applyOverrides(other, settingsAsOverrides(server)).budget).toEqual(server.budget);
+	});
+
+	test("sanitize keeps valid shares and drops the rest", () => {
+		expect(sanitizeOverrides({ budget: "50%" })).toEqual({ overrides: { budget: "50%" }, ignored: [] });
+		expect(sanitizeOverrides({ budget: "1%" }).ignored).toEqual([]);
+		for (const bad of ["0%", "101%", "50", "x%", 0.5]) {
+			expect(sanitizeOverrides({ budget: bad })).toEqual({ overrides: {}, ignored: ["budget"] });
+		}
+		expect(() => applyOverrides(base, { budget: "0%" as never })).toThrow(/^budget must be a percentage/);
 	});
 });

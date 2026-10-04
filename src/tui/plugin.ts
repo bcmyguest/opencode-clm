@@ -140,7 +140,7 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 		const model = buildPanelModel(files, { ...(latest ? { latest } : {}), ...(budget ? { budget } : {}), ...(preferSettings ? { preferSettings } : {}) });
 		model.enabled = current.values.effective.editing;
 		model.settings = settingsView(current.values, model, {
-			format: { ...(limits.context ? { modelWindow: limits.context } : {}) },
+			format: { ...(limits.context ? { modelWindow: limits.context } : {}), ...(limits.output ? { modelOutput: limits.output } : {}) },
 			...(current.warning ? { warning: current.warning } : {}),
 		});
 		model.settings.rows.push(resetRow(model.settings.changed.length));

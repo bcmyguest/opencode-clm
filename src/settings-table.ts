@@ -10,10 +10,10 @@
  */
 import { basename, resolve } from "node:path";
 
-import { resolveBudgetPolicy } from "./budget.ts";
+import { FALLBACK_BUDGET, formatPercent, resolveBudget, resolveBudgetPolicy, type BudgetPolicyConfig } from "./budget.ts";
 import { MIN_OBSERVATION_CAP, resolveObservationCap } from "./observation.ts";
 import { toEditGate, type EditGate } from "./policy.ts";
-import { HOUSE_STEERING, parseCompaction, parseFlag, parseFractions, parseTokens, type ClmSettings, type CompactionMode } from "./settings.ts";
+import { HOUSE_STEERING, parseBudget, parseCompaction, parseFlag, parseFractions, parseTokens, type ClmSettings, type CompactionMode } from "./settings.ts";
 
 export type SettingKey =
 	| "editing" | "budget" | "reserve" | "reminders" | "gate" | "guard" | "compaction" | "cap" | "steering" | "oneTool" | "trailer"
@@ -26,7 +26,8 @@ export type SettingKey =
  */
 export interface ClmOverrides {
 	editing?: boolean;
-	budget?: number | null;
+	/** Tokens, a share of the model window as text (`"50%"`), or null for the whole window. */
+	budget?: number | BudgetPercent | null;
 	reserve?: number;
 	/** Reminder fractions; empty disables every reminder, the budget − reserve one included. */
 	reminders?: number[];
@@ -44,6 +45,9 @@ export interface ClmOverrides {
 	trailer?: boolean;
 }
 
+/** A budget percentage as stored in overrides.json: `"50%"`, `"12.5%"`. */
+export type BudgetPercent = `${number}%`;
+
 /** Settings in force for one session: the resolved settings plus whether edits apply. */
 export interface SettingsValues {
 	editing: boolean;
@@ -53,6 +57,8 @@ export interface SettingsValues {
 export interface FormatContext {
 	/** Model context window, shown next to a `window` budget. */
 	modelWindow?: number;
+	/** Model output limit; a percentage budget is a share of the window minus this. */
+	modelOutput?: number;
 }
 
 export interface ParseContext {
@@ -80,6 +86,24 @@ export function compactTokens(value: number): string {
 	if (value >= 1_000_000 && value % 10_000 === 0) return `${Number((value / 1_000_000).toFixed(2))}m`;
 	if (value >= 1_000 && value % 100 === 0) return `${Number((value / 1_000).toFixed(1))}k`;
 	return value.toLocaleString("en-US");
+}
+
+const percentText = (fraction: number) => formatPercent(fraction) as BudgetPercent;
+
+/** `"50%"` → 0.5; undefined for anything but a percentage from 1% to 100%. */
+export function budgetPercentFraction(value: unknown): number | undefined {
+	if (typeof value !== "string" || !/^\d+(?:\.\d+)?%$/.test(value)) return undefined;
+	const percent = Number(value.slice(0, -1));
+	return percent >= 1 && percent <= 100 ? percent / 100 : undefined;
+}
+
+/** The budget fields of a policy for a `budget` override. */
+function budgetFields(budget: number | BudgetPercent | null): Pick<BudgetPolicyConfig, "contextBudget" | "contextFraction"> {
+	if (budget === null) return { contextBudget: undefined, contextFraction: undefined };
+	if (typeof budget === "number") return { contextBudget: budget, contextFraction: undefined };
+	const fraction = budgetPercentFraction(budget);
+	if (fraction === undefined) throw new Error(`budget must be a percentage from 1% to 100%, got ${JSON.stringify(budget)}`);
+	return { contextBudget: undefined, contextFraction: fraction };
 }
 
 const onOff = (value: boolean) => (value ? "on" : "off");
@@ -138,19 +162,25 @@ export const SETTINGS_TABLE: readonly SettingDescriptor[] = [
 		key: "budget",
 		name: "budget",
 		label: "Budget",
-		description: "Token budget the reminders, the edit gate and the overflow guard measure against, OpenCode's system prompt and tool schemas included. A number (32k) or \"window\" for the model's context window. Env: CLM_BUDGET.",
-		placeholder: "32k, 1.5m, or window",
+		description: `Token budget the reminders, the edit gate and the overflow guard measure against, OpenCode's system prompt and tool schemas included. A percentage of the model window minus its output limit (50%; ${compactTokens(FALLBACK_BUDGET)} while the window is unknown), a number (32k), or "window" for all of it. Env: CLM_BUDGET.`,
+		placeholder: "50%, 32k, 1.5m, or window",
 		format: (values, context) => {
-			const budget = values.settings.budget.contextBudget;
-			if (budget !== undefined) return compactTokens(budget);
+			const policy = values.settings.budget;
+			if (policy.contextBudget !== undefined) return compactTokens(policy.contextBudget);
+			if (policy.contextFraction !== undefined) {
+				const resolved = context?.modelWindow ? resolveBudget(policy, context.modelWindow, context.modelOutput) : undefined;
+				return `${formatPercent(policy.contextFraction)}${resolved ? ` (${compactTokens(resolved.budget)})` : ""}`;
+			}
 			return `window${context?.modelWindow ? ` (${compactTokens(context.modelWindow)})` : ""}`;
 		},
+		// The settings page pre-fills its prompt with the formatted value: `50% (131,072)`.
 		parse: (text) => {
-			const value = text.trim().toLowerCase();
-			if (value === "window" || value === "model") return { budget: null };
-			const budget = parseTokens(value, "budget");
-			if (budget <= 0) throw new Error(`budget must be a positive number of tokens or "window", got "${text}"`);
-			return { budget };
+			const parsed = parseBudget(text.replace(/\s*\([^)]*\)\s*$/, ""), "budget");
+			switch (parsed.kind) {
+				case "window": return { budget: null };
+				case "fraction": return { budget: percentText(parsed.fraction) };
+				case "tokens": return { budget: parsed.tokens };
+			}
 		},
 	},
 	{
@@ -313,7 +343,9 @@ export function unknownSettingText(name: string): string {
 export function applyOverrides(base: ClmSettings, overrides: ClmOverrides): ClmSettings {
 	const budget = resolveBudgetPolicy({
 		...base.budget,
-		contextBudget: overrides.budget === null ? undefined : overrides.budget ?? base.budget.contextBudget,
+		...(overrides.budget !== undefined
+			? budgetFields(overrides.budget)
+			: { contextBudget: base.budget.contextBudget, contextFraction: base.budget.contextFraction }),
 		reserve: overrides.reserve ?? base.budget.reserve,
 		remindAtFractions: overrides.reminders ?? base.budget.remindAtFractions,
 		remindAtReserve: overrides.reminders !== undefined ? overrides.reminders.length > 0 : base.budget.remindAtReserve,
@@ -342,7 +374,8 @@ function baseValue(key: keyof ClmOverrides, values: SettingsValues): unknown {
 	const settings = values.settings;
 	switch (key) {
 		case "editing": return values.editing;
-		case "budget": return settings.budget.contextBudget ?? null;
+		case "budget": return settings.budget.contextBudget ??
+			(settings.budget.contextFraction !== undefined ? percentText(settings.budget.contextFraction) : null);
 		case "reserve": return settings.budget.reserve;
 		case "reminders": return settings.budget.remindAtReserve || settings.budget.remindAtFractions.length > 0 ? [...settings.budget.remindAtFractions] : [];
 		case "gate": return settings.gate;
@@ -385,7 +418,7 @@ const isPath = (value: unknown) => value === null || (typeof value === "string" 
 const VALID: Record<keyof ClmOverrides, (value: unknown) => boolean> = {
 	editing: (value) => typeof value === "boolean",
 	// Integers: state.json's budget check stores them as counts.
-	budget: (value) => value === null || (Number.isInteger(value) && (value as number) > 0),
+	budget: (value) => value === null || (Number.isInteger(value) && (value as number) > 0) || budgetPercentFraction(value) !== undefined,
 	reserve: (value) => Number.isInteger(value) && (value as number) >= 0,
 	reminders: (value) => Array.isArray(value) && value.every((fraction) => isNumber(fraction) && fraction > 0 && fraction < 1),
 	gate: (value) => value === "fit" || value === "shrink" || value === "none",

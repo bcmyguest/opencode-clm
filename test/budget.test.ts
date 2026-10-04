@@ -4,14 +4,17 @@ import {
 	BudgetTracker,
 	DEFAULT_BUDGET_POLICY,
 	EstimateCalibrator,
+	FALLBACK_BUDGET,
 	WORKING_MARGIN,
 	budgetFit,
 	budgetFitLine,
 	budgetNoticeText,
+	budgetOrigin,
 	budgetSummaryLine,
 	budgetTooSmallAlertText,
 	budgetTooSmallNoticeText,
 	budgetTiers,
+	formatPercent,
 	formatTokens,
 	governingTokens,
 	resolveBudget,
@@ -32,11 +35,11 @@ const reading = (estimated: number, observed?: number): BudgetReading => ({
 const windowPolicy = resolveBudgetPolicy({ contextBudget: undefined });
 
 describe("budget policy resolution", () => {
-	test("defaults: 32,000 budget, 2,048 reserve, 25/50/75% plus budget-reserve", () => {
-		expect(DEFAULT_BUDGET_POLICY).toEqual({ contextBudget: 32000, reserve: 2048, remindAtFractions: [0.25, 0.5, 0.75], remindAtReserve: true });
+	test("defaults: 50% of the model window (32,000 while unknown), 2,048 reserve, 25/50/75% plus budget-reserve", () => {
+		expect(DEFAULT_BUDGET_POLICY).toEqual({ contextFraction: 0.5, reserve: 2048, remindAtFractions: [0.25, 0.5, 0.75], remindAtReserve: true });
 		const defaults = resolveBudgetPolicy(undefined);
 		const resolved = resolveBudget(defaults, undefined)!;
-		expect(resolved).toEqual({ budget: 32000, reserve: 2048, source: "config" });
+		expect(resolved).toEqual({ budget: 32000, reserve: 2048, source: "fallback", fraction: 0.5 });
 		expect(budgetTiers(defaults, resolved.budget, resolved.reserve).map((tier) => [tier.label, tier.tokens])).toEqual([
 			["25%", 8000], ["50%", 16000], ["75%", 24000], ["budget-reserve", 29952],
 		]);
@@ -335,5 +338,55 @@ describe("budgetFit", () => {
 	test("the summary line names a raised budget", () => {
 		const line = budgetSummaryLine({ budget: 28_048, reserve: 2048, estimated: 100, source: "config", raisedFrom: 12_000 });
 		expect(line).toContain("budget 28,048 tok (raised from 12,000 to cover the fixed overhead, reserve 2,048)");
+	});
+});
+
+describe("percentage budgets", () => {
+	const half = resolveBudgetPolicy({ contextFraction: 0.5 });
+
+	test("a share of the model window minus its output limit", () => {
+		expect(resolveBudget(half, 262_144)).toEqual({ budget: 131_072, reserve: 2048, source: "window-fraction", fraction: 0.5 });
+		expect(resolveBudget(half, 200_000, 32_000)).toEqual({ budget: 84_000, reserve: 2048, source: "window-fraction", fraction: 0.5 });
+		// An output limit that is not below the window is ignored, as for `window`.
+		expect(resolveBudget(half, 200_000, 200_000)?.budget).toBe(100_000);
+		expect(resolveBudget(resolveBudgetPolicy({ contextFraction: 1 }), 200_000, 32_000)?.budget).toBe(168_000);
+		expect(resolveBudget(resolveBudgetPolicy({ contextFraction: 1 }), 200_000, 32_000)?.budget)
+			.toBe(resolveBudget(windowPolicy, 200_000, 32_000)?.budget);
+	});
+
+	test("the fallback while the window is unknown; `window` stays undefined", () => {
+		expect(FALLBACK_BUDGET).toBe(32_000);
+		expect(resolveBudget(half, undefined)).toEqual({ budget: FALLBACK_BUDGET, reserve: 2048, source: "fallback", fraction: 0.5 });
+		expect(resolveBudget(resolveBudgetPolicy({ contextFraction: 1 }), undefined)?.source).toBe("fallback");
+		expect(resolveBudget(half, 0)?.source).toBe("fallback");
+		expect(resolveBudget(windowPolicy, undefined)).toBeUndefined();
+	});
+
+	test("the reserve never exceeds a small share", () => {
+		const tiny = resolveBudgetPolicy({ contextFraction: 0.01, reserve: 5000 });
+		expect(resolveBudget(tiny, 100_000)).toMatchObject({ budget: 1000, reserve: 1000 });
+	});
+
+	test("policy: a token count or an explicit window replaces the default fraction", () => {
+		expect(resolveBudgetPolicy(undefined).contextFraction).toBe(0.5);
+		expect(resolveBudgetPolicy({ contextBudget: 20_000 })).not.toHaveProperty("contextFraction");
+		expect(resolveBudgetPolicy({ contextBudget: undefined })).not.toHaveProperty("contextFraction");
+		expect(resolveBudgetPolicy({ contextBudget: 20_000, contextFraction: 0.25 })).not.toHaveProperty("contextFraction");
+		expect(resolveBudgetPolicy({ contextBudget: undefined, contextFraction: 0.25 }).contextFraction).toBe(0.25);
+		for (const bad of [0, -0.5, 1.01, Number.NaN]) {
+			expect(() => resolveBudgetPolicy({ contextFraction: bad })).toThrow(/contextFraction must be in \(0, 1\]/);
+		}
+	});
+
+	test("status labels", () => {
+		const reading = (fields: Partial<BudgetReading>): BudgetReading => ({ budget: 131_072, reserve: 2048, estimated: 100, source: "window-fraction", ...fields });
+		expect(budgetSummaryLine(reading({ fraction: 0.5 }))).toStartWith("budget 131,072 tok (50% of model window, reserve 2,048)");
+		expect(budgetSummaryLine(reading({ fraction: 0.125 }))).toContain("(12.5% of model window,");
+		expect(budgetSummaryLine(reading({ budget: 32_000, source: "fallback", fraction: 0.5 })))
+			.toStartWith("budget 32,000 tok (fallback, 50% of an unknown model window, reserve 2,048)");
+		expect(budgetOrigin({ source: "model-window" })).toBe("model window");
+		expect(budgetOrigin({ source: "config" })).toBe("configured");
+		expect(formatPercent(0.5)).toBe("50%");
+		expect(formatPercent(1 / 3)).toBe("33.33%");
 	});
 });

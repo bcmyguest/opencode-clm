@@ -36,7 +36,7 @@ describe("resolveSettings", () => {
 	});
 
 	test("empty env values count as unset", () => {
-		expect(resolveSettings({}, { CLM_BUDGET: "  ", CLM_ESTIMATE_FACTOR: "" }, project).budget.contextBudget).toBe(32_000);
+		expect(resolveSettings({}, { CLM_BUDGET: "  ", CLM_ESTIMATE_FACTOR: "" }, project).budget.contextFraction).toBe(0.5);
 	});
 
 	test("token counts accept k, m, underscores and commas; window follows the model", () => {
@@ -111,5 +111,35 @@ describe("resolveSettings", () => {
 		expect(PACKAGE_DIR).toBe(join(import.meta.dir, ".."));
 		expect(SKILLS_DIR).toBe(join(PACKAGE_DIR, "skills"));
 		expect(HOUSE_STEERING).toBe(join(PACKAGE_DIR, "steering", "house-brief.md"));
+	});
+});
+
+describe("budget percentages", () => {
+	test("plugin option and environment variable", () => {
+		expect(resolveSettings({}, {}, project).budget).toMatchObject({ contextFraction: 0.5 });
+		expect(resolveSettings({}, {}, project).budget).not.toHaveProperty("contextBudget");
+		expect(resolveSettings({ budget: "25%" }, {}, project).budget.contextFraction).toBe(0.25);
+		expect(resolveSettings({}, { CLM_BUDGET: " 75 % " }, project).budget.contextFraction).toBe(0.75);
+		expect(resolveSettings({ budget: "100%" }, {}, project).budget.contextFraction).toBe(1);
+		expect(resolveSettings({ budget: "1%" }, {}, project).budget.contextFraction).toBe(0.01);
+		expect(resolveSettings({ budget: "12.5%" }, {}, project).budget.contextFraction).toBe(0.125);
+		// The option wins over the variable.
+		expect(resolveSettings({ budget: "40%" }, { CLM_BUDGET: "64k" }, project).budget).toMatchObject({ contextFraction: 0.4 });
+	});
+
+	test("token counts and window clear the default fraction", () => {
+		const tokens = resolveSettings({ budget: "32k" }, {}, project).budget;
+		expect(tokens.contextBudget).toBe(32_000);
+		expect(tokens).not.toHaveProperty("contextFraction");
+		const window = resolveSettings({}, { CLM_BUDGET: "window" }, project).budget;
+		expect(window.contextBudget).toBeUndefined();
+		expect(window.contextFraction).toBeUndefined();
+	});
+
+	test("out-of-range and malformed percentages throw an error naming budget", () => {
+		for (const value of ["0%", "0.5%", "101%", "150%", "-5%", "abc%", "%", "5x%", "50%%"]) {
+			expect(() => resolveSettings({ budget: value }, {}, project)).toThrow(/^budget must be .*percentage of the model window \(1% to 100%\)/);
+			expect(() => resolveSettings({}, { CLM_BUDGET: value }, project)).toThrow(/^budget/);
+		}
 	});
 });

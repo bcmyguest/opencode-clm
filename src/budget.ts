@@ -21,9 +21,16 @@
 export interface BudgetPolicyConfig {
 	/**
 	 * Context budget in tokens the reminders are measured against. Advisory: requests are
-	 * never blocked or rolled back. `undefined` means "use the model context window".
+	 * never blocked or rolled back. When undefined, `contextFraction` decides; when both are
+	 * undefined, the budget is the model context window (the `window` setting).
 	 */
 	contextBudget?: number;
+	/**
+	 * Budget as a fraction (0 < f <= 1) of the model window minus its output limit, used when
+	 * `contextBudget` is undefined (the `50%` setting). With the window unknown the budget is
+	 * `FALLBACK_BUDGET`.
+	 */
+	contextFraction?: number;
 	/** Generation headroom reserved below the budget. The final reminder fires at budget - reserve. */
 	reserve: number;
 	/** Fractions of the budget at which escalating reminders fire (0 < f < 1), ascending. */
@@ -32,8 +39,11 @@ export interface BudgetPolicyConfig {
 	remindAtReserve: boolean;
 }
 
+/** Budget when a percentage budget meets an unknown model window. */
+export const FALLBACK_BUDGET = 32_000;
+
 export const DEFAULT_BUDGET_POLICY: BudgetPolicyConfig = {
-	contextBudget: 32000,
+	contextFraction: 0.5,
 	reserve: 2048,
 	remindAtFractions: [0.25, 0.5, 0.75],
 	remindAtReserve: true,
@@ -70,11 +80,19 @@ export interface BudgetReading {
 	 * describes a context that no longer exists. The notice says so.
 	 */
 	observedStale?: boolean;
-	/** Where `budget` came from, for status text. */
-	source: "config" | "model-window";
+	/**
+	 * Where `budget` came from, for status text: `config` (a token count), `model-window`
+	 * (the window, or a token count capped by it), `window-fraction` (`fraction` of the
+	 * window), `fallback` (`FALLBACK_BUDGET`: a percentage with the window unknown).
+	 */
+	source: BudgetSource;
+	/** The configured fraction, for `window-fraction` and `fallback`. */
+	fraction?: number;
 	/** Set when `budget` was raised above the configured value to cover the fixed overhead (see `budgetFit`). */
 	raisedFrom?: number;
 }
+
+export type BudgetSource = "config" | "model-window" | "window-fraction" | "fallback";
 
 /** A reminder threshold in absolute tokens plus a stable label for re-arming. */
 export interface BudgetTier {
@@ -82,11 +100,24 @@ export interface BudgetTier {
 	tokens: number;
 }
 
+/**
+ * Defaults plus `overrides`, validated. An own `contextBudget` key without an own
+ * `contextFraction` key replaces the default fraction (`{ contextBudget: undefined }` still
+ * means "the model window"); a defined `contextBudget` always clears `contextFraction`.
+ */
 export function resolveBudgetPolicy(overrides: Partial<BudgetPolicyConfig> | undefined): BudgetPolicyConfig {
 	const merged: BudgetPolicyConfig = { ...DEFAULT_BUDGET_POLICY, ...(overrides ?? {}) };
+	const budgetGiven = overrides !== undefined && Object.hasOwn(overrides, "contextBudget");
+	const fractionGiven = overrides !== undefined && Object.hasOwn(overrides, "contextFraction");
+	if (merged.contextBudget !== undefined || (budgetGiven && !fractionGiven)) delete merged.contextFraction;
 	if (merged.contextBudget !== undefined && (!Number.isFinite(merged.contextBudget) || merged.contextBudget <= 0)) {
 		throw new Error(`contextBudget must be a positive number of tokens, got ${String(merged.contextBudget)}`);
 	}
+	if (merged.contextFraction !== undefined && (!Number.isFinite(merged.contextFraction) || merged.contextFraction <= 0 || merged.contextFraction > 1)) {
+		throw new Error(`contextFraction must be in (0, 1], got ${String(merged.contextFraction)}`);
+	}
+	if (merged.contextFraction === undefined) delete merged.contextFraction;
+	if (merged.contextBudget === undefined) delete merged.contextBudget;
 	if (!Number.isFinite(merged.reserve) || merged.reserve < 0) {
 		throw new Error(`reserve must be a nonnegative number of tokens, got ${String(merged.reserve)}`);
 	}
@@ -101,20 +132,27 @@ export function resolveBudgetPolicy(overrides: Partial<BudgetPolicyConfig> | und
 }
 
 /**
- * Effective budget: the configured budget (default 32,000), capped by the model's context
- * window minus its output allowance when that is smaller. `undefined` contextBudget means
- * "use the window". An output limit that is not finite, <= 0, or >= the window is ignored.
+ * Effective budget against the model window minus its output allowance (the base): a token
+ * count, capped by the base when that is smaller; else `contextFraction` of the base
+ * (default 50%), or `FALLBACK_BUDGET` with the window unknown; else the base itself. An
+ * output limit that is not finite, <= 0, or >= the window is ignored. Undefined only for
+ * the `window` setting with the window unknown.
  */
 export function resolveBudget(
 	policy: BudgetPolicyConfig,
 	modelContextWindow: number | undefined,
 	modelOutputLimit = 0,
-): Pick<BudgetReading, "budget" | "reserve" | "source"> | undefined {
+): Pick<BudgetReading, "budget" | "reserve" | "source" | "fraction"> | undefined {
 	const window = modelContextWindow !== undefined && Number.isFinite(modelContextWindow) && modelContextWindow > 0
 		? modelContextWindow - (Number.isFinite(modelOutputLimit) && modelOutputLimit > 0 && modelOutputLimit < modelContextWindow ? modelOutputLimit : 0)
 		: undefined;
 	if (policy.contextBudget !== undefined && (window === undefined || policy.contextBudget <= window)) {
 		return { budget: policy.contextBudget, reserve: Math.min(policy.reserve, policy.contextBudget), source: "config" };
+	}
+	const fraction = policy.contextBudget === undefined ? policy.contextFraction : undefined;
+	if (fraction !== undefined) {
+		const budget = window !== undefined ? Math.max(1, Math.floor(window * fraction)) : FALLBACK_BUDGET;
+		return { budget, reserve: Math.min(policy.reserve, budget), source: window !== undefined ? "window-fraction" : "fallback", fraction };
 	}
 	if (window !== undefined) {
 		return { budget: window, reserve: Math.min(policy.reserve, window), source: "model-window" };
@@ -293,11 +331,27 @@ function calibrated(reading: Pick<BudgetReading, "calibration">): boolean {
 	return reading.calibration !== undefined && reading.calibration > 1.005;
 }
 
+/** `0.5` → `50%`, `0.125` → `12.5%`. */
+export function formatPercent(fraction: number): string {
+	return `${Number((fraction * 100).toFixed(2))}%`;
+}
+
+/** Short origin label of a budget: `configured`, `model window`, `50% of model window`, … */
+export function budgetOrigin(reading: Pick<BudgetReading, "source" | "fraction">): string {
+	const percent = reading.fraction !== undefined ? formatPercent(reading.fraction) : "";
+	switch (reading.source) {
+		case "config": return "configured";
+		case "model-window": return "model window";
+		case "window-fraction": return `${percent} of model window`;
+		case "fallback": return `fallback, ${percent} of an unknown model window`;
+	}
+}
+
 /** One line for status text: budget, estimate, and observation, each labelled. */
 export function budgetSummaryLine(reading: BudgetReading): string {
 	const origin = reading.raisedFrom !== undefined
 		? `raised from ${formatTokens(reading.raisedFrom)} to cover the fixed overhead`
-		: reading.source === "config" ? "configured" : "model window";
+		: budgetOrigin(reading);
 	const parts = [
 		`budget ${formatTokens(reading.budget)} tok (${origin}, reserve ${formatTokens(reading.reserve)})`,
 		`estimated next request ${formatTokens(reading.estimated)}${calibrated(reading) ? ` (×${reading.calibration!.toFixed(2)} calibrated)` : ""}`,

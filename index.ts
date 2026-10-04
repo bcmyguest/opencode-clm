@@ -504,7 +504,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	async function configCommand(clm: ClmSession, words: string[]): Promise<string> {
 		const [name, ...valueWords] = words;
 		const { base, effective } = clm.settingsValues();
-		const format = { modelWindow: clm.limits.context };
+		const format = { modelWindow: clm.limits.context, modelOutput: clm.limits.output };
 		if (!name) return settingsText(base, effective, format, clm.settingsWarning);
 		if (name.toLowerCase() === "reset" && valueWords.length === 0) {
 			await clearSettings(clm);
@@ -527,7 +527,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			model.mirrorUnavailable = clm.mirrorUnavailable;
 			model.mirrorPath = `unavailable (${clm.mirrorUnavailable})`;
 		}
-		const format = { ...(clm.limits.context ? { modelWindow: clm.limits.context } : {}) };
+		const format = { ...(clm.limits.context ? { modelWindow: clm.limits.context } : {}), ...(clm.limits.output ? { modelOutput: clm.limits.output } : {}) };
 		model.settings = settingsView(clm.settingsValues(), model, { format, ...(clm.settingsWarning ? { warning: clm.settingsWarning } : {}) });
 		return panelPageText(model, page);
 	}

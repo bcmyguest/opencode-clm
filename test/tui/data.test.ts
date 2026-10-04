@@ -79,7 +79,7 @@ describe("settings view and status", () => {
 		const changed = settingsView({ base, effective }, model, { warning: "w" });
 		expect(changed.changed).toEqual(["editing", "budget", "guard"]);
 		expect(changed.rows.find((row) => row.key === "budget")).toMatchObject({ value: "20k", changed: true });
-		expect(changed.rows.find((row) => row.key === "budget")!.description).toContain("Default: 32k.");
+		expect(changed.rows.find((row) => row.key === "budget")!.description).toContain("Default: 50%.");
 		expect(changed.warning).toBe("w");
 	});
 
@@ -109,5 +109,20 @@ describe("server authority over the settings base", () => {
 		expect(overridesNewer(Date.parse(at) - 1, { at })).toBe(false);
 		expect(overridesNewer(undefined, { at })).toBe(false);
 		expect(overridesNewer(1, undefined)).toBe(true);
+	});
+});
+
+describe("percentage budgets in the TUI", () => {
+	test("fallbackBudget and the settings row follow the share of window minus output", () => {
+		const settings = resolveSettings({}, {}, "/tmp");
+		expect(fallbackBudget(settings, { context: 200_000, output: 32_000 })).toEqual({ budget: 84_000, reserve: 2048, source: "window-fraction", cap: 168_000 });
+		expect(fallbackBudget(settings, {})).toEqual({ budget: 32_000, reserve: 2048, source: "fallback" });
+		const model = buildPanelModel(files({ events: basicEvents }));
+		const base = { editing: true, settings };
+		const effective = { editing: true, settings: resolveSettings({ budget: "25%" }, {}, "/tmp") };
+		const view = settingsView({ base, effective }, model, { format: { modelWindow: 200_000, modelOutput: 32_000 } });
+		const row = view.rows.find((item) => item.key === "budget")!;
+		expect(row).toMatchObject({ value: "25% (42k)", changed: true });
+		expect(row.description).toContain("Default: 50% (84k).");
 	});
 });
