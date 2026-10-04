@@ -1,6 +1,6 @@
 {
   "name": "opencode-clm",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "OpenCode plugin for Context Language Models: the model edits a file mirror of its own context, and the edited mirror becomes its next input.",
   "type": "module",
   "license": "MIT",
