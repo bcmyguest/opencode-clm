@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { initialPanelState, reduce, type Key, type PanelState } from "../../src/panel/keys.ts";
+import { initialPanelState, reduce, withMessage, type Key, type PanelState } from "../../src/panel/keys.ts";
 import { plain } from "../../src/panel/lines.ts";
 import { buildPanelModel, type PanelModel } from "../../src/panel/model.ts";
 import { renderPanel } from "../../src/panel/view.ts";
@@ -123,6 +123,27 @@ describe("settings", () => {
 		expect(press(["4", "down", "down", "up"]).state.settingSel).toBe(0);
 		expect(press(["4", "enter"]).effect).toEqual({ kind: "apply", setting: "editing", value: "off" });
 		expect(press(["4", "down", "space"]).effect).toEqual({ kind: "prompt", setting: "budget", current: "16k", placeholder: "32k" });
+	});
+
+	test("a result message keeps the selected row in view and limits the scroll", () => {
+		const many = { ...richModel() };
+		many.settings = {
+			...many.settings,
+			rows: Array.from({ length: 40 }, (_unused, index) => ({ key: `s${index}`, label: `Setting ${index}`, value: `v${index}` })),
+		};
+		const small = { width: 90, height: 20 }; // 14 body rows; 13 with a one-line message
+		// Select the row that sits on the last body row (header: title, summary, blank = 3 lines).
+		const selected = press(Array.from({ length: 10 }, () => "down" as Key), many, initialPanelState("settings"), small).state;
+		expect(selected).toMatchObject({ settingSel: 10, scroll: 0 });
+		const shown = withMessage(selected, { text: "Setting 10: x", warning: false }, many, small);
+		expect(shown.scroll).toBe(1);
+		const text = renderPanel(many, shown, small).map(plain);
+		expect(text.join("\n")).toMatch(/› Setting 10 /);
+		expect(text.at(-4)).toMatch(/✓ Setting 10: x/);
+		// End scrolls to the last line above the message, which stays visible.
+		const end = press(["end"], many, shown, small).state;
+		expect(renderPanel(many, end, small).map(plain).at(-4)).toMatch(/✓ Setting 10: x/);
+		expect(withMessage(initialPanelState("overview"), { text: "x", warning: false }, many, small).scroll).toBe(0);
 	});
 
 	test("a key clears the result message; Tab and q stay panel keys", () => {

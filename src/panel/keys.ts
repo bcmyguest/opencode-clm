@@ -13,6 +13,7 @@ import {
 	effectiveZoom,
 	markerSelection,
 	maxScroll,
+	pageViewport,
 	revisionIndex,
 	settingsPage,
 	viewportHeight,
@@ -116,7 +117,7 @@ function clampSetting(model: PanelModel, index: number): number {
 
 function revealSetting(state: PanelState, model: PanelModel, size: PanelSize): PanelState {
 	const { focus } = settingsPage(model, state, contentWidth(size));
-	const viewport = viewportHeight(size);
+	const viewport = pageViewport(state, size);
 	let scroll = state.scroll;
 	if (focus < scroll) scroll = focus;
 	else if (focus >= scroll + viewport) scroll = focus - viewport + 1;
@@ -224,6 +225,15 @@ function step(state: PanelState, key: Key, model: PanelModel, size: PanelSize): 
 	if (key === "end" || key === "G") return { state: jump(state, model, true) };
 	if (/^[1-4]$/.test(key)) return { state: withPage(state, PAGES[Number(key) - 1]!) };
 	return { state };
+}
+
+/**
+ * The settings page with a result message pinned below it. The message takes body rows, so
+ * the selected row is scrolled back into view if the message would cover it.
+ */
+export function withMessage(state: PanelState, message: PanelState["message"], model: PanelModel, size: PanelSize): PanelState {
+	const next = { ...state, message };
+	return next.page === "settings" ? revealSetting(next, model, size) : next;
 }
 
 /** Applies one key. The result's scroll is clamped to the page. */

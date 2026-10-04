@@ -9,7 +9,7 @@ import type { TextChunk } from "@opentui/core";
 import type { TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 
 import type { Page } from "../panel/command.ts";
-import { reduce, type Effect, type Key } from "../panel/keys.ts";
+import { reduce, withMessage, type Effect, type Key } from "../panel/keys.ts";
 import type { Line, Tone } from "../panel/lines.ts";
 import type { PanelModel } from "../panel/model.ts";
 import { initialPanelState, renderPanel, type PanelSize, type PanelState } from "../panel/view.ts";
@@ -165,7 +165,8 @@ export function createPanel(api: PanelApi, options: PanelOptions): PanelControll
 		await controller.reload();
 		const row = model?.settings.rows.find((candidate) => candidate.key === setting);
 		const shown = `${row?.label ?? setting}: ${row?.value ?? value}`;
-		state = { ...state, message: error ? { text: error, warning: true } : { text: shown, warning: false } };
+		const message = error ? { text: error, warning: true } : { text: shown, warning: false };
+		state = model ? withMessage(state, message, model, size()) : { ...state, message };
 		render();
 	};
 

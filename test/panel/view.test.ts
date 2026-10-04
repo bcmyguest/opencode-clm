@@ -146,6 +146,31 @@ describe("settings", () => {
 		expect(screen({ ...initialPanelState("settings"), settingSel: 1 }).join("\n")).toMatch(/Enter: type a value/);
 	});
 
+	test("the result message stays on screen when the page is longer than the panel", () => {
+		const many = { ...richModel() };
+		many.settings = {
+			...many.settings,
+			rows: Array.from({ length: 40 }, (_unused, index) => ({ key: `s${index}`, label: `Setting ${index}`, value: `v${index}` })),
+		};
+		const small = { width: 90, height: 20 };
+		const message = { text: "Budget: 20k", warning: false };
+		for (const scroll of [0, 10, Number.MAX_SAFE_INTEGER]) {
+			const text = screen({ ...initialPanelState("settings"), scroll, message }, many, small);
+			expect(text.length).toBe(20);
+			// Pinned as the last body row, just above the separator and help row.
+			expect(text.at(-4)).toMatch(/^│ ✓ Budget: 20k +│$/);
+			expect(text.at(-2)).toMatch(/lines \d+-\d+\/\d+ · ↑ ↓ select/);
+		}
+		// Without a message the page uses every body row.
+		const plainText = screen({ ...initialPanelState("settings") }, many, small);
+		expect(plainText.join("\n")).not.toMatch(/✓/);
+		expect(plainText.at(-2)).toMatch(/lines 1-14\//);
+		expect(screen({ ...initialPanelState("settings"), message }, many, small).at(-2)).toMatch(/lines 1-13\//);
+		// A short page keeps the message right after its text.
+		const short = screen({ ...initialPanelState("settings"), message }).join("\n");
+		expect(short).toMatch(/Enter: next value +│\n│ ✓ Budget: 20k/);
+	});
+
 	test("no rows", () => {
 		const bare = buildPanelModel(files());
 		expect(screen(initialPanelState("settings"), bare).join("\n")).toMatch(/Settings are not available here\./);

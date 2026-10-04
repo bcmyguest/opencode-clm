@@ -478,10 +478,24 @@ export function settingsPage(model: PanelModel, state: PanelState, width: number
 	const row = settings.rows[selected]!;
 	if (row.description) lines.push([], ...wrapAll([text(row.description, "dim")], width));
 	lines.push([], ...wrapAll([text(row.choices?.length ? "Enter: next value" : "Enter: type a value", "dim")], width));
-	if (state.message) {
-		lines.push(...wrapAll([text(`${state.message.warning ? "⚠" : "✓"} ${state.message.text}`, state.message.warning ? "warning" : "success")], width));
-	}
 	return { lines, focus };
+}
+
+/**
+ * Lines pinned below the scrolling page: the settings page's result message ("✓ Budget:
+ * 20k"), so it stays on screen when the page is longer than the viewport. At most
+ * `viewport` − 1 lines, so one page line always shows.
+ */
+export function pinnedLines(state: PanelState, width: number, viewport: number): Line[] {
+	if (state.page !== "settings" || !state.message) return [];
+	const message = wrapAll([text(`${state.message.warning ? "⚠" : "✓"} ${state.message.text}`, state.message.warning ? "warning" : "success")], width);
+	return message.slice(0, Math.max(0, viewport - 1));
+}
+
+/** Body rows left for the scrolling page once the pinned lines take theirs. */
+export function pageViewport(state: PanelState, size: PanelSize): number {
+	const viewport = viewportHeight(size);
+	return Math.max(1, viewport - pinnedLines(state, contentWidth(size), viewport).length);
 }
 
 // ---- frame ---------------------------------------------------------------------------
@@ -514,7 +528,7 @@ export function helpText(model: PanelModel, state: PanelState, width: number): s
 }
 
 export function maxScroll(model: PanelModel, state: PanelState, size: PanelSize): number {
-	return Math.max(0, pageLines(model, state, contentWidth(size), viewportHeight(size)).length - viewportHeight(size));
+	return Math.max(0, pageLines(model, state, contentWidth(size), viewportHeight(size)).length - pageViewport(state, size));
 }
 
 /** The framed panel, exactly `size.height` lines of `size.width` cells. */
@@ -522,11 +536,14 @@ export function renderPanel(model: PanelModel, state: PanelState, size: PanelSiz
 	const width = Math.max(8, size.width);
 	const inner = width - 2;
 	const content = contentWidth({ width, height: size.height });
-	const viewport = viewportHeight(size);
-	const page = pageLines(model, state, content, viewport);
+	const body = viewportHeight(size);
+	const page = pageLines(model, state, content, body);
+	const pinned = pinnedLines(state, content, body);
+	const viewport = pageViewport(state, size);
 	const scroll = Math.max(0, Math.min(state.scroll, page.length - viewport));
-	const visible = page.slice(scroll, scroll + viewport);
-	while (visible.length < viewport) visible.push([]);
+	// The pinned lines follow the page directly when it fits, else sit at the bottom.
+	const visible = [...page.slice(scroll, scroll + viewport), ...pinned];
+	while (visible.length < body) visible.push([]);
 
 	const border = (value: string) => span(value, "border");
 	const row = (line: Line): Line => normalize([border("│"), span(" "), ...fit(line, inner - 1), border("│")]);
