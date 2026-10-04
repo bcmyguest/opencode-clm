@@ -551,6 +551,99 @@ describe("budget-too-small check", () => {
 	});
 });
 
+describe("a fallback budget while the model window is unknown", () => {
+	const eventNames = (clm: ClmSession) => existsSync(join(clm.store.directory, "events.jsonl"))
+		? readFileSync(join(clm.store.directory, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line).event as string)
+		: [];
+	// About 40,000 tokens of tool output: over the 32,000 fallback, under a 100,000 window.
+	const long = () => conversation("x".repeat(160_000));
+
+	test("withholds nothing and sends no reminder; once the window is known, the guard acts on the real budget", async () => {
+		const clm = await ClmSession.open(SESSION, settings());
+		const first = await clm.transform(long());
+		expect(clm.lastReading).toMatchObject({ source: "fallback", budget: 32_000 });
+		expect(clm.lastReading!.estimated).toBeGreaterThan(32_000);
+		expect(clm.guardLimit()).toBeUndefined();
+		expect(String(toolOutput(first.messages[1], "call_1"))).toStartWith("big output");
+		expect(first.notices).toEqual([]);
+		expect(eventNames(clm)).not.toContain("overflow-guard");
+		expect(eventNames(clm)).not.toContain("budget-notice");
+
+		// Budget 50% of 60,000 = 30,000; guard limit 27,952.
+		clm.limits = { context: 60_000, output: 0 };
+		expect(clm.guardLimit()).toBe(30_000 - 2048);
+		const second = await clm.transform(long());
+		expect(String(toolOutput(second.messages[1], "call_1"))).toStartWith("[clm overflow guard]");
+		expect(eventNames(clm)).toContain("overflow-guard");
+	});
+
+	test("a model known to report no window gets the 32,000 fallback in full", async () => {
+		const clm = await ClmSession.open(SESSION, settings());
+		clm.limitsKnown = true;
+		const first = await clm.transform(long());
+		expect(clm.lastReading).toMatchObject({ source: "fallback", budget: 32_000 });
+		expect(clm.guardLimit()).toBe(32_000 - 2048);
+		expect(String(toolOutput(first.messages[1], "call_1"))).toStartWith("[clm overflow guard]");
+		expect(eventNames(clm)).toContain("overflow-guard");
+	});
+
+	test("a window that stays unknown keeps the reminder tiers armed", async () => {
+		const clm = await ClmSession.open(SESSION, settings({ guard: "off" }));
+		await clm.transform(long());
+		await clm.transform(long());
+		expect(eventNames(clm)).not.toContain("budget-notice");
+		clm.limits = { context: 60_000, output: 0 };
+		const known = await clm.transform(long());
+		expect(String(toolOutput(known.messages[1], "call_1"))).toStartWith("big output");
+		expect(eventNames(clm).filter((name) => name === "budget-notice")).toHaveLength(1);
+	});
+
+	test("the fit gate is unlimited: an edit that grows the context past 32,000 is accepted", async () => {
+		const grow = async (clm: ClmSession) => {
+			await clm.transform(long());
+			const id = blockId(clm.baseline!.snapshot, "assistant", 1);
+			writeFileSync(clm.mirrorPath, replaceBody(readFileSync(clm.mirrorPath, "utf8"), id, "g".repeat(8000)));
+			return clm.receipt("bash", { command: `sed -i x ${clm.mirrorPath}` }, "/");
+		};
+		const clm = await ClmSession.open(SESSION, settings({ guard: "off" }));
+		expect(await grow(clm)).toContain("Mirror edit valid");
+		expect(clm.baseline!.limit).toBeUndefined();
+		const applied = await clm.transform(long());
+		expect(applied.notices.join("\n")).toContain("Applied revision 1");
+
+		// Control: the same edit against an explicit 32,000 is refused.
+		const explicit = await ClmSession.open(SESSION, settings({ budget: 32_000, guard: "off" }));
+		expect(await grow(explicit)).toContain("would be refused");
+	});
+
+	test("no size trailer: it would report a limit nothing enforces", async () => {
+		const clm = await ClmSession.open(SESSION, settings({ trailer: true }));
+		await clm.transform(long());
+		expect(clm.sizeTrailer("x".repeat(400))).toBeUndefined();
+		clm.limits = { context: 60_000, output: 0 };
+		expect(clm.sizeTrailer("x".repeat(400))).toContain("of 30,000 tokens");
+	});
+
+	test("a budget-too-small raise on top of a fallback is still provisional", async () => {
+		const clm = await ClmSession.open(SESSION, settings());
+		clm.scope = { systemTokens: 30_000, toolTokens: 0 };
+		await clm.transform(conversation());
+		await clm.transform([...conversation(), assistant("msg_a3", "ok", [], 0)]);
+		expect(clm.resolvedBudget()).toMatchObject({ source: "fallback", raisedFrom: 32_000 });
+		expect(clm.guardLimit()).toBeUndefined();
+		expect(clm.baseline!.limit).toBeUndefined();
+	});
+
+	test("an explicit budget: 32000 still withholds with the window unknown", async () => {
+		const clm = await ClmSession.open(SESSION, settings({ budget: 32_000 }));
+		const first = await clm.transform(long());
+		expect(clm.lastReading).toMatchObject({ source: "config", budget: 32_000 });
+		expect(clm.guardLimit()).toBe(32_000 - 2048);
+		expect(String(toolOutput(first.messages[1], "call_1"))).toStartWith("[clm overflow guard]");
+		expect(eventNames(clm)).toContain("overflow-guard");
+	});
+});
+
 describe("calibration after a measured overhead", () => {
 	test("hook sizes below the real overhead do not inflate estimates; new tool results are delivered", async () => {
 		// Real overhead 18,000; the hooks see 6,000 (built-in tool schemas unmeasured). The

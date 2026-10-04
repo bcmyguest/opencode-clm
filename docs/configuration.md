@@ -74,10 +74,15 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
 - **Budget.** The budget counts the whole request, OpenCode's system prompt and tool
   schemas included; `/clm status` shows their measured size. A percentage budget is that
   share of the model window minus its output limit, and 32,000 tokens while the model
-  window is unknown (`window` then has no budget until the window is known). The model
-  window minus its output limit caps a token budget. When budget − reserve leaves less
-  than 8,000 tokens after the measured overhead, the session raises its effective budget
-  to make room, warns with a toast and tells the model once.
+  window is unknown (`window` then has no budget until the window is known). The model's
+  limits reach the plugin one request late, so the first request after a restart reads the
+  fallback; on that request the overflow guard withholds nothing, the fit gate accepts any
+  size, reminders stay silent and the size trailer is omitted. A model that reports no
+  window keeps the 32,000 fallback, which then applies in full. An explicit token budget
+  applies from the first request. The model window minus its output limit caps a token
+  budget. When budget − reserve leaves less than 8,000 tokens after the measured overhead,
+  the session raises its effective budget to make room, warns with a toast and tells the
+  model once.
 - **Reminder cooldown.** An edit that drops the context below a reminder tier re-arms it.
   So the model is not reminded again a few steps after each edit, an accepted edit starts
   a cooldown: until the context grows by the cooldown share of the budget beyond its size

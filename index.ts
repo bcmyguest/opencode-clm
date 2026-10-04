@@ -823,6 +823,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			if (!clm.enabled || clm.mirrorUnavailable !== undefined) return;
 			const limit = (hookInput.model as { limit?: { context?: number; input?: number; output?: number } } | undefined)?.limit;
 			if (limit) clm.limits = { context: limit.context || undefined, output: limit.output || undefined, ...(limit.input ? { input: limit.input } : {}) };
+			if (hookInput.model) clm.limitsKnown = true;
 			const sections = [systemGuidance(clm.mirrorPath, clm.resolvedBudget()?.budget)];
 			if (clm.steering) sections.push(steeringPromptSection(clm.steering));
 			output.system.push(sections.join("\n\n"));

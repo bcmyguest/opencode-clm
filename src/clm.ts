@@ -200,6 +200,12 @@ export class ClmSession {
 	accepted = 0;
 	rejected = 0;
 	limits: ModelLimits = {};
+	/**
+	 * Set once the system transform has seen the model, with or without a window. Until then
+	 * a fallback budget is provisional: the guard, fit gate, reminders and trailer stand down.
+	 * A model that reports no window keeps the fallback, which then applies in full.
+	 */
+	limitsKnown = false;
 	scope: RequestScope = {};
 	/** Set by `experimental.session.compacting`: the next transform carries OpenCode's compaction input. */
 	compacting = false;
@@ -479,10 +485,19 @@ export class ClmSession {
 		return base ? budgetFit(base.budget, base.reserve, this.state.budgetCheck?.overhead, this.windowCap()) : undefined;
 	}
 
-	/** budget − reserve, or undefined while the budget is unknown. */
+	/**
+	 * budget − reserve: the limit the overflow guard enforces. Undefined while the budget is
+	 * unknown or a fallback (`FALLBACK_BUDGET`, model window not yet known): the guard then
+	 * withholds nothing.
+	 */
+	/** A fallback budget read before the model's limits arrived (see `limitsKnown`). */
+	private provisional(resolved: Pick<BudgetReading, "source">): boolean {
+		return resolved.source === "fallback" && !this.limitsKnown;
+	}
+
 	guardLimit(): number | undefined {
 		const resolved = this.resolvedBudget();
-		return resolved ? overflowGuardLimit(resolved.budget, resolved.reserve) : undefined;
+		return resolved && !this.provisional(resolved) ? overflowGuardLimit(resolved.budget, resolved.reserve) : undefined;
 	}
 
 	/**
@@ -663,13 +678,15 @@ export class ClmSession {
 
 	/**
 	 * `setting trailer`: the size trailer for one tool result (the last reading plus the
-	 * result's calibrated estimate, against the budget in force); undefined when off.
+	 * result's calibrated estimate, against the budget in force); undefined when off or while
+	 * the budget is unknown or a provisional fallback.
 	 */
 	sizeTrailer(output: string): string | undefined {
 		if (!this.settings.enabled || !this.enabled || !this.settings.trailer || this.mirrorUnavailable !== undefined) return undefined;
-		const budget = this.resolvedBudget()?.budget;
-		if (!budget) return undefined;
-		return sizeTrailer(this.lastReading?.estimated ?? 0, this.calibrator.apply(this.textTokens(output)), budget);
+		const resolved = this.resolvedBudget();
+		// A fallback budget is a placeholder: "~N of 32,000" would report a limit nothing enforces.
+		if (!resolved || this.provisional(resolved)) return undefined;
+		return sizeTrailer(this.lastReading?.estimated ?? 0, this.calibrator.apply(this.textTokens(output)), resolved.budget);
 	}
 
 	/**
@@ -1234,7 +1251,13 @@ export class ClmSession {
 			formatContinuityMessage({ annotations, effectiveMessages: messages });
 		const pinnedTokens = this.estimate(flatten(pinnedMessages));
 		const resolved = this.resolvedBudget();
-		const limit = resolved ? overflowGuardLimit(resolved.budget, resolved.reserve) : undefined;
+		// Model limits arrive one request late, so the first request of a process reads the
+		// FALLBACK_BUDGET placeholder. Withholding, reminding or refusing an edit against it is
+		// undone on the next request (a prompt-cache miss, a spurious notice, an edit the real
+		// budget would accept), so none acts on a fallback: `guardLimit()` is undefined, which
+		// also leaves the fit gate unlimited, as with no budget at all.
+		const limit = this.guardLimit();
+		const provisional = resolved !== undefined && this.provisional(resolved);
 		const { systemTokens, toolTokens } = this.scope;
 		const { measuredOverhead, scopeTokens } = this.scopeSize();
 		const excluded = measuredOverhead !== undefined ? [] : [
@@ -1312,7 +1335,9 @@ export class ClmSession {
 				// The measured request was answered inside the prefix the active revision replaced.
 				observedStale: observed !== undefined && checkpoint !== undefined && checkpoint.sourceIds.includes(observed.messageID),
 			};
-			const { tier, suppressed, cooldownUntil } = this.tracker.check(
+			// A fallback reading skips the tracker: no tier fires or is marked fired, and a pending
+			// cooldown waits, so reminders start from the real budget once the window is known.
+			const { tier, suppressed, cooldownUntil } = provisional ? { tier: undefined, suppressed: [] } : this.tracker.check(
 				reading, budgetTiers(this.settings.budget, resolved.budget, resolved.reserve), this.settings.budget.reminderCooldown);
 			for (const skipped of suppressed) {
 				await this.log({ event: "budget-notice-suppressed", tier: skipped.label, estimated: reading.estimated, cooldownUntil });

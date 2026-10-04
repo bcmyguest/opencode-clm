@@ -218,7 +218,13 @@ such a plugin.
 `src/budget.ts`. The budget is the `budget` setting (`CLM_BUDGET`): a share of the model
 window minus its output limit (`contextFraction`, default 50%; `FALLBACK_BUDGET`, 32,000,
 while the window is unknown), a token count capped by that same base, or `window` for all
-of it; the reserve (default 2,048) is generation headroom. Reminders fire at 25/50/75% of
+of it; the reserve (default 2,048) is generation headroom. A fallback reading
+(`source: "fallback"`) taken before the system transform has seen the model
+(`limitsKnown` false) is a placeholder that the next request replaces: the overflow guard
+withholds nothing against it (`guardLimit()` is undefined), the fit gate measures against
+no limit, the size trailer is omitted, and `BudgetTracker` is not consulted, so no reminder
+fires and no tier is marked fired. A model that reports no window keeps the fallback,
+which then applies in full. Reminders fire at 25/50/75% of
 the budget (`remindAt`) and at budget − reserve, once per tier, re-arming when usage drops.
 An accepted edit starts a cooldown (`reminderCooldown`, default 10% of the budget): the
 first reading after it records the size E, and until the estimate reaches E + cooldown ×
@@ -544,7 +550,8 @@ come from `events.jsonl`, so the panel works on resume without extra persistence
   order, and child calls of OpenCode's experimental code mode count as calls too.
 - Model limits and the system-prompt size reach the plugin one request late. On the first
   request of a process the model window does not yet cap the budget, a percentage budget
-  (the default) is 32,000 tokens, and the estimate omits the system prompt; with
+  (the default) is 32,000 tokens (the guard, the fit gate, reminders and the size trailer
+  stand down), and the estimate omits the system prompt; with
   `budget: "window"` that request has no budget reading.
 - Built-in tool descriptions are measured, but not their parameter schemas; the
   provider-measured overhead covers them once it arrives.
