@@ -13,10 +13,10 @@ import { basename, resolve } from "node:path";
 import { FALLBACK_BUDGET, formatPercent, resolveBudget, resolveBudgetPolicy, type BudgetPolicyConfig } from "./budget.ts";
 import { MIN_OBSERVATION_CAP, resolveObservationCap } from "./observation.ts";
 import { toEditGate, type EditGate } from "./policy.ts";
-import { HOUSE_STEERING, parseBudget, parseCompaction, parseCooldown, parseFlag, parseFractions, parseTokens, type ClmSettings, type CompactionMode } from "./settings.ts";
+import { HOUSE_STEERING, parseBudget, parseCompaction, parseCooldown, parseFlag, parseFractions, parseMode, parseTokens, type ClmMode, type ClmSettings, type CompactionMode } from "./settings.ts";
 
 export type SettingKey =
-	| "editing" | "budget" | "reserve" | "reminders" | "cooldown" | "gate" | "guard" | "compaction" | "cap" | "steering" | "oneTool" | "trailer"
+	| "editing" | "budget" | "reserve" | "reminders" | "cooldown" | "gate" | "guard" | "compaction" | "cap" | "steering" | "mode" | "oneTool" | "trailer"
 	| "compactPrompt" | "reasoning";
 
 /**
@@ -45,6 +45,7 @@ export interface ClmOverrides {
 	reasoning?: boolean;
 	oneTool?: boolean;
 	trailer?: boolean;
+	mode?: ClmMode;
 }
 
 /** A budget percentage as stored in overrides.json: `"50%"`, `"12.5%"`. */
@@ -267,6 +268,15 @@ export const SETTINGS_TABLE: readonly SettingDescriptor[] = [
 		},
 	},
 	{
+		key: "mode",
+		name: "mode",
+		label: "Mode",
+		description: "edit: the model edits its context through the mirror. notices-only: no mirror, no protocol prompt and no edits; budget notices and reminders, the overflow guard, the observation cap and the size trailer still apply, to compare telling the model its budget with letting it edit. An accepted revision is kept but not applied while notices-only is in force. Env: CLM_MODE.",
+		choices: ["edit", "notices-only"],
+		format: (values) => values.settings.mode,
+		parse: (text) => ({ mode: parseMode(text) }),
+	},
+	{
 		key: "oneTool",
 		name: "one-tool",
 		label: "One tool per turn",
@@ -336,6 +346,7 @@ const ALIASES: Record<string, SettingKey> = {
 	"compact-prompt": "compactPrompt",
 	compactprompt: "compactPrompt",
 	reasoning: "reasoning",
+	mode: "mode",
 };
 
 /** Names `/clm config` lists. */
@@ -379,6 +390,7 @@ export function applyOverrides(base: ClmSettings, overrides: ClmOverrides): ClmS
 		compaction: overrides.compaction ?? base.compaction,
 		oneTool: overrides.oneTool ?? base.oneTool,
 		trailer: overrides.trailer ?? base.trailer,
+		mode: overrides.mode ?? base.mode,
 		observationCap,
 		steeringPath: overrides.steering === null ? undefined : overrides.steering ?? base.steeringPath,
 		compactPromptPath: overrides.compactPrompt === null ? undefined : overrides.compactPrompt ?? base.compactPromptPath,
@@ -406,6 +418,7 @@ function baseValue(key: keyof ClmOverrides, values: SettingsValues): unknown {
 		case "steering": return settings.steeringPath ?? null;
 		case "compactPrompt": return settings.compactPromptPath ?? null;
 		case "reasoning": return settings.reasoning;
+		case "mode": return settings.mode;
 	}
 }
 
@@ -417,7 +430,7 @@ function baseValue(key: keyof ClmOverrides, values: SettingsValues): unknown {
  */
 export function settingsAsOverrides(settings: ClmSettings): ClmOverrides {
 	const values: SettingsValues = { editing: true, settings };
-	const keys: Array<keyof ClmOverrides> = ["budget", "reserve", "reminders", "cooldown", "gate", "guard", "compaction", "cap", "capHead", "steering", "oneTool", "trailer", "compactPrompt", "reasoning"];
+	const keys: Array<keyof ClmOverrides> = ["budget", "reserve", "reminders", "cooldown", "gate", "guard", "compaction", "cap", "capHead", "steering", "mode", "oneTool", "trailer", "compactPrompt", "reasoning"];
 	return Object.fromEntries(keys.map((key) => [key, baseValue(key, values)])) as ClmOverrides;
 }
 
@@ -450,6 +463,7 @@ const VALID: Record<keyof ClmOverrides, (value: unknown) => boolean> = {
 	steering: isPath,
 	compactPrompt: isPath,
 	reasoning: (value) => typeof value === "boolean",
+	mode: (value) => value === "edit" || value === "notices-only",
 };
 
 /**

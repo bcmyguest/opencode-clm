@@ -522,6 +522,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		const budget = fallbackBudget(clm.settings, clm.limits);
 		const model = buildPanelModel(files, budget ? { budget } : {});
 		model.enabled = clm.enabled;
+		if (clm.noticesOnly) model.noticesOnly = true;
 		// No mirror: name why, never the temporary directory (the text reaches the model).
 		if (clm.mirrorUnavailable !== undefined) {
 			model.mirrorUnavailable = clm.mirrorUnavailable;
@@ -550,7 +551,8 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				return text;
 			}
 			case "path":
-				return clm.mirrorUnavailable === undefined ? `CLM mirror: ${clm.mirrorPath}` : `CLM mirror: unavailable (${clm.mirrorUnavailable})`;
+				if (clm.mirrorUnavailable !== undefined) return `CLM mirror: unavailable (${clm.mirrorUnavailable})`;
+				return clm.noticesOnly ? "CLM mirror: not used (mode notices-only)" : `CLM mirror: ${clm.mirrorPath}`;
 			case "on":
 			case "off": {
 				// The same override the TUI and `/clm config editing` write.
@@ -560,6 +562,11 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 					return argument === "on"
 						? "CLM is on for this session. No mirror is available: requests carry the raw history plus the continuity annotations."
 						: "CLM is off for this session: requests carry the raw history.";
+				}
+				if (clm.noticesOnly) {
+					return argument === "on"
+						? "CLM is on for this session in notices-only mode: requests carry the raw history plus the budget notices; the model cannot edit its context."
+						: "CLM is off for this session: requests carry the raw history and no notices.";
 				}
 				return argument === "on"
 					? "CLM is on for this session: the mirror is refreshed before the next request."
@@ -824,9 +831,10 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			const limit = (hookInput.model as { limit?: { context?: number; input?: number; output?: number } } | undefined)?.limit;
 			if (limit) clm.limits = { context: limit.context || undefined, output: limit.output || undefined, ...(limit.input ? { input: limit.input } : {}) };
 			if (hookInput.model) clm.limitsKnown = true;
-			const sections = [systemGuidance(clm.mirrorPath, clm.resolvedBudget()?.budget)];
+			// notices-only: no protocol section (there is no mirror); the steering document stays.
+			const sections = clm.noticesOnly ? [] : [systemGuidance(clm.mirrorPath, clm.resolvedBudget()?.budget)];
 			if (clm.steering) sections.push(steeringPromptSection(clm.steering));
-			output.system.push(sections.join("\n\n"));
+			if (sections.length > 0) output.system.push(sections.join("\n\n"));
 			clm.scope = { ...clm.scope, systemTokens: clm.textTokens(output.system.join("\n")) };
 		},
 
@@ -873,7 +881,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				if (cancelled && usable !== undefined) {
 					await clm.log({ event: "compaction-cancelled", reason: "threshold", setting: cancelled.by, count: cancelled.count, usable });
 					if (cancelled.by === "off") {
-						clm.queueNotice(thresholdCancelledNoticeText(clm.mirrorPath));
+						clm.queueNotice(thresholdCancelledNoticeText(clm.noticesOnly ? undefined : clm.mirrorPath));
 						toast(thresholdCancelledText(cancelled.count, usable));
 					} else toast(thresholdPausedText(cancelled.count, usable, clm.guardLimit()));
 				}
@@ -946,7 +954,7 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			// Automatic compaction only (manual /compact does not reach this hook).
 			const overflow = hookInput.overflow === true;
 			await clm.log({ event: "native-compaction", reason: overflow ? "overflow" : "threshold", setting: clm.settings.compaction });
-			toast(nativeCompactionText(overflow, clm.settings.compaction));
+			toast(nativeCompactionText(overflow, clm.settings.compaction, clm.noticesOnly));
 		},
 
 		async event({ event }) {
@@ -987,9 +995,11 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 					toast("The provider rejected the request as too long, and OpenCode's automatic compaction is off. Run /compact.", "warning");
 					return;
 				}
-				clm.queueNotice(overflowNotCompactedText(clm.mirrorPath));
+				clm.queueNotice(overflowNotCompactedText(clm.noticesOnly ? undefined : clm.mirrorPath));
 				await clm.log({ event: "overflow-not-compacted", setting: clm.settings.compaction });
-				toast("The provider rejected the request as too long, and OpenCode's automatic compaction is off. Edit the mirror or run /compact.", "warning");
+				toast(clm.noticesOnly
+					? "The provider rejected the request as too long, and OpenCode's automatic compaction is off. Run /compact."
+					: "The provider rejected the request as too long, and OpenCode's automatic compaction is off. Edit the mirror or run /compact.", "warning");
 				return;
 			}
 			if (event.type !== "session.compacted") return;
@@ -1055,7 +1065,15 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 					// pi-clm's compactCommand: nothing for the model to edit, so nothing is asked of it.
 					toast(`The context mirror is unavailable, so the model cannot edit its context (${clm.mirrorUnavailable}).`, "warning");
 					text = relay("[CLM] The context mirror is unavailable, so the model cannot edit its context.");
-				} else text = await compactCommand(clm, hookInput.sessionID, argument);
+				} else {
+					await clm.refreshSettings();
+					if (clm.noticesOnly) {
+						// The compaction prompt asks for a mirror edit; notices-only has no mirror.
+						const message = "CLM runs in notices-only mode for this session, so the model cannot edit its context. Switch with /clm config mode edit.";
+						toast(message, "warning");
+						text = relay(`[CLM] ${message}`);
+					} else text = await compactCommand(clm, hookInput.sessionID, argument);
+				}
 			} catch (error) {
 				const message = `/${hookInput.command} failed: ${describe(error)}`;
 				toast(message, "error");

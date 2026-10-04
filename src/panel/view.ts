@@ -52,6 +52,7 @@ const EDIT_TONE: Tone = "edit";
 const KEPT_PREVIEW_CHARACTERS = 2_000;
 const MIRROR_TEXT_MAX_LINES = 200;
 const MIRROR_UNAVAILABLE_TEXT = "No mirror: requests carry the raw history plus the continuity annotations; edits are off.";
+const NOTICES_ONLY_TEXT = "Mode notices-only: requests carry the raw history plus the budget notices; no mirror, so the model cannot edit its context (/clm config mode edit).";
 
 /** Body rows available for the page. */
 export function viewportHeight(size: PanelSize): number {
@@ -194,6 +195,8 @@ function overviewLines(model: PanelModel, state: PanelState, width: number, view
 		? text("Projection off: the model sees the raw history (/clm on).", "warning")
 		: model.mirrorUnavailable !== undefined
 		? text(MIRROR_UNAVAILABLE_TEXT, "warning")
+		: model.noticesOnly
+		? text(NOTICES_ONLY_TEXT, "warning")
 		: model.lastOutcome?.kind === "rejected"
 			? text(`Last edit rejected: ${model.lastOutcome.message}`, "warning")
 			: undefined;
@@ -547,7 +550,7 @@ export function renderPanel(model: PanelModel, state: PanelState, size: PanelSiz
 
 	const border = (value: string) => span(value, "border");
 	const row = (line: Line): Line => normalize([border("│"), span(" "), ...fit(line, inner - 1), border("│")]);
-	const title = ` Live Context Viewer · r${model.revision} `;
+	const title = ` Live Context Viewer · r${model.revision}${model.noticesOnly && model.enabled ? " · notices-only" : ""} `;
 	const titleText = truncate([span(title)], inner, "").map((part) => part.text).join("");
 	const left = Math.max(0, Math.floor((inner - titleText.length) / 2));
 	const right = Math.max(0, inner - titleText.length - left);

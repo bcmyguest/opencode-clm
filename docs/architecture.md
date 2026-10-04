@@ -60,10 +60,21 @@ messages.transform   0. re-read overrides.json if it changed; activate the setti
                      7. write pinned ++ effective ++ continuity ++ notices into OpenCode's
                         array in place; replace snapshot.json; log a `request` event
 system.transform     append the editing protocol + mirror path (+ steering) to the system prompt
+                     (notices-only: steering only)
 provider request     the model sees the effective context
 assistant step       the model may rewrite the mirror with bash/edit/write
 tool.execute.after   a tool call that wrote the mirror gets a dry-run verdict appended
 ```
+
+`mode notices-only` skips steps 1 and 5 and the checkpoint part of step 3: nothing is
+committed or rendered, the accepted checkpoint (if any) stays in `state.json` but is not
+applied, and the effective context is the raw history (reasoning view, cap and guard
+still apply). There is no baseline, so the bash verdict stays silent and `/clm-compact`
+refuses. Notices use wording without the mirror (`budgetNoticeText` and the overflow,
+too-small and compaction notices take a notices-only variant). Ignoring the checkpoint
+rather than dropping it makes the mode switch reversible: back in `edit` the checkpoint
+applies again while it still matches the history, and a compaction signal received
+meanwhile is held until then so the rebase can still happen.
 
 OpenCode has no end-of-turn hook, so the edit the model made during step *k* is committed
 at the start of step *k+1*'s transform, right before the request it affects. The file
@@ -309,9 +320,9 @@ capped block is persisted in its capped form when an edit is accepted.
 
 `src/settings.ts` resolves the plugin options (the `plugin` entry in `opencode.json`), then
 environment variables, then defaults, once at load; an invalid value fails the plugin with
-the setting's name. `src/settings-table.ts` is the one table of the fourteen settings a session
+the setting's name. `src/settings-table.ts` is the one table of the fifteen settings a session
 can change — editing, budget, reserve, reminders, reminder cooldown, edit gate, overflow guard, compaction,
-observation cap, steering, one-tool, trailer, compact prompt, reasoning — with each one's label, description, choices,
+observation cap, steering, mode, one-tool, trailer, compact prompt, reasoning — with each one's label, description, choices,
 formatting and parsing; values parse with the same functions as options and environment
 variables. `enabled`, `mirrorDir`, `estimateFactor`, `skill`, `commands` and
 `dumpRequests` are load-time only.

@@ -130,6 +130,8 @@ export interface PanelModel {
 	mirrorPath: string;
 	/** The newest `mirror-unavailable` event's reason: the session runs without a mirror. */
 	mirrorUnavailable?: string;
+	/** The session runs `mode notices-only` (set by the caller from the settings in force). */
+	noticesOnly?: boolean;
 	/** Problems reading the files (corrupt JSON, skipped event lines). */
 	warnings: string[];
 }

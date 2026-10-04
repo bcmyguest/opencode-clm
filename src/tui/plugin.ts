@@ -139,6 +139,7 @@ export const tui: TuiPlugin = async (api, tuiOptions) => {
 		const preferSettings = overridesNewer(current.overridesAt, files.snapshot);
 		const model = buildPanelModel(files, { ...(latest ? { latest } : {}), ...(budget ? { budget } : {}), ...(preferSettings ? { preferSettings } : {}) });
 		model.enabled = current.values.effective.editing;
+		if (current.values.effective.settings.mode === "notices-only") model.noticesOnly = true;
 		model.settings = settingsView(current.values, model, {
 			format: { ...(limits.context ? { modelWindow: limits.context } : {}), ...(limits.output ? { modelOutput: limits.output } : {}) },
 			...(current.warning ? { warning: current.warning } : {}),
@@ -456,7 +457,7 @@ export function statusSummary(model: PanelModel): string {
 	if (!model.found) return `No CLM data for this session (${model.directory}).`;
 	const latest = model.timeline.points.at(-1);
 	const parts = [
-		`CLM ${model.enabled ? "on" : "off"} · revision ${model.revision}`,
+		`CLM ${model.enabled ? "on" : "off"}${model.enabled && model.noticesOnly ? " · mode notices-only" : ""} · revision ${model.revision}`,
 		latest ? `last request ${latest.measured ? "" : "~"}${formatTokenCount(latest.tokens)}` : "no requests yet",
 		model.budget !== undefined ? `budget ${formatTokenCount(model.budget)}` : undefined,
 		model.budgetInfo?.overhead !== undefined ? `fixed overhead ~${formatTokenCount(model.budgetInfo.overhead)}` : undefined,

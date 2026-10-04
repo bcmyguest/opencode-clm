@@ -7,6 +7,12 @@
  * during step k is read back and committed at the start of step k+1's transform, right
  * before the request it affects. As in pi-clm, the file content at that moment wins.
  *
+ * `mode notices-only` (`noticesOnly`) skips steps 1, 2 and 4: the accepted revision, if any,
+ * stays in state.json but is not applied, nothing is rendered or committed, and the request
+ * carries the raw history (reasoning view, cap and guard still apply) with every notice.
+ * Switching back to `edit` applies the kept revision again while it still matches the
+ * history; a mismatch then takes the usual restore-or-reset path.
+ *
  *   transform(raw)  0. pinned = everything up to and including the first user message;
  *                      source = flatten(rest), the raw prefix a checkpoint digests
  *                   1. commit: read the mirror; if it differs from the last render,
@@ -312,6 +318,11 @@ export class ClmSession {
 		return this.overrides.editing ?? this.state.enabled;
 	}
 
+	/** `mode notices-only`: notices and the guard run, the model cannot edit its context. */
+	get noticesOnly(): boolean {
+		return this.settings.mode === "notices-only";
+	}
+
 	/** Base and effective values, for the settings table. */
 	settingsValues(): { base: SettingsValues; effective: SettingsValues } {
 		return {
@@ -384,6 +395,7 @@ export class ClmSession {
 		const before = this.settings.budget;
 		const after = staged.settings.budget;
 		const wasEnabled = this.enabled;
+		const wasMode = this.settings.mode;
 		const changed = JSON.stringify(this.overrides) !== JSON.stringify(overrides);
 		this.settings = staged.settings;
 		this.steering = staged.steering;
@@ -396,6 +408,12 @@ export class ClmSession {
 			this.baseline = undefined;
 			this.tracker.clearCooldown();
 			if (!this.enabled) this.continuitySize.observe(0);
+		}
+		if (wasMode !== this.settings.mode) {
+			// The render the baseline holds no longer describes what the model is sent.
+			this.baseline = undefined;
+			this.lastSnapshot = undefined;
+			this.tracker.clearCooldown();
 		}
 		if (changed) await this.log({ event: "settings", overrides });
 	}
@@ -571,7 +589,7 @@ export class ClmSession {
 			...(previous ? { replaces: previous.source, previousOverhead: previous.overhead } : {}),
 		});
 		if (!warn) return undefined;
-		this.pendingNotices.push(budgetTooSmallNoticeText(fit));
+		this.pendingNotices.push(budgetTooSmallNoticeText(fit, { noticesOnly: this.noticesOnly }));
 		return budgetTooSmallAlertText(fit);
 	}
 
@@ -666,7 +684,7 @@ export class ClmSession {
 	 * calls that only read it or do not touch it.
 	 */
 	receipt(tool: string, args: Record<string, unknown> | undefined, cwd: string): string | undefined {
-		if (!this.settings.enabled || !this.enabled) return undefined;
+		if (!this.settings.enabled || !this.enabled || this.noticesOnly) return undefined;
 		if (classifyMirrorToolCall(tool, args ?? {}, cwd, this.mirrorPath) !== "write") return undefined;
 		const check = this.validateMirror(this.store.readSync());
 		if (!check) return undefined;
@@ -697,7 +715,7 @@ export class ClmSession {
 	 */
 	async commitBeforeCompaction(): Promise<void> {
 		await this.refreshSettings();
-		if (!this.settings.enabled || !this.enabled) return;
+		if (!this.settings.enabled || !this.enabled || this.noticesOnly) return;
 		await this.commit();
 	}
 
@@ -708,6 +726,7 @@ export class ClmSession {
 
 	/** The mirror block the model last saw, for continuity annotations. */
 	blockSource(blockId: string): ContinuityBlockSource | undefined {
+		if (this.noticesOnly) throw new Error("CLM runs in notices-only mode: there is no context mirror, so no block can be annotated.");
 		const snapshot = this.lastSnapshot;
 		const block = snapshot?.blocks.find((candidate) => candidate.id === blockId);
 		return snapshot && block ? { message: block.source, revision: snapshot.revision } : undefined;
@@ -1168,6 +1187,7 @@ export class ClmSession {
 			return { messages: raw, notices: [], ...this.drainAlerts() };
 		}
 		if (this.mirrorUnavailable !== undefined) return await this.transformWithoutMirror(raw);
+		const noticesOnly = this.noticesOnly;
 		const pinned = pinnedCount(raw);
 		const pinnedMessages = raw.slice(0, pinned);
 		const context = this.context(raw);
@@ -1178,15 +1198,23 @@ export class ClmSession {
 		// A pending edit was committed by `commitBeforeCompaction` just before.
 		if (this.compacting) {
 			this.compacting = false;
+			// notices-only: the summary is made from the history the model was sent, the raw one.
+			if (noticesOnly) return { messages: raw, notices: [], ...this.drainAlerts() };
 			const projection = applyProjection(flatten(raw.slice(pinned)), this.state.checkpoint);
 			if (!projection.valid || !this.state.checkpoint) return { messages: raw, notices: [], ...this.drainAlerts() };
 			return { messages: [...pinnedMessages, ...unflatten(projection.messages, context)], notices: [], ...this.drainAlerts() };
 		}
 
-		await this.commit();
+		if (noticesOnly) {
+			// No render to commit against; a mirror written meanwhile is never applied.
+			this.baseline = undefined;
+			this.lastSnapshot = undefined;
+		} else await this.commit();
 		this.requests += 1;
-		const compacted = this.compacted;
-		this.compacted = false;
+		// notices-only leaves a compaction signal pending: back in `edit`, the kept revision
+		// rebases onto the summary as it would have at the time.
+		const compacted = noticesOnly ? false : this.compacted;
+		if (!noticesOnly) this.compacted = false;
 
 		// The raw source prefix is digested as flattened, before any view, cap or guard.
 		const source = flatten(raw.slice(pinned));
@@ -1199,13 +1227,16 @@ export class ClmSession {
 		// overhead (built-in tool schemas) as undercounting; start calibration over.
 		if (measured?.source === "provider") this.calibrator.reset();
 
-		let projection = applyProjection(source, this.state.checkpoint);
+		// notices-only: the kept revision is ignored, not dropped (see the header comment).
+		let projection = applyProjection(source, noticesOnly ? undefined : this.state.checkpoint);
 		// A late or repeated compaction signal must not swallow a later revert: rebase only
 		// onto a summary the active checkpoint does not already cover.
 		const summaryId = compacted ? compactionSummaryId(raw) : undefined;
 		const rebase = summaryId !== undefined && !projection.valid && this.state.checkpoint !== undefined &&
 			!this.state.checkpoint.sourceIds.includes(summaryId);
-		if (rebase) {
+		if (noticesOnly) {
+			// Raw history: nothing to rebase, restore or reset.
+		} else if (rebase) {
 			await this.rebaseAfterCompaction(summaryId);
 			projection = applyProjection(source, undefined);
 		} else if (!projection.valid && (await this.restoreAfterMismatch(source, projection.reason))) {
@@ -1235,10 +1266,10 @@ export class ClmSession {
 		}
 		const origin = this.forkOrigin;
 		this.forkOrigin = undefined;
-		if (origin && !this.state.checkpoint && this.state.revision === 0 && (await this.restoreFromFork(origin, source))) {
+		if (origin && !noticesOnly && !this.state.checkpoint && this.state.revision === 0 && (await this.restoreFromFork(origin, source))) {
 			projection = applyProjection(source, this.state.checkpoint);
 		}
-		const checkpoint = this.state.checkpoint;
+		const checkpoint = noticesOnly ? undefined : this.state.checkpoint;
 		const suffixLength = projection.valid ? projection.suffix.length : 0;
 
 		let effective = projection.messages;
@@ -1281,7 +1312,7 @@ export class ClmSession {
 			if (guarded.withheld.length > 0) {
 				effective = guarded.messages;
 				withheldCount = guarded.withheld.length;
-				this.pendingNotices.push(overflowNoticeText(guarded, limit));
+				this.pendingNotices.push(overflowNoticeText(guarded, limit, { noticesOnly }));
 				await this.log({
 					event: "overflow-guard",
 					withheld: guarded.withheld.map((record) => ({ id: record.toolCallId, tokens: record.tokens, file: record.file })),
@@ -1296,30 +1327,33 @@ export class ClmSession {
 			this.pendingNotices.push(continuitySizeNoticeText(this.textTokens(continuity ?? "")));
 		}
 
-		const snapshot = renderContextDocument(effective, {
+		// notices-only: no mirror is rendered or written, so no edit can be validated or applied.
+		const snapshot = noticesOnly ? undefined : renderContextDocument(effective, {
 			revision: this.state.revision,
 			protectedIndexes: new Set<number>(),
 			// Constant until the next accepted edit or reset, so header ids read on one call
 			// remain valid on the next; bodies are escaped accordingly.
 			documentSeed: `${this.sessionID}:${this.nonce}:${checkpoint?.sourceDigest ?? "raw"}`,
 		});
-		try {
-			await this.store.write(snapshot.text);
-			this.refreshFailing = false;
-			this.lastSnapshot = snapshot;
-			this.baseline = {
-				rawMessages: source,
-				effectiveMessages: effective,
-				snapshot,
-				// The fit gate measures the editable context alone; the system prompt, tool
-				// schemas, pinned task and continuity message take their share of budget − reserve first.
-				limit: limit === undefined ? undefined : Math.max(1, limit - scopeTokens - pinnedTokens - continuityTokens),
-			};
-		} catch (error) {
-			this.baseline = undefined;
-			this.pendingNotices.push(`[CLM] Could not refresh the mirror: ${describe(error)}`);
-			if (!this.refreshFailing) this.pendingErrors.push(`could not refresh the mirror, edits are off until it can be written: ${describe(error)}`);
-			this.refreshFailing = true;
+		if (snapshot) {
+			try {
+				await this.store.write(snapshot.text);
+				this.refreshFailing = false;
+				this.lastSnapshot = snapshot;
+				this.baseline = {
+					rawMessages: source,
+					effectiveMessages: effective,
+					snapshot,
+					// The fit gate measures the editable context alone; the system prompt, tool
+					// schemas, pinned task and continuity message take their share of budget − reserve first.
+					limit: limit === undefined ? undefined : Math.max(1, limit - scopeTokens - pinnedTokens - continuityTokens),
+				};
+			} catch (error) {
+				this.baseline = undefined;
+				this.pendingNotices.push(`[CLM] Could not refresh the mirror: ${describe(error)}`);
+				if (!this.refreshFailing) this.pendingErrors.push(`could not refresh the mirror, edits are off until it can be written: ${describe(error)}`);
+				this.refreshFailing = true;
+			}
 		}
 
 		const conversationTokens = pinnedTokens + this.estimate(effective) + continuityTokens;
@@ -1344,7 +1378,7 @@ export class ClmSession {
 			}
 			if (tier) {
 				// With the guard off nothing is withheld, so the notice must not describe it.
-				this.pendingNotices.push(budgetNoticeText(reading, tier, this.mirrorPath, this.settings.guard === "off" ? null : limit));
+				this.pendingNotices.push(budgetNoticeText(reading, tier, noticesOnly ? undefined : this.mirrorPath, this.settings.guard === "off" ? null : limit, { noticesOnly }));
 				await this.log({ event: "budget-notice", tier: tier.label, estimated: reading.estimated });
 			}
 			this.lastReading = reading;
@@ -1372,7 +1406,7 @@ export class ClmSession {
 		}
 
 		this.previousRequest = { rawCount: raw.length, conversation: conversationTokens + this.calibrator.apply(this.noticeTokens(notices)) };
-		this.lastRequest = { rawMessages: raw.length, sentMessages: messages.length, mirrorBlocks: snapshot.blocks.length };
+		this.lastRequest = { rawMessages: raw.length, sentMessages: messages.length, mirrorBlocks: snapshot?.blocks.length ?? 0 };
 		if (this.settings.dumpRequests) {
 			const directory = join(this.store.directory, "requests");
 			await mkdir(directory, { recursive: true, mode: 0o700 }).catch(() => undefined);
@@ -1399,7 +1433,8 @@ export class ClmSession {
 			users: raw.filter((message) => message.info.role === "user").length,
 			raw: raw.length,
 			sent: messages.length,
-			blocks: snapshot.blocks.length,
+			blocks: snapshot?.blocks.length ?? 0,
+			...(noticesOnly ? { mode: "notices-only" } : {}),
 			withheld: withheldCount,
 			estimated: reading?.estimated ?? requestTokens,
 			observedPrevious: observed?.tokens,
@@ -1438,7 +1473,10 @@ export class ClmSession {
 			...(changed ? { changed } : {}),
 			...(this.settingsWarning ? { settingsWarning: this.settingsWarning } : {}),
 			sessionID: this.sessionID,
-			mirrorPath: this.mirrorUnavailable === undefined ? this.mirrorPath : `unavailable, requests carry the raw history (${this.mirrorUnavailable})`,
+			mirrorPath: this.mirrorUnavailable !== undefined
+				? `unavailable, requests carry the raw history (${this.mirrorUnavailable})`
+				: this.noticesOnly ? "not used (mode notices-only)" : this.mirrorPath,
+			...(this.noticesOnly ? { mode: "notices-only" as const } : {}),
 			revision: this.state.revision,
 			accepted: this.accepted,
 			rejected: this.rejected,

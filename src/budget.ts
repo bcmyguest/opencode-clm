@@ -250,7 +250,7 @@ export function budgetFitLine(fit: BudgetFit): string {
  * The one-time model notice for a budget that cannot hold OpenCode's fixed overhead plus a
  * working margin. Text written for this package.
  */
-export function budgetTooSmallNoticeText(fit: BudgetFit): string {
+export function budgetTooSmallNoticeText(fit: BudgetFit, options: NoticeOptions = {}): string {
 	const head =
 		`[CLM BUDGET] The configured budget of ${formatTokens(fit.configured)} tokens is too small for this session: ` +
 		`OpenCode's system prompt and tool schemas take about ${formatTokens(fit.overhead ?? 0)} tokens of every request, ` +
@@ -260,7 +260,9 @@ export function budgetTooSmallNoticeText(fit: BudgetFit): string {
 		const raise = fit.raised ? `CLM raised this session's budget to ${formatTokens(fit.effective)} tokens, the most the model window allows, ` : "The model window allows no larger budget, ";
 		return (
 			`${head} ${raise}which still leaves only ${left} tokens for the conversation. ` +
-			"The overflow guard will hold back most tool results: keep the context mirror short and read files in small parts."
+			(options.noticesOnly
+				? "The overflow guard will hold back most tool results: read files in small parts."
+				: "The overflow guard will hold back most tool results: keep the context mirror short and read files in small parts.")
 		);
 	}
 	return (
@@ -432,17 +434,24 @@ export function budgetSummaryLine(reading: BudgetReading): string {
 	return parts.join(" · ");
 }
 
+/** Model-facing notice variants. `noticesOnly`: the session runs `mode notices-only`, so no text may point the model at a mirror. */
+export interface NoticeOptions {
+	noticesOnly?: boolean;
+}
+
 /**
  * The model-facing reminder. States the estimate and the provider count separately, the
  * budget and the tokens left, the mirror path, and, from the third tier up, what the
  * overflow guard does above `overflowLimit` (default budget - reserve). Pass `null` when the
- * guard is off: the notice then leaves the guard out.
+ * guard is off: the notice then leaves the guard out. `noticesOnly` keeps the measurement,
+ * the budget, the tokens left and the guard sentence, and drops every invitation to edit.
  */
 export function budgetNoticeText(
 	reading: BudgetReading,
 	tier: BudgetTier,
 	mirrorPath: string | undefined,
 	overflowLimit: number | null = reading.budget - reading.reserve,
+	options: NoticeOptions = {},
 ): string {
 	const governing = governingTokens(reading);
 	const remaining = Math.max(0, reading.budget - governing);
@@ -456,6 +465,19 @@ export function budgetNoticeText(
 	const overflow = overflowLimit === null
 		? ""
 		: ` Above ${formatTokens(overflowLimit)} tokens the overflow guard holds back the oldest new tool results and saves them to files.`;
+	if (options.noticesOnly) {
+		const fraction = tier.tokens / reading.budget;
+		if (tier.label === "budget-reserve") {
+			return (
+				`[CLM BUDGET] Context is at ${formatTokens(governing)} of a ${formatTokens(reading.budget)}-token budget ` +
+				`(${measurement}). Only ${formatTokens(remaining)} tokens remain, which is inside the ${formatTokens(reading.reserve)}-token generation reserve.${overflow}`
+			);
+		}
+		const base =
+			`[CLM BUDGET] Context crossed ${tier.label} of a ${formatTokens(reading.budget)}-token budget: ${measurement}. ` +
+			`${formatTokens(remaining)} tokens remain; the final reminder comes at ${formatTokens(reading.budget - reading.reserve)} tokens.`;
+		return fraction <= 0.5 ? base : `${base}${overflow}`;
+	}
 	if (tier.label === "budget-reserve") {
 		return (
 			`[CLM BUDGET] Context is at ${formatTokens(governing)} of a ${formatTokens(reading.budget)}-token budget ` +

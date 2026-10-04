@@ -23,7 +23,7 @@ const parse = (name: string, text: string) => settingDescriptor(name)!.parse(tex
 
 describe("settings table", () => {
 	test("names, aliases and case", () => {
-		expect(SETTINGS_TABLE.map((item) => item.name)).toEqual(["editing", "budget", "reserve", "reminders", "reminder-cooldown", "gate", "guard", "compaction", "cap", "steering", "one-tool", "trailer", "compact-prompt", "reasoning"]);
+		expect(SETTINGS_TABLE.map((item) => item.name)).toEqual(["editing", "budget", "reserve", "reminders", "reminder-cooldown", "gate", "guard", "compaction", "cap", "steering", "mode", "one-tool", "trailer", "compact-prompt", "reasoning"]);
 		for (const [alias, key] of [["enabled", "editing"], ["REMIND", "reminders"], ["remind-at", "reminders"], ["overflow", "guard"], ["observation", "cap"], ["observation-cap", "cap"], ["edit-gate", "gate"], ["compactprompt", "compactPrompt"], ["Compact-Prompt", "compactPrompt"]]) {
 			expect(settingDescriptor(alias!)?.key).toBe(key as never);
 		}
@@ -74,6 +74,7 @@ describe("settings table", () => {
 			compaction: "auto",
 			cap: "10k chars (50% head)",
 			steering: "b.md",
+			mode: "edit",
 			"one-tool": "off",
 			trailer: "off",
 			"compact-prompt": "default",

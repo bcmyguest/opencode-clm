@@ -155,14 +155,15 @@ export function sizeLine(latest: Pick<TimelinePoint, "tokens" | "measured" | "es
  * `clm 12k / 32k · r2` (newest size against the budget in force), `clm off · r2`, or
  * undefined before the session has CLM data.
  */
-export function footerText(model: Pick<PanelModel, "found" | "enabled" | "revision" | "timeline" | "budget">): string | undefined {
+export function footerText(model: Pick<PanelModel, "found" | "enabled" | "revision" | "timeline" | "budget"> & Partial<Pick<PanelModel, "noticesOnly">>): string | undefined {
 	if (!model.found) return undefined;
 	if (!model.enabled) return `clm off · r${model.revision}`;
+	const mode = model.noticesOnly ? " notices-only" : "";
 	const latest = model.timeline.points.at(-1);
 	const size = latest === undefined
 		? ""
 		: ` ${latest.measured ? "" : "~"}${formatTokenCount(latest.tokens)}${model.budget !== undefined ? ` / ${formatTokenCount(model.budget)}` : ""}`;
-	return `clm${size} · r${model.revision}`;
+	return `clm${mode}${size} · r${model.revision}`;
 }
 
 /** Key of the settings page's "Reset to defaults" row, and the choice that resets. */
@@ -198,6 +199,11 @@ export function detailLines(
 		lines.push(calibration.samples === 0
 			? "Estimate not calibrated yet (characters ÷ 4 until the provider reports a size)"
 			: `Estimate ×${calibration.factor.toFixed(2)}, calibrated from ${calibration.samples} provider count${calibration.samples === 1 ? "" : "s"}`);
+	}
+	if (effective.settings.mode === "notices-only") {
+		lines.push(effective.editing
+			? "Mode notices-only: budget notices and the guard run; no mirror, the model cannot edit its context"
+			: "Mode notices-only (CLM editing is off, so nothing runs)");
 	}
 	const limit = model.budgetInfo?.limit;
 	lines.push(effective.settings.guard === "off"

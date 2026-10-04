@@ -39,6 +39,12 @@ repairs tool-call pairs, saves the result as a revision, and sends it. The edit 
 shrinks it; the harness only guarantees the request is legal and tells the model how much
 room it has.
 
+`mode notices-only` (`/clm config mode notices-only`, `CLM_MODE`) turns this off for
+benchmark comparisons: no mirror and no protocol prompt, the raw history goes out, and
+everything in the next section still runs, along with the budget reminders, the size
+trailer and the steering document. A revision accepted before is kept and applies again
+after `/clm config mode edit`.
+
 ## What runs without the model
 
 Two things run on their own, because a single turn with many parallel tool calls can

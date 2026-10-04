@@ -48,17 +48,19 @@ options go on the `opencode.json` entry only, and the TUI plugin reads them from
 |---------|--------------|
 | `/clm` | open the panel: **overview** (context size per request + every accepted edit) <br><img src="https://raw.githubusercontent.com/bcmyguest/opencode-clm/main/.github/images/overview.png" alt="The overview page: context size per request, with the requests after which the model edited its context" width="720"> <br> **input** (what the next request contains) · **edits** (per-revision side-by-side diff) <br><img src="https://raw.githubusercontent.com/bcmyguest/opencode-clm/main/.github/images/edits.png" alt="The edits page: a tool result before and after the model shortened it" width="720"> |
 | `/clm overview` / `input` / `edits` / `settings` | open the panel on that page (`timeline` and `edit` also work); without the TUI plugin, print it as text |
-| `/clm status` | a toast: on or off, revision, last request size, budget, fixed overhead, last outcome |
+| `/clm status` | a toast: on or off, revision, last request size, budget, fixed overhead, last outcome; `mode notices-only` when set |
 | `/clm config` | open **settings**; `/clm config <setting> <value>` changes one, `/clm config reset` drops this session's changes <br><img src="https://raw.githubusercontent.com/bcmyguest/opencode-clm/main/.github/images/settings.png" alt="The settings page: sizes, files, and every setting" width="720"> |
 | `/clm-compact [instructions]` | ask the model to compact its own context now; anything you add (e.g. what to keep) is passed along. The result shows on the **edits** page |
 | `/clm on` / `off` / `reset` / `path` | enable, use raw context, discard the accepted revision, show the mirror's path |
 | `/clm budget [value]` | show or change the budget, the same as `/clm config budget`: a share of the model window (default `50%`), tokens (`64k`), or `window` |
+| `/clm config mode notices-only` | keep the budget notices, reminders and overflow guard but take away editing: no mirror, no protocol prompt, raw history. For comparing "telling the model its budget" with "letting it edit"; `/clm config mode edit` switches back |
 
 With the TUI plugin, typed `/clm …` lines run in the TUI and cost no model turn, and Tab
 completes their subcommands, setting names and values;
 `/clm reset` is handed to the server plugin, also without a turn. The right of the
 session prompt shows `clm <size> / <budget> · r<revision>` (`~` before the size marks an
-estimate the provider has not confirmed; `clm off · r<revision>` while CLM is off).
+estimate the provider has not confirmed; `clm off · r<revision>` while CLM is off;
+`clm notices-only <size> / <budget> · r<revision>` in notices-only mode).
 
 In the panel: `1–4` or `Tab` switch pages, `← →` step through the overview's markers or
 the edits page's revisions, `z` zooms the chart, `Enter` opens the selection, `r`
@@ -103,7 +105,7 @@ trained models. Hosted APIs are untested.
 ## Docs
 
 - [How it works](docs/how-it-works.md) — the mirror, what runs without the model, the panel, model and server support, safety.
-- [Configuration](docs/configuration.md) — every setting (editing, budget, reserve, reminders, reminder-cooldown, gate, guard, compaction, cap, steering, one-tool, trailer, compact-prompt, reasoning), plugin options and environment variables.
+- [Configuration](docs/configuration.md) — every setting (editing, budget, reserve, reminders, reminder-cooldown, gate, guard, compaction, cap, steering, mode, one-tool, trailer, compact-prompt, reasoning), plugin options and environment variables.
 - [Architecture](docs/architecture.md) — modules, session files, design notes, known limitations.
 - [Development](docs/development.md) — setup, checks, the integration suites, releasing.
 

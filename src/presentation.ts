@@ -98,6 +98,8 @@ export interface ClmStatus {
 	changed?: string;
 	/** Saved settings that could not be used. */
 	settingsWarning?: string;
+	/** Set in `mode notices-only`; absent in `edit`. */
+	mode?: "notices-only";
 }
 
 /** One line for a toast. */
@@ -105,7 +107,8 @@ export function statusLine(status: ClmStatus): string {
 	const size = status.reading
 		? ` · ${formatTokens(status.reading.estimated)} of ${formatTokens(status.reading.budget)} tok`
 		: "";
-	return `CLM r${status.revision} · ${status.accepted} accepted / ${status.rejected} rejected${size}`;
+	const mode = status.mode ? ` · mode ${status.mode}` : "";
+	return `CLM r${status.revision}${mode} · ${status.accepted} accepted / ${status.rejected} rejected${size}`;
 }
 
 /** Multi-line status for `/clm`. */
@@ -113,6 +116,7 @@ export function statusText(status: ClmStatus): string {
 	const lines = [
 		`CLM status for session ${status.sessionID}`,
 		`mirror: ${status.mirrorPath}`,
+		...(status.mode ? ["mode notices-only: budget notices and the overflow guard run; no mirror and no protocol prompt, so the model cannot edit its context"] : []),
 		`revision ${status.revision} · edits accepted ${status.accepted} · rejected ${status.rejected} · gate ${status.gate} · guard ${status.guard}`,
 		status.reading
 			? `${budgetSummaryLine(status.reading)} · model window ${status.modelWindow ? formatTokens(status.modelWindow) : "unknown"}`
@@ -121,7 +125,9 @@ export function statusText(status: ClmStatus): string {
 	if (status.fit) lines.push(budgetFitLine(status.fit));
 	const checkpoint = status.checkpoint;
 	lines.push(
-		checkpoint
+		checkpoint && status.mode
+			? `revision ${checkpoint.revision} kept but not applied in notices-only mode: the model sees the raw history`
+			: checkpoint
 			? `active revision ${checkpoint.revision}: covers ${checkpoint.anchorCount} raw messages; ~${formatTokens(checkpoint.beforeEstimate)}→${formatTokens(checkpoint.afterEstimate)} tokens when accepted`
 			: "no accepted edit: the model sees the raw history",
 	);

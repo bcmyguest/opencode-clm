@@ -69,7 +69,7 @@ describe("settings view and status", () => {
 		const model = buildPanelModel(files({ events: basicEvents }));
 		const base = { editing: true, settings: resolveSettings({}, {}, "/tmp") };
 		const view = settingsView({ base, effective: base }, model);
-		expect(view.rows.map((row) => row.key)).toEqual(["editing", "budget", "reserve", "reminders", "reminder-cooldown", "gate", "guard", "compaction", "cap", "steering", "one-tool", "trailer", "compact-prompt", "reasoning"]);
+		expect(view.rows.map((row) => row.key)).toEqual(["editing", "budget", "reserve", "reminders", "reminder-cooldown", "gate", "guard", "compaction", "cap", "steering", "mode", "one-tool", "trailer", "compact-prompt", "reasoning"]);
 		expect(view.rows[0]).toMatchObject({ value: "on", choices: ["on", "off"] });
 		expect(view.rows[1]?.placeholder).toBeDefined();
 		expect(view.summary.at(-1)).toMatch(/^Files mirror /);

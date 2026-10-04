@@ -47,6 +47,22 @@ export interface ClmSettings {
 	oneTool: boolean;
 	/** Append `[context: ~N of B tokens after this result]` to tool results (paper-harness parity). */
 	trailer: boolean;
+	/**
+	 * `edit`: the model edits its context through the mirror. `notices-only`: no mirror, no
+	 * protocol prompt and no edits; budget notices, reminders, the guard, the cap and the
+	 * trailer still apply (to compare telling the model its budget with letting it edit).
+	 */
+	mode: ClmMode;
+}
+
+export type ClmMode = "edit" | "notices-only";
+
+/** `edit`, `notices-only`, or `notices` (an alias of `notices-only`). */
+export function parseMode(value: unknown, name = "mode"): ClmMode {
+	const text = String(value).trim().toLowerCase();
+	if (text === "edit") return "edit";
+	if (text === "notices-only" || text === "notices") return "notices-only";
+	throw new Error(`${name} must be edit or notices-only, got ${JSON.stringify(value)}`);
 }
 
 export type CompactionMode = "auto" | "off" | "on";
@@ -191,6 +207,7 @@ export function resolveSettings(options: Record<string, unknown> = {}, env: Env 
 	const compactionRaw = pick(options, "compaction", env, "CLM_NATIVE_COMPACTION");
 	const oneToolRaw = pick(options, "oneTool", env, "CLM_ONE_TOOL_PER_TURN");
 	const trailerRaw = pick(options, "trailer", env, "CLM_SIZE_TRAILER");
+	const modeRaw = pick(options, "mode", env, "CLM_MODE");
 
 	const overrides: Partial<BudgetPolicyConfig> = {};
 	if (budgetRaw !== undefined) {
@@ -262,5 +279,6 @@ export function resolveSettings(options: Record<string, unknown> = {}, env: Env 
 		compaction: compactionRaw === undefined ? "auto" : parseCompaction(compactionRaw),
 		oneTool: oneToolRaw === undefined ? false : parseFlag(oneToolRaw, "oneTool"),
 		trailer: trailerRaw === undefined ? false : parseFlag(trailerRaw, "trailer"),
+		mode: modeRaw === undefined ? "edit" : parseMode(modeRaw),
 	};
 }

@@ -35,15 +35,20 @@ export function applyCompactionMode(config: { compaction?: { auto?: boolean } },
 }
 
 /** Toast after OpenCode compacted a session on its own. */
-export function nativeCompactionText(overflow: boolean, mode: CompactionMode): string {
+export function nativeCompactionText(overflow: boolean, mode: CompactionMode, noticesOnly = false): string {
 	const why = overflow ? "after the provider reported a context overflow" : "at its token threshold";
-	const hint = mode === "off" ? "" : " Set /clm config compaction off to keep the model's own edits instead.";
+	// In notices-only the model makes no edits a compaction could replace.
+	const hint = mode === "off" || noticesOnly ? "" : " Set /clm config compaction off to keep the model's own edits instead.";
 	return `OpenCode compacted this session ${why}; CLM continues from the summary.${hint}`;
 }
 
 /** Model notice when a provider overflow was not compacted because `compaction.auto` was false. */
-export function overflowNotCompactedText(mirrorPath: string): string {
-	return `[CLM] The provider rejected the last request as too long, and OpenCode's automatic compaction is off, so nothing was compacted. Shrink the context by editing ${mirrorPath}, or ask the user to run /compact.`;
+export function overflowNotCompactedText(mirrorPath: string | undefined): string {
+	const head = "[CLM] The provider rejected the last request as too long, and OpenCode's automatic compaction is off, so nothing was compacted.";
+	// undefined: `mode notices-only`, no mirror to edit.
+	return mirrorPath === undefined
+		? `${head} Ask the user to run /compact.`
+		: `${head} Shrink the context by editing ${mirrorPath}, or ask the user to run /compact.`;
 }
 
 /**
@@ -214,8 +219,11 @@ export function thresholdPausedText(count: number, usable: number, guardLimit: n
 }
 
 /** Model notice when `off` cancelled a threshold compaction (pi: notice and toast). */
-export function thresholdCancelledNoticeText(mirrorPath: string): string {
-	return `[CLM] OpenCode's automatic compaction (threshold) was cancelled: CLM manages this context. Free space by editing ${mirrorPath}.`;
+export function thresholdCancelledNoticeText(mirrorPath: string | undefined): string {
+	// undefined: `mode notices-only`, no mirror to edit.
+	return mirrorPath === undefined
+		? "[CLM] OpenCode's automatic compaction (threshold) was cancelled: CLM's compaction setting is off."
+		: `[CLM] OpenCode's automatic compaction (threshold) was cancelled: CLM manages this context. Free space by editing ${mirrorPath}.`;
 }
 
 /** Toast when `off` cancelled a threshold compaction. */

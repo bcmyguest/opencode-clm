@@ -35,6 +35,7 @@ Values keep their case (paths), names do not. Relative paths resolve against the
 | `compaction`     | OpenCode's automatic compaction: `off` turns it off; `auto` pauses it while the guard enforces a budget; `on` keeps your `compaction.auto` (see Notes) | `auto`, `off`, `on`                                       | `auto`      |
 | `cap`            | max characters kept per tool result (head + tail), at least 200                                          | `10k`, `10000`, `10k:0.5` (head fraction), `off`              | off         |
 | `steering`       | markdown file with your context-management strategy, appended to the system prompt                      | `house` (the bundled `steering/house-brief.md`), a path, `none` | none      |
+| `mode`           | `edit`: the model edits its context through the mirror; `notices-only`: budget notices and the guard without a mirror or edits (see Notes) | `edit`, `notices-only` (alias `notices`) | `edit` |
 | `one-tool`       | run only the first tool call of each model response; later ones fail with a note to repeat them          | `on`, `off`                                                   | `off`       |
 | `trailer`        | end each successful tool result with `[context: ~N of B tokens after this result]`                      | `on`, `off`                                                   | `off`       |
 | `compact-prompt` | markdown template `/clm-compact` sends instead of the built-in prompt                                    | a path, `default`                                             | built in    |
@@ -59,6 +60,7 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
 | `compaction`     | `CLM_NATIVE_COMPACTION` | `auto`, `off` or `on`                                                                              | `compaction`     |
 | `oneTool`        | `CLM_ONE_TOOL_PER_TURN` | a flag (default off)                                                                               | `one-tool`       |
 | `trailer`        | `CLM_SIZE_TRAILER`    | a flag (default off)                                                                                 | `trailer`        |
+| `mode`           | `CLM_MODE`            | `edit` (default) or `notices-only`; `notices` is accepted for `notices-only`                         | `mode`           |
 | `observationCap` | `CLM_OBSERVATION_CAP` | a number of characters, e.g. `10000` (no `k`), or `10000:0.5` with the head fraction (default 0.8); `off` or `0` | `cap` |
 | `steering`       | `CLM_STEERING`        | a path to a markdown file, or `house`; `none` or `off`                                               | `steering`       |
 | `compactPrompt`  | `CLM_COMPACT_PROMPT`  | a path to a markdown template; `default`, `none` or `off` for the built-in prompt                    | `compact-prompt` |
@@ -90,6 +92,23 @@ plugin from loading, with a message naming the setting. Flags accept `true`/`fal
   skipped, not saved for later. The budget − reserve reminder always fires. A later edit
   restarts the cooldown; changing the budget, reserve or reminders, `/clm reset`, a
   restored or dropped revision, and turning editing off or on clear it.
+- **Notices-only mode.** `mode notices-only` exists to measure what budget notices achieve
+  without editing: everything runs as in `edit` except the mirror. No `LIVE_CONTEXT.md` is
+  written, the system prompt carries no protocol section, and no edit is validated or
+  applied (a bash command that writes an old mirror gets no receipt). Requests carry the
+  raw history. These still run as in `edit`: the budget and its too-small check, the
+  `[CLM BUDGET]` reminders (worded without any invitation to edit), the overflow guard,
+  the observation cap, the size trailer, `one-tool`, the `compaction` setting, the
+  steering document, and the continuity annotations with `clm_annotate` and `clm_recall`.
+  `clm_annotate create` needs a block id from the mirror, so it fails; listing, resolving
+  and recalling existing annotations work. `/clm-compact` refuses. A revision accepted
+  earlier in `edit` stays in `state.json` but is not applied; switching back to `edit`
+  applies it again while it still matches the history (otherwise the usual restore or
+  reset follows). `/clm status`, the footer and the panel show `notices-only`.
+  `editing off` still bypasses CLM entirely, in either mode. The `clm-context` skill is
+  registered at load, not per session, so a notices-only session still lists it (its
+  description invites mirror edits on a `[CLM BUDGET]` note); set the `skill` option to
+  `false` to keep it out of a benchmark.
 - **Calibration.** Sizes are estimated at four characters per token, then corrected with
   the provider's own count of each request. Dense content (code, random strings) can be
   twice as many tokens as the estimate; for a run that starts with such data,

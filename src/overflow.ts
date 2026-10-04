@@ -195,7 +195,8 @@ export function applyOverflowGuard(messages: LiveContextMessage[], options: Appl
 	return { messages: current, withheld, estimated };
 }
 
-export function overflowNoticeText(result: OverflowGuardResult, limit: number): string {
+/** `noticesOnly` (`mode notices-only`): no mirror, so the text names no edit. */
+export function overflowNoticeText(result: OverflowGuardResult, limit: number, options: { noticesOnly?: boolean } = {}): string {
 	const count = result.withheld.length;
 	const files = result.withheld.filter((record) => record.file).length;
 	const list = result.withheld
@@ -205,8 +206,10 @@ export function overflowNoticeText(result: OverflowGuardResult, limit: number): 
 	return (
 		`[CLM BUDGET] Overflow guard: the request would have exceeded the limit of ${limit.toLocaleString("en-US")} tokens, so ${count} tool result${count === 1 ? "" : "s"} ` +
 		`${count === 1 ? "was" : "were"} withheld from your context and replaced by notes${files > 0 ? " with file paths" : ""}: ${list}. ` +
-		`Estimated request is now ${result.estimated.toLocaleString("en-US")} tokens${fits ? "" : " and still over the limit; edit your context now"}. ` +
+		`Estimated request is now ${result.estimated.toLocaleString("en-US")} tokens${fits ? "" : options.noticesOnly ? " and still over the limit" : " and still over the limit; edit your context now"}. ` +
 		"Nothing was re-run; the full outputs are in the files named in the notes and in the session history. " +
-		"Free space by editing the context mirror, then re-read only the parts you need, e.g. with sed -n or grep."
+		(options.noticesOnly
+			? "Re-read only the parts you need, e.g. with sed -n or grep."
+			: "Free space by editing the context mirror, then re-read only the parts you need, e.g. with sed -n or grep.")
 	);
 }
