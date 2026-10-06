@@ -89,6 +89,11 @@ config directory. `SHOTS_DEBUG=1` also writes each screen's text to `/tmp/shot-<
 `bun test`, `npm pack --dry-run`, `scripts/smoke.sh --strict` and `bun run test:e2e`
 against `opencode-ai@1.18.34`. `codeql.yml` runs CodeQL.
 
+`skills/sync-pi-clm/SKILL.md` describes upstream syncs. The local weekly timer runs
+the ChatGPT-signed-in Codex CLI with `gpt-6-luna` against that skill and leaves a
+tested local branch. The timer and its runner are installed under the user's home
+directory, outside this repository. Review and merge the branch before the next sync.
+
 ## Commits
 
 Commit messages follow [Conventional Commits](https://www.conventionalcommits.org)
