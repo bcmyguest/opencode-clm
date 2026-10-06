@@ -109,13 +109,6 @@ trained models. Hosted APIs are untested.
 - [Architecture](docs/architecture.md) — modules, session files, design notes, known limitations.
 - [Development](docs/development.md) — setup, checks, the integration suites, releasing.
 
-## Upstream sync
-
-The [sync skill](skills/sync-pi-clm/SKILL.md) guides updates from pi-clm and records
-the last incorporated upstream commit. A local weekly job runs the skill through the
-ChatGPT-signed-in Codex CLI with `gpt-6-luna`; it leaves a tested branch for review.
-`PORTING.md` records intentional differences.
-
 ## Citation
 
 If you use opencode-clm in your research, please cite
