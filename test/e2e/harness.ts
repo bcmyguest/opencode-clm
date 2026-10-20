@@ -18,7 +18,7 @@ import { MODEL_ID, startMockServer, textOf, type ChatMessage, type MockServer, t
 export const ENABLED = process.env.OPENCODE_CLM_E2E === "1";
 export const OPENCODE = process.env.OPENCODE_BIN ?? "opencode";
 export const PLUGIN = `file://${resolve(import.meta.dir, "../../index.ts")}`;
-export const SKILLS_DIR = resolve(import.meta.dir, "../../skills");
+export const SKILLS_DIR = resolve(import.meta.dir, "../../.agents/skills/clm-context");
 export const RUN_TIMEOUT_MS = 150_000;
 /** Per-test timeout for cases with up to two opencode runs. */
 export const CASE_TIMEOUT_MS = 2 * RUN_TIMEOUT_MS + 30_000;

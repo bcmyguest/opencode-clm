@@ -111,6 +111,15 @@ describe("flatten", () => {
 		// The digest input never depends on the view.
 		expect(digestSourcePrefix(flatten([message, only]))).toBe(digestSourcePrefix(flat));
 	});
+
+	test("flat messages carry the write marker: updated, else completed, else created", () => {
+		const raw = conversation();
+		raw[0]!.info.time = { created: 111, updated: 222 };
+		const flat = flatten(raw);
+		expect(flat.find((message) => message.ocMessageID === "msg_u1")!.updatedAt).toBe(222);
+		// The assistant fixture has completed=3, which wins over created=2.
+		expect(flat.find((message) => message.ocMessageID === "msg_a1")!.updatedAt).toBe(3);
+	});
 });
 
 describe("unflatten", () => {
