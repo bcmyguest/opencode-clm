@@ -22,7 +22,7 @@ Derived from pi-clm (code and model-facing text, adapted for OpenCode):
   src/steering.ts               src/steering.ts
   src/types.ts                  src/types.ts
   steering/house-brief.md       steering/house-brief.md (byte-identical copy)
-  skills/clm-context/SKILL.md   src/skills/live-context/SKILL.md
+  .agents/skills/clm-context/SKILL.md   src/skills/live-context/SKILL.md
   src/panel/timeline.ts         src/timeline.ts (context chart and its zoom levels)
   src/panel/diff.ts             src/diff.ts (side-by-side diff)
   src/panel/view.ts             src/viewer.ts (panel pages)
@@ -45,5 +45,5 @@ Context Language Models
   Two design choices follow its harness: the fit/shrink edit gate and the default
   25/50/75% reminder steps. pi-clm's skill guidance on edit cost (batch edits, mind the
   tail below an edit, write detailed summaries), carried into
-  skills/clm-context/SKILL.md, covers the same points as the harness prompt in
+  .agents/skills/clm-context/SKILL.md, covers the same points as the harness prompt in
   different words.

@@ -109,7 +109,7 @@ describe("resolveSettings", () => {
 
 	test("package directories resolve relative to the module", () => {
 		expect(PACKAGE_DIR).toBe(join(import.meta.dir, ".."));
-		expect(SKILLS_DIR).toBe(join(PACKAGE_DIR, "skills"));
+		expect(SKILLS_DIR).toBe(join(PACKAGE_DIR, ".agents/skills/clm-context"));
 		expect(HOUSE_STEERING).toBe(join(PACKAGE_DIR, "steering", "house-brief.md"));
 	});
 });

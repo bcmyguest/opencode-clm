@@ -20,9 +20,26 @@ body = """
 {%- endif %}
 {%- endfor %}
 {% endfor %}
+{% if github.contributors -%}
+{%- set_global thanks_sep = "" -%}
+Thanks{% for contributor in github.contributors | sort(attribute="username") -%}
+{%- if contributor.username != "bcmyguest" -%}
+{{- thanks_sep }} @{{ contributor.username -}}
+{%- set_global thanks_sep = "," -%}
+{%- endif -%}
+{%- endfor -%}
+{% endif %}
 """
 trim = true
 footer = ""
+# Omit "Thanks" when every contributor in the range is excluded (maintainer only).
+postprocessors = [
+  { pattern = "\\n+Thanks\\s*$", replace = "" },
+]
+
+[remote.github]
+owner = "bcmyguest"
+repo = "opencode-clm"
 
 [git]
 conventional_commits = true
