@@ -75,7 +75,7 @@ export function parseCompaction(value: unknown, name = "compaction"): Compaction
 
 export const PACKAGE_DIR = resolve(fileURLToPath(new URL("..", import.meta.url)));
 export const HOUSE_STEERING = join(PACKAGE_DIR, "steering", "house-brief.md");
-export const SKILLS_DIR = join(PACKAGE_DIR, "skills");
+export const SKILLS_DIR = join(PACKAGE_DIR, ".agents/skills/clm-context");
 
 type Env = Record<string, string | undefined>;
 

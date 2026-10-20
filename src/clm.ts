@@ -38,7 +38,6 @@
  * calibrator learns only from requests whose full scope (system prompt and tool schemas
  * included) was estimated; without those sizes it stays at 1.
  */
-import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -261,11 +260,6 @@ export class ClmSession {
 	private pendingAlerts: string[] = [];
 	/** The settings warning last shown to the user, so a new or changed one toasts once. */
 	private shownSettingsWarning?: string;
-	/**
-	 * Per-process seed of the stable document id. Fresh on every open, so a document id never
-	 * repeats even when a corrupt state file resets the revision counter to 0.
-	 */
-	private readonly nonce = randomUUID();
 	private readonly tokenCache = new WeakMap<LiveContextMessage, number>();
 	private saving: Promise<void> = Promise.resolve();
 	private running: Promise<unknown> = Promise.resolve();
@@ -1264,6 +1258,24 @@ export class ClmSession {
 		} else if (this.state.checkpoint) {
 			this.invalidationStreak = 0;
 		}
+		if (projection.valid && projection.reanchor) {
+			// OpenCode rewrote messages of the current turn after the checkpoint was captured
+			// (an assistant message still being finalized). Trim the anchor to the stable head
+			// instead of dropping the revision: the trimmed tail becomes ordinary suffix,
+			// exactly as if the edit had been committed a moment later. Silent by design;
+			// `reanchored` in events.jsonl records it for the panel and for debugging.
+			this.invalidationStreak = 0;
+			const reanchor = projection.reanchor;
+			const revision = this.state.revision;
+			await this.updateState(
+				(state) =>
+					state.checkpoint && state.revision === revision
+						? { ...state, checkpoint: { ...state.checkpoint, ...reanchor } }
+						: state,
+				true,
+			).catch(() => undefined);
+			await this.log({ event: "reanchored", revision, sourceMessageCount: reanchor.sourceMessageCount });
+		}
 		const origin = this.forkOrigin;
 		this.forkOrigin = undefined;
 		if (origin && !noticesOnly && !this.state.checkpoint && this.state.revision === 0 && (await this.restoreFromFork(origin, source))) {
@@ -1331,9 +1343,10 @@ export class ClmSession {
 		const snapshot = noticesOnly ? undefined : renderContextDocument(effective, {
 			revision: this.state.revision,
 			protectedIndexes: new Set<number>(),
-			// Constant until the next accepted edit or reset, so header ids read on one call
-			// remain valid on the next; bodies are escaped accordingly.
-			documentSeed: `${this.sessionID}:${this.nonce}:${checkpoint?.sourceDigest ?? "raw"}`,
+			// Constant until the next accepted edit or reset — and across process restarts,
+			// as pi-clm's is — so header ids read on one call remain valid on the next;
+			// bodies are escaped accordingly.
+			documentSeed: `${this.sessionID}:${checkpoint?.sourceDigest ?? "raw"}`,
 		});
 		if (snapshot) {
 			try {
