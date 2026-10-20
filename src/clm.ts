@@ -175,11 +175,14 @@ export function lastProviderReported(raw: readonly OcMessage[]): ObservedRequest
 	return undefined;
 }
 
-/** Id of the newest compaction summary (an assistant message with `summary` set). */
+/**
+ * Id of the newest compaction summary: an OpenCode 1 assistant message with `summary` set,
+ * or the OpenCode 2 checkpoint user message src/opencode-v2.ts marks the same way.
+ */
 export function compactionSummaryId(raw: readonly OcMessage[]): string | undefined {
 	for (let index = raw.length - 1; index >= 0; index--) {
 		const info = raw[index]!.info;
-		if (info.role === "assistant" && info.summary && !info.error) return info.id;
+		if (info.summary && !info.error) return info.id;
 	}
 	return undefined;
 }
@@ -219,6 +222,16 @@ export class ClmSession {
 	 * `experimental.compaction.autocontinue` hook); the next transform rebases onto the summary.
 	 */
 	compacted = false;
+	/** OpenCode's newest compaction of this session in this process (`/clm status`). */
+	lastCompaction?: { reason: "auto" | "manual"; at: number };
+	/**
+	 * Records a compaction OpenCode made (automatic: its threshold or a provider overflow;
+	 * manual: `/compact`) for `/clm status` and events.jsonl.
+	 */
+	async noteCompaction(reason: "auto" | "manual", at = Date.now()): Promise<void> {
+		this.lastCompaction = { reason, at };
+		await this.log({ event: "opencode-compaction", reason });
+	}
 	/**
 	 * Set by the plugin when OpenCode's session metadata names another session as the origin
 	 * (a fork, `Session.fork` copies metadata). The first transform restores the newest of the
@@ -1507,6 +1520,7 @@ export class ClmSession {
 				}
 				: undefined,
 			lastRequest: this.lastRequest,
+			...(this.lastCompaction ? { lastCompaction: this.lastCompaction } : {}),
 			steering,
 		};
 	}
