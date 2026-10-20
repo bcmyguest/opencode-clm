@@ -113,7 +113,7 @@ PACK_JSON=$TMP/pack.json
 if node -e '
 	const [p] = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 	const files = p.files.map((f) => f.path).sort();
-	const required = ["index.ts", "tui.ts", "skills/clm-context/SKILL.md", "steering/house-brief.md", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "package.json"];
+	const required = ["index.ts", "tui.ts", ".agents/skills/clm-context/SKILL.md", "steering/house-brief.md", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "package.json"];
 	const isSrc = (f) => /^src\/(panel\/|tui\/)?[^/]+\.ts$/.test(f) && !/\.test\.ts$/.test(f);
 	const bad = required.filter((f) => !files.includes(f)).map((f) => `missing ${f}`);
 	for (const dir of ["src/", "src/panel/", "src/tui/"]) if (!files.some((f) => isSrc(f) && f.startsWith(dir) && !f.slice(dir.length).includes("/"))) bad.push(`missing ${dir}*.ts`);
@@ -126,7 +126,7 @@ if node -e '
 
 echo "== 2. plugin load from file://$REPO/index.ts"
 load_plugin "$TMP/repo" "file://$REPO/index.ts"
-check_loaded "$TMP/repo" "$REPO/skills" "file://$REPO/index.ts"
+check_loaded "$TMP/repo" "$REPO/.agents/skills/clm-context" "file://$REPO/index.ts"
 
 echo "== 3. @opencode-ai/plugin resolution (regular dependency)"
 if v=$(node -p 'require(process.argv[1]).version' "$REPO/node_modules/@opencode-ai/plugin/package.json" 2> /dev/null); then
@@ -145,7 +145,7 @@ echo "-- 3a. extracted tarball, no node_modules (dependency absent)"
 BARE=$TMP/bare/node_modules/opencode-clm
 mkdir -p "$BARE" && tar -xzf "$TGZ" -C "$BARE" --strip-components=1
 load_plugin "$TMP/bare" "file://$BARE/index.ts"
-check_registrations "$TMP/bare" "$BARE/skills" "file://$BARE/index.ts" absent
+check_registrations "$TMP/bare" "$BARE/.agents/skills/clm-context" "file://$BARE/index.ts" absent
 
 echo "-- 3b. npm install --offline of the tarball"
 mkdir -p "$TMP/inst" && echo '{"private":true}' > "$TMP/inst/package.json"
@@ -155,7 +155,7 @@ if (cd "$TMP/inst" && HOME="$TMP/inst-home" npm_config_cache="$NPM_CACHE" \
 	pass "npm install --offline (@opencode-ai/plugin: $dep)"
 	SPEC="file://$TMP/inst/node_modules/opencode-clm/index.ts"
 	load_plugin "$TMP/inst" "$SPEC"
-	check_loaded "$TMP/inst" "$TMP/inst/node_modules/opencode-clm/skills" "$SPEC"
+	check_loaded "$TMP/inst" "$TMP/inst/node_modules/opencode-clm/.agents/skills/clm-context" "$SPEC"
 else
 	skip 6 "npm install --offline failed (npm cache lacks a package?):"; tail -3 "$TMP/npm.log"
 fi
@@ -166,7 +166,7 @@ load_plugin "$TMP/ocinst" "$SPEC"
 PKGDIR=$(find "$TMP/ocinst/cache/opencode/packages" -type d -path '*/node_modules/opencode-clm' 2> /dev/null | head -1 || true)
 if [[ -n $PKGDIR ]]; then
 	if [[ -e $(dirname "$PKGDIR")/@opencode-ai/plugin/package.json ]]; then pass "opencode installed @opencode-ai/plugin beside the plugin"; else fail "opencode did not install @opencode-ai/plugin"; fi
-	check_loaded "$TMP/ocinst" "$PKGDIR/skills" "$SPEC"
+	check_loaded "$TMP/ocinst" "$PKGDIR/.agents/skills/clm-context" "$SPEC"
 else
 	skip 6 "opencode did not install the tarball (offline npm cache miss?)"
 fi

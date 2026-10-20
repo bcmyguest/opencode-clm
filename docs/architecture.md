@@ -518,7 +518,7 @@ src/commands.ts              command names and templates shared by server and TU
 src/session-files.ts         read-only access to a session directory
 src/panel/                   pure panel code: model, timeline, diff, view, keys, command parser
 src/tui/                     opentui adapter, route, Enter intercept, Tab completion, host data
-skills/clm-context/          editing recipes, registered as an OpenCode skill
+.agents/skills/clm-context/  editing recipes, registered as an OpenCode skill
 test/                        unit tests; test/e2e/ drives a real OpenCode against a mock provider
 ```
 

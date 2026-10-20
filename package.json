@@ -31,7 +31,7 @@
     "index.ts",
     "tui.ts",
     "src/**/*.ts",
-    "skills/**",
+    ".agents/skills/clm-context/**",
     "steering/**",
     "LICENSE",
     "NOTICE",

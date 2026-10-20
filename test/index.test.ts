@@ -13,7 +13,7 @@ import { SKILLS_DIR } from "../src/settings.ts";
 import { assistant, conversation, SESSION, tempDir, toolOutput, user } from "./fixtures.ts";
 import { replaceBody } from "./helpers.ts";
 
-const SKILL_FILE = join(SKILLS_DIR, "clm-context", "SKILL.md");
+const SKILL_FILE = join(SKILLS_DIR, "SKILL.md");
 
 interface Harness {
 	hooks: Hooks;
@@ -361,7 +361,7 @@ describe("tool.definition", () => {
 	});
 });
 
-describe("skills/clm-context/SKILL.md", () => {
+describe(".agents/skills/clm-context/SKILL.md", () => {
 	const skill = readFileSync(SKILL_FILE, "utf8");
 
 	test("front matter names the skill and its trigger", () => {
