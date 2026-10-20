@@ -85,6 +85,11 @@ describe("state validation", () => {
 		expect(isProjectionCheckpoint(checkpoint())).toBe(true);
 	});
 
+	test("accepts a checkpoint without per-message stamps (an older version)", () => {
+		const { sourceStamps: _stamps, ...older } = checkpoint();
+		expect(isProjectionCheckpoint(older)).toBe(true);
+	});
+
 	test.each([
 		["missing version", { enabled: true, revision: 0 }],
 		["foreign version", { version: 2, enabled: true, revision: 0 }],
@@ -114,6 +119,10 @@ describe("state validation", () => {
 		["missing sourceIds", { sourceIds: undefined }],
 		["sourceIds length unlike count", { sourceIds: ["msg_1"] }],
 		["non-string source id", { sourceIds: ["msg_1", 2] }],
+		["stamps length unlike count", { sourceStamps: [{ digest: "a".repeat(64), updatedAt: 1 }] }],
+		["stamp digest not hex", { sourceStamps: [{ digest: "nope", updatedAt: 1 }, { digest: "a".repeat(64), updatedAt: 1 }] }],
+		["stamp updatedAt not finite", { sourceStamps: [{ digest: "a".repeat(64), updatedAt: "now" }, { digest: "a".repeat(64), updatedAt: 1 }] }],
+		["stamp strippedDigest not hex", { sourceStamps: [{ digest: "a".repeat(64), updatedAt: 1, strippedDigest: "nope" }, { digest: "a".repeat(64), updatedAt: 1 }] }],
 		["numeric content", { projectedMessages: [{ role: "user", content: 5 }, { role: "user", content: "x" }] }],
 		["untyped content part", { projectedMessages: [{ role: "user", content: [{ text: "x" }] }, { role: "user", content: "x" }] }],
 	])("rejects a checkpoint with %s", (_name, patch) => {
@@ -254,6 +263,47 @@ describe("budgetCheck", () => {
 		expect(loaded.state).toEqual(state);
 		expect(loaded.warning).toBeUndefined();
 		expect(loaded.repaired).toContain("invalid budgetCheck");
+		await rm(directory, { recursive: true, force: true });
+	});
+
+	test("malformed sourceStamps are dropped; the rest of the state is kept", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "clm-state-"));
+		const state = applied(3);
+		const broken = structuredClone(state);
+		broken.checkpoint!.sourceStamps = [{ digest: "nope", updatedAt: 1 }];
+		await writeFile(join(directory, STATE_FILE), JSON.stringify(broken));
+		const loaded = await loadLiveContextState(directory);
+		const expected = structuredClone(state);
+		delete expected.checkpoint!.sourceStamps;
+		expect(loaded.state).toEqual(expected);
+		expect(loaded.warning).toBeUndefined();
+		expect(loaded.repaired).toContain("invalid sourceStamps");
+		await rm(directory, { recursive: true, force: true });
+	});
+
+	test("a malformed lastOutcome is dropped; the checkpoint is kept", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "clm-state-"));
+		const state = applied(4);
+		const broken = structuredClone(state);
+		broken.lastOutcome = { ...state.lastOutcome!, message: 42 as unknown as string };
+		await writeFile(join(directory, STATE_FILE), JSON.stringify(broken));
+		const loaded = await loadLiveContextState(directory);
+		const expected = structuredClone(state);
+		delete expected.lastOutcome;
+		expect(loaded.state).toEqual(expected);
+		expect(loaded.warning).toBeUndefined();
+		expect(loaded.repaired).toContain("invalid lastOutcome");
+		await rm(directory, { recursive: true, force: true });
+	});
+
+	test("the clean-start warning names the failing field", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "clm-state-"));
+		const broken = applied(4);
+		broken.revision = 5;
+		await writeFile(join(directory, STATE_FILE), JSON.stringify(broken));
+		const loaded = await loadLiveContextState(directory);
+		expect(loaded.state).toEqual(initialLiveContextState());
+		expect(loaded.warning).toContain("checkpoint revision does not match the state revision");
 		await rm(directory, { recursive: true, force: true });
 	});
 });

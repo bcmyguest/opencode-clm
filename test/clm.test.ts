@@ -379,7 +379,7 @@ describe("estimates and persistence", () => {
 		expect(loaded.state.revision).toBe(1);
 	});
 
-	test("the document id does not repeat after a corrupt state file resets the revision", async () => {
+	test("the document id stays stable after a corrupt state file resets the revision", async () => {
 		const project = settings();
 		const clm = await ClmSession.open(SESSION, project);
 		await clm.transform(conversation());
@@ -389,7 +389,7 @@ describe("estimates and persistence", () => {
 		expect(reopened.loadWarning).toContain("not valid JSON");
 		await reopened.transform(conversation());
 		expect(reopened.lastSnapshot!.revision).toBe(0);
-		expect(reopened.lastSnapshot!.documentId).not.toBe(firstId);
+		expect(reopened.lastSnapshot!.documentId).toBe(firstId);
 	});
 
 	test("status reflects the session", async () => {
