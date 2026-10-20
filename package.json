@@ -52,7 +52,7 @@
     "test:e2e": "OPENCODE_CLM_E2E=1 bun test test/e2e"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.34"
+    "@opencode-ai/plugin": "^1.19.3"
   },
   "peerDependencies": {
     "@opentui/core": ">=0.4.5"
