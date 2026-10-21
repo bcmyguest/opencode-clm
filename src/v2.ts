@@ -13,8 +13,9 @@
  *   compaction's own messages transform: the pending edit is committed, the accepted revision
  *   applied to the history being summarized, and the annotations go in as a system part.
  * - Commands registered through `command.transform` run plugin code instead of sending a
- *   template, so `/clm` costs no model turn: its text is posted with `session.synthetic`
- *   and `resume: false` (queued in the session's inbox and delivered with the next turn).
+ *   template. Their text is posted with `session.synthetic` and `resume: true`: delivered at
+ *   once, steered into a running turn, or waking an idle session (one model turn, as
+ *   OpenCode 1's relay had it). `resume: false` would defer the reply to the next turn.
  * - `tool.hook("execute.after")` replaces `tool.execute.after`.
  * - Events come from `event.subscribe`: `session.step.ended` carries the provider's token
  *   count (OpenCode 1 kept it on the message), `session.compaction.ended` marks a compaction.
@@ -326,11 +327,12 @@ export async function setup(ctx: V2Context): Promise<(() => void) | void> {
 	});
 
 	/**
-	 * Posts `text` to the session without starting a model turn; it is delivered with the next
-	 * one, and the model reads it then, as OpenCode 1's `/clm` relay has it read.
+	 * Posts `text` to the session at once: steered into a running turn, or waking an idle
+	 * session (one model turn, as OpenCode 1's `/clm` relay had it read). `resume: false`
+	 * would defer the reply to the next turn instead.
 	 */
 	const display = async (sessionID: string, text: string) => {
-		await ctx.session.synthetic({ sessionID, text, resume: false });
+		await ctx.session.synthetic({ sessionID, text, resume: true });
 	};
 
 	if (settings.commands) {
