@@ -225,12 +225,12 @@ describe("context hook", () => {
 });
 
 describe("commands", () => {
-	test("/clm posts its text without starting a model turn", async () => {
+	test("/clm posts its text and resumes the session", async () => {
 		const h = await load();
 		await request(h, conversation());
 		await h.commands.get(STATUS_COMMAND)!.execute({ sessionID: SESSION, prompt: { text: "path" }, delivery: "steer" });
 		expect(h.synthetic).toHaveLength(1);
-		expect(h.synthetic[0]).toMatchObject({ sessionID: SESSION, resume: false });
+		expect(h.synthetic[0]).toMatchObject({ sessionID: SESSION, resume: true });
 		expect(h.synthetic[0]!.text).toContain("CLM mirror:");
 		expect(h.prompts).toHaveLength(0);
 	});
