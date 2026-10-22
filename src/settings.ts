@@ -168,7 +168,9 @@ export function parseCooldown(value: unknown, name = "reminderCooldown"): number
 	if (text === "off" || text === "none" || text === "0" || text === "0%") return 0;
 	const percent = text.endsWith("%");
 	const number = percent ? text.slice(0, -1).trim() : text;
-	const parsed = /^\d*\.?\d+$/.test(number) ? Number(number) / (percent ? 100 : 1) : Number.NaN;
+	// Bounded, and unambiguous: `\d*\.?\d+` backtracks polynomially on a long digit string (CodeQL).
+	const parsed =
+		number.length <= 32 && /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(number) ? Number(number) / (percent ? 100 : 1) : Number.NaN;
 	if (!(parsed > 0 && parsed < 1)) throw new Error(`${name} must be ${COOLDOWN_FORMS}, got ${JSON.stringify(value)}`);
 	return parsed;
 }
