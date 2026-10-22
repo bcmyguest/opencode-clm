@@ -93,6 +93,8 @@ export interface ClmStatus {
 	/** The accepted revision now in effect, if any. */
 	checkpoint?: { revision: number; anchorCount: number; beforeEstimate: number; afterEstimate: number };
 	lastRequest?: { rawMessages: number; sentMessages: number; mirrorBlocks: number };
+	/** OpenCode's newest compaction of the session in this process. */
+	lastCompaction?: { reason: "auto" | "manual"; at: number };
 	steering?: SteeringDocument;
 	/** Settings changed for this session (`budget 20k, guard off`); absent when none. */
 	changed?: string;
@@ -134,6 +136,10 @@ export function statusText(status: ClmStatus): string {
 	if (status.lastRequest) {
 		const request = status.lastRequest;
 		lines.push(`last request: ${request.rawMessages} raw messages → ${request.sentMessages} sent, ${request.mirrorBlocks} mirror blocks`);
+	}
+	if (status.lastCompaction) {
+		const time = new Date(status.lastCompaction.at).toTimeString().slice(0, 5);
+		lines.push(`last compaction: OpenCode, ${status.lastCompaction.reason === "auto" ? "automatic" : "/compact"}, at ${time}`);
 	}
 	lines.push(steeringStatusLine(status.steering));
 	if (status.changed) lines.push(`Changed: ${status.changed}`);

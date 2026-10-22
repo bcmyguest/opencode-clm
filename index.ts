@@ -27,15 +27,12 @@
  * - `tool.definition` carries no session id; it runs per tool each time OpenCode builds the
  *   tool set, before the request's `messages.transform`.
  */
-import { rmSync } from "node:fs";
-import { mkdir, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { tool, type Hooks, type Plugin, type PluginInput, type PluginOptions } from "@opencode-ai/plugin";
 
-import { formatTokens } from "./src/budget.ts";
 import { ClmSession } from "./src/clm.ts";
-import { copyPrivateFile, MirrorDirectoryError, privateTemporaryParent } from "./src/mirror-store.ts";
 import {
 	applyCompactionMode,
 	compactionAuto,
@@ -54,22 +51,16 @@ import {
 	ThresholdWatch,
 	ToolCallCounter,
 } from "./src/compaction.ts";
-import { buildCompactPrompt, loadCompactPrompt } from "./src/compact.ts";
-import { ANNOTATIONS_FILE, continuityTools, persistAnnotations, restorePersisted } from "./src/continuity.ts";
+import { continuityTools } from "./src/continuity.ts";
+import { checkSessionID, createHost, describe, relay, type SessionRecord, type ToastVariant } from "./src/host.ts";
 import { filterCompacted, replaceInPlace, type OcMessage } from "./src/opencode.ts";
-import { statusText, systemGuidance } from "./src/presentation.ts";
+import { systemGuidance } from "./src/presentation.ts";
 import { COMPACT_COMMAND, COMPACT_TEMPLATE, STATUS_COMMAND, STATUS_TEMPLATE } from "./src/commands.ts";
-import { changeSetting, OVERRIDES_FILE, resetSettings, showSetting } from "./src/overrides.ts";
-import { STATE_FILE } from "./src/state.ts";
 import { CHANNEL_VERSION, commandOf, decodeRequest, encodeReply, MAX_READ_BYTES, type ChannelReply, type ChannelRequest } from "./src/channel.ts";
-import { settingsText } from "./src/settings-table.ts";
-import { parseClmCommand, type Page } from "./src/panel/command.ts";
-import { buildPanelModel } from "./src/panel/model.ts";
-import { panelPageText } from "./src/panel/text.ts";
-import { readSessionDirectory, sessionDirectory } from "./src/session-files.ts";
-import { fallbackBudget, settingsView } from "./src/tui/data.ts";
-import { defaultMirrorDir, resolveSettings, SKILLS_DIR, type ClmSettings } from "./src/settings.ts";
+import { sessionDirectory } from "./src/session-files.ts";
+import { resolveSettings, SKILLS_DIR, type ClmSettings } from "./src/settings.ts";
 import { loadSteeringDocument, steeringPromptSection, type SteeringDocument } from "./src/steering.ts";
+import { setup } from "./src/v2.ts";
 
 export const PLUGIN_ID = "opencode-clm";
 export { COMPACT_COMMAND, STATUS_COMMAND } from "./src/commands.ts";
@@ -81,26 +72,7 @@ const HELPER_PROMPTS = [
 	"You are a context summarization agent",
 ];
 
-const STATUS_USAGE = "Usage: /clm [overview | input | edits | settings | status | path | on | off | reset | budget [value] | config [setting [value] | reset]]";
-/** A pending `/clm-compact` older than this no longer refuses a new one (its prompt may have failed to send). */
-const COMPACT_PENDING_MS = 5 * 60_000;
-
-type ToastVariant = "info" | "success" | "warning" | "error";
-
-function describe(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * Session ids name a directory (`<mirrorDir>/clm-<id>`). A separator or `..` would reach
- * outside it, so such ids are refused before anything touches the file system.
- */
-export function checkSessionID(sessionID: unknown): string {
-	if (typeof sessionID !== "string" || sessionID === "" || /[/\\]/.test(sessionID) || sessionID.includes("..")) {
-		throw new Error(`CLM refuses session id ${JSON.stringify(sessionID)}: it must not contain "/", "\\" or "..".`);
-	}
-	return sessionID;
-}
+export { checkSessionID };
 
 /** ENOENT/ENOTDIR → undefined (missing); anything else rethrown. */
 function missingAsUndefined(error: unknown): undefined {
@@ -112,11 +84,6 @@ function missingAsUndefined(error: unknown): undefined {
 function isHelperPrompt(system: readonly string[]): boolean {
 	const first = system[0]?.trimStart() ?? "";
 	return HELPER_PROMPTS.some((prompt) => first.startsWith(prompt));
-}
-
-/** The text the model receives in place of the `/clm` template. */
-function relay(text: string): string {
-	return `${text}\n\nShow the CLM text above to the user exactly as written. Do not edit the mirror or run tools.`;
 }
 
 export const server: Plugin = async (input: PluginInput, options?: PluginOptions): Promise<Hooks> => {
@@ -135,7 +102,6 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		}
 	}
 
-	const sessions = new Map<string, Promise<ClmSession>>();
 	/** Estimated tokens per tool schema, from `tool.definition` (no session id there). */
 	const toolSizes = new Map<string, number>();
 
@@ -221,256 +187,31 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	/**
 	 * OpenCode's record of a session: its metadata (`Session.Info.metadata`, a free record) and
 	 * whether it is a child (subagent) session (`parentID`). Undefined when the client is
-	 * unavailable; a failed call is logged as `stamp-error`. The v1 SDK's `Session` type omits
-	 * `metadata`.
+	 * unavailable. The v1 SDK's `Session` type omits `metadata`.
 	 */
-	const sessionRecord = async (clm: ClmSession): Promise<{ metadata: Record<string, unknown>; child: boolean; created?: number } | undefined> => {
-		const get = input.client?.session?.get;
-		if (typeof get !== "function") return undefined;
-		try {
-			const result = await input.client.session.get({ path: { id: clm.sessionID } });
-			const failed = (result as { error?: unknown } | undefined)?.error;
-			const data = (result as { data?: { metadata?: unknown; parentID?: unknown; time?: { created?: unknown } } } | undefined)?.data;
-			if (failed !== undefined || !data) {
-				await clm.log({ event: "stamp-error", stage: "get", error: JSON.stringify(failed ?? "no data") });
-				return undefined;
-			}
-			const metadata = data.metadata;
-			return {
-				metadata: metadata && typeof metadata === "object" && !Array.isArray(metadata) ? (metadata as Record<string, unknown>) : {},
-				child: typeof data.parentID === "string" && data.parentID !== "",
-				...(typeof data.time?.created === "number" ? { created: data.time.created } : {}),
-			};
-		} catch (error) {
-			await clm.log({ event: "stamp-error", stage: "get", error: describe(error) });
-			return undefined;
-		}
+	const record = async (sessionID: string): Promise<SessionRecord | undefined> => {
+		if (typeof input.client?.session?.get !== "function") return undefined;
+		const result = await input.client.session.get({ path: { id: sessionID } });
+		const failed = (result as { error?: unknown } | undefined)?.error;
+		const data = (result as { data?: { metadata?: unknown; parentID?: unknown; time?: { created?: unknown } } } | undefined)?.data;
+		if (failed !== undefined || !data) throw new Error(JSON.stringify(failed ?? "no data"));
+		const metadata = data.metadata;
+		return {
+			metadata: metadata && typeof metadata === "object" && !Array.isArray(metadata) ? (metadata as Record<string, unknown>) : {},
+			child: typeof data.parentID === "string" && data.parentID !== "",
+			...(typeof data.time?.created === "number" ? { created: data.time.created } : {}),
+		};
 	};
-	/**
-	 * Read-modify-write of a session's metadata, one at a time per session: `PATCH
-	 * /session/:id` replaces the whole record, so concurrent writers (the fork stamp, two
-	 * annotation changes in one step) must each build their body from the previous result.
-	 */
-	const metadataChains = new Map<string, Promise<unknown>>();
-	const inMetadataChain = <T>(sessionID: string, task: () => Promise<T>): Promise<T> => {
-		const run = (metadataChains.get(sessionID) ?? Promise.resolve()).then(task, task);
-		const tail = run.catch(() => undefined);
-		metadataChains.set(sessionID, tail);
-		void tail.then(() => {
-			if (metadataChains.get(sessionID) === tail) metadataChains.delete(sessionID);
-		});
-		return run;
+	/** `PATCH /session/:id` replaces the whole metadata record. */
+	const updateMetadata = async (sessionID: string, metadata: Record<string, unknown>): Promise<void> => {
+		const result = await input.client?.session?.update?.({ path: { id: sessionID }, body: { metadata } } as never);
+		const error = (result as { error?: unknown } | undefined)?.error;
+		if (error) throw new Error(JSON.stringify(error));
 	};
-
-	/** Sessions whose stamp was handled in this process (`linkFork`). */
-	const linked = new Set<string>();
-
-	/**
-	 * Fork detection. The plugin stamps `metadata.clm.origin = <own id>` on every session it
-	 * opens; `Session.fork` copies the metadata into the fork, so a stamp naming another session
-	 * marks a fork of it. A fresh fork restores the origin's newest matching revision on its
-	 * first request (clm.ts `restoreFromFork`); the stamp is then rewritten to the fork's id.
-	 * `PATCH /session/:id` replaces the whole metadata record, so the other keys are copied.
-	 */
-	const linkFork = (clm: ClmSession): Promise<void> => inMetadataChain(clm.sessionID, async () => {
-		const record = await sessionRecord(clm);
-		// Child (subagent) sessions are never forked: no stamp, no PATCH bumping their time.
-		if (!record || record.child) return;
-		const metadata = record.metadata;
-		const stamp = metadata.clm && typeof metadata.clm === "object" && !Array.isArray(metadata.clm) ? (metadata.clm as Record<string, unknown>) : {};
-		const origin = stamp.origin;
-		// `annotations` is the store of a session without a mirror (M1). A session with a mirror
-		// drops it, so a later run without one does not restore a stale set; a fork drops the
-		// origin's copy and persists its own after its first request.
-		const own = origin === clm.sessionID;
-		const fork = typeof origin === "string" && !own;
-		const dropAnnotations = "annotations" in stamp && (fork || clm.mirrorUnavailable === undefined);
-		if (own && !dropAnnotations) return;
-		if (!own && typeof origin === "string" && !clm.state.checkpoint && clm.state.revision === 0) {
-			try {
-				clm.forkOrigin = {
-					sessionID: origin,
-					directory: sessionDirectory(settings.mirrorDir, checkSessionID(origin)),
-					...(record.created !== undefined ? { created: record.created } : {}),
-				};
-			} catch {
-				// a foreign stamp that is not a usable session id: ignore it
-			}
-		}
-		try {
-			const { annotations: _dropped, ...kept } = stamp;
-			const next = { ...(dropAnnotations ? kept : stamp), origin: clm.sessionID };
-			const result = await input.client?.session?.update?.({ path: { id: clm.sessionID }, body: { metadata: { ...metadata, clm: next } } } as never);
-			const error = (result as { error?: unknown } | undefined)?.error;
-			if (error) await clm.log({ event: "stamp-error", stage: "update", error: JSON.stringify(error) });
-		} catch (error) {
-			await clm.log({ event: "stamp-error", stage: "update", error: describe(error) });
-		}
-	});
-
-	/** The project's default mirror parent, inside the project (no external-directory prompts). */
-	const projectMirrorDir = defaultMirrorDir(input.directory);
+	const host = createHost({ settings, steering, directory: input.directory, toast, log, record, updateMetadata });
+	const { sessions, session, opened, linked, linkFork, persistAnnotationsOf, setSetting, clearSettings, dropRevision, statusCommand, compactPending } = host;
 	/** Sessions already told that CLM could not start for them (one error toast each). */
 	const openFailures = new Set<string>();
-
-	/** Private parent for sessions without a usable mirror directory, made on first use (`openWithoutMirror`). */
-	let unmirroredParent: Promise<string> | undefined;
-
-	/**
-	 * Opens a session in `mirrorDir`. Only a failure to create or use the session directory
-	 * (`MirrorDirectoryError`) is handled here; any other error propagates as before.
-	 * - An explicitly configured `mirrorDir` that fails: the session uses the project default
-	 *   `.opencode/clm` instead, and a toast names both. Inside the project the model's tools
-	 *   reach it without an `external_directory` permission prompt.
-	 * - The default fails too: the session runs without a mirror (`openWithoutMirror`).
-	 */
-	const openSession = async (id: string): Promise<ClmSession> => {
-		const failures: MirrorDirectoryError[] = [];
-		try {
-			return await ClmSession.open(id, settings, { steering });
-		} catch (error) {
-			if (!(error instanceof MirrorDirectoryError)) throw error;
-			failures.push(error);
-		}
-		if (settings.mirrorDir !== projectMirrorDir) {
-			try {
-				const clm = await ClmSession.open(id, { ...settings, mirrorDir: projectMirrorDir }, { steering });
-				const error = failures[0]!;
-				const message = `could not use the configured mirrorDir ${settings.mirrorDir} (${describe(error.cause)}); the files of session ${id} are in ${clm.store.directory} instead.`;
-				log("warn", message);
-				toast(message, "warning");
-				await clm.log({ event: "mirror-dir-fallback", configured: settings.mirrorDir, used: projectMirrorDir, reason: describe(error.cause) });
-				return clm;
-			} catch (error) {
-				if (!(error instanceof MirrorDirectoryError)) throw error;
-				failures.push(error);
-			}
-		}
-		return await openWithoutMirror(id, failures);
-	};
-
-	/**
-	 * pi-clm's degraded mode (src/index.ts `replaceStore` and the `context` handler's `!store`
-	 * branch): no mirror, no protocol prompt, no edits; requests carry the raw history plus the
-	 * continuity annotations and their size notice. The session's files go to a private
-	 * directory under the OS temp directory, made once per process and removed at exit. The
-	 * model is never pointed there, so no `external_directory` prompt arises. state.json,
-	 * overrides.json and annotations.jsonl still readable in a failed session directory (ours,
-	 * not a symlink) are copied in before the session loads them; changes stay in the copy.
-	 * When even that fails, the open fails: raw history, one "not active" toast naming every
-	 * reason.
-	 */
-	const openWithoutMirror = async (id: string, failures: MirrorDirectoryError[]): Promise<ClmSession> => {
-		const reason = failures.map((failure) => `${failure.parent}: ${describe(failure.cause)}`).join("; ");
-		const copied: string[] = [];
-		let copiedFrom: string | undefined;
-		let clm: ClmSession;
-		try {
-			if (!unmirroredParent) {
-				unmirroredParent = privateTemporaryParent().then((parent) => {
-					process.once("exit", () => rmSync(parent, { recursive: true, force: true }));
-					return parent;
-				});
-				unmirroredParent.catch(() => (unmirroredParent = undefined));
-			}
-			const parent = await unmirroredParent;
-			const directory = sessionDirectory(parent, id);
-			await mkdir(directory, { recursive: true, mode: 0o700 });
-			for (const name of [STATE_FILE, OVERRIDES_FILE, ANNOTATIONS_FILE]) {
-				for (const failure of failures) {
-					const from = sessionDirectory(failure.parent, id);
-					if (await copyPrivateFile(from, directory, name)) {
-						copied.push(name);
-						copiedFrom ??= from;
-						break;
-					}
-				}
-			}
-			clm = await ClmSession.open(id, { ...settings, mirrorDir: parent }, { steering });
-		} catch (error) {
-			throw new Error(`no mirror directory could be used (${reason}), and no temporary directory either: ${describe(error)}`);
-		}
-		clm.mirrorUnavailable = reason;
-		await restoreAnnotations(clm);
-		const kept = copiedFrom ? `${copied.join(", ")} copied from ${copiedFrom}; changes stay` : "No saved session files found; the session's files are";
-		const message = `CLM editing not active for session ${id}: no mirror directory could be used (${reason}). Requests carry the raw history plus the continuity annotations and their size notice. ${kept} in ${clm.store.directory} for this server process only.`;
-		log("error", message);
-		toast(message, "error");
-		await clm.log({ event: "mirror-unavailable", reason, directory: clm.store.directory, ...(copiedFrom ? { copiedFrom, copied } : {}) });
-		return clm;
-	};
-
-	/** `metadata.clm` of a session record, or an empty object. */
-	const clmStamp = (metadata: Record<string, unknown>): Record<string, unknown> =>
-		metadata.clm && typeof metadata.clm === "object" && !Array.isArray(metadata.clm) ? (metadata.clm as Record<string, unknown>) : {};
-
-	/**
-	 * M1: a session without a mirror keeps its files in a per-process temp directory, so its
-	 * annotations (resolutions made while degraded, and the snapshots copied in) would be lost
-	 * at restart; pi keeps them in session entries. They go to OpenCode's session metadata
-	 * (`metadata.clm.annotations`, bounded by PERSISTED_ANNOTATIONS_BYTES) after each change
-	 * and are restored when the session opens without a mirror again.
-	 */
-	const restoreAnnotations = async (clm: ClmSession): Promise<void> => {
-		const record = await inMetadataChain(clm.sessionID, () => sessionRecord(clm));
-		const stamp = record ? clmStamp(record.metadata) : {};
-		const persisted = stamp.annotations;
-		if (persisted === undefined) return;
-		// A fork's metadata is the origin's clone: the fork's first request applies the
-		// fork-point cutoff to that set (clm.ts `copyForkAnnotations`) instead.
-		if (typeof stamp.origin === "string" && stamp.origin !== clm.sessionID && !record!.child) {
-			clm.forkPersisted = restorePersisted([], persisted);
-			return;
-		}
-		try {
-			const snapshots = restorePersisted(await clm.annotations.list(), persisted);
-			await clm.annotations.appendAll(snapshots);
-			if (snapshots.length > 0) await clm.log({ event: "annotations-restored", count: snapshots.length });
-		} catch (error) {
-			await clm.log({ event: "annotations-restore-error", error: describe(error) });
-		}
-	};
-	const persistAnnotationsOf = async (sessionID: string): Promise<void> => {
-		const clm = await opened(sessionID);
-		if (!clm || clm.mirrorUnavailable === undefined) return;
-		await inMetadataChain(sessionID, () => persistNow(clm));
-	};
-	const persistNow = async (clm: ClmSession): Promise<void> => {
-		const record = await sessionRecord(clm);
-		if (!record) return;
-		try {
-			const annotations = persistAnnotations(await clm.annotations.list());
-			const metadata = { ...record.metadata, clm: { ...clmStamp(record.metadata), annotations } };
-			const result = await input.client?.session?.update?.({ path: { id: clm.sessionID }, body: { metadata } } as never);
-			const error = (result as { error?: unknown } | undefined)?.error;
-			if (error) throw new Error(JSON.stringify(error));
-			await clm.log({ event: "annotations-persisted", count: annotations.annotations.length, resolved: annotations.resolved.length });
-		} catch (error) {
-			await clm.log({ event: "annotations-persist-error", error: describe(error) });
-		}
-	};
-
-	const session = (sessionID: string): Promise<ClmSession> => {
-		const id = checkSessionID(sessionID);
-		let existing = sessions.get(id);
-		if (!existing) {
-			existing = openSession(id).then(async (clm) => {
-				if (clm.loadWarning) toast(`state reset for ${id}: ${clm.loadWarning}`, "warning");
-				return clm;
-			});
-			existing.catch(() => sessions.delete(id));
-			sessions.set(id, existing);
-		}
-		return existing;
-	};
-	/** An already open session, without opening one. */
-	const opened = async (sessionID: string): Promise<ClmSession | undefined> => {
-		try {
-			return await sessions.get(sessionID);
-		} catch {
-			return undefined;
-		}
-	};
 
 	const toolTokens = (): number | undefined => {
 		if (toolSizes.size === 0) return undefined;
@@ -478,108 +219,6 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 		for (const size of toolSizes.values()) total += size;
 		return total;
 	};
-
-	/** One setting through `changeSetting`, activated at once; returns `Label: value`. */
-	async function setSetting(clm: ClmSession, name: string, value: string): Promise<string> {
-		const result = await changeSetting(clm.changeRequest(input.directory), name, value);
-		await clm.refreshSettings(true);
-		return result.text;
-	}
-
-	async function clearSettings(clm: ClmSession): Promise<void> {
-		await resetSettings(clm.store.directory);
-		await clm.refreshSettings(true);
-		toast("CLM settings reset to the defaults.");
-	}
-
-	async function dropRevision(clm: ClmSession): Promise<void> {
-		await clm.resetProjection("/clm reset");
-		toast("CLM revision dropped");
-	}
-
-	/**
-	 * `/clm config …` as text (pi-clm's `/clm config` semantics; the TUI opens the settings
-	 * page instead). `words` keep their case: values may be paths.
-	 */
-	async function configCommand(clm: ClmSession, words: string[]): Promise<string> {
-		const [name, ...valueWords] = words;
-		const { base, effective } = clm.settingsValues();
-		const format = { modelWindow: clm.limits.context, modelOutput: clm.limits.output };
-		if (!name) return settingsText(base, effective, format, clm.settingsWarning);
-		if (name.toLowerCase() === "reset" && valueWords.length === 0) {
-			await clearSettings(clm);
-			return "CLM settings reset to the defaults for this session.";
-		}
-		if (valueWords.length === 0) return showSetting(name, effective, format);
-		const text = await setSetting(clm, name, valueWords.join(" "));
-		toast(`CLM ${text}.`);
-		return `CLM ${text}. It applies from the next request.`;
-	}
-
-	/** `/clm overview|input|edits|settings` outside the TUI: the panel page as plain text. */
-	async function pageCommand(clm: ClmSession, page: Page): Promise<string> {
-		const files = await readSessionDirectory(clm.store.directory, clm.sessionID);
-		const budget = fallbackBudget(clm.settings, clm.limits);
-		const model = buildPanelModel(files, budget ? { budget } : {});
-		model.enabled = clm.enabled;
-		if (clm.noticesOnly) model.noticesOnly = true;
-		// No mirror: name why, never the temporary directory (the text reaches the model).
-		if (clm.mirrorUnavailable !== undefined) {
-			model.mirrorUnavailable = clm.mirrorUnavailable;
-			model.mirrorPath = `unavailable (${clm.mirrorUnavailable})`;
-		}
-		const format = { ...(clm.limits.context ? { modelWindow: clm.limits.context } : {}), ...(clm.limits.output ? { modelOutput: clm.limits.output } : {}) };
-		model.settings = settingsView(clm.settingsValues(), model, { format, ...(clm.settingsWarning ? { warning: clm.settingsWarning } : {}) });
-		return panelPageText(model, page);
-	}
-
-	async function statusCommand(clm: ClmSession, args: string): Promise<string> {
-		await clm.refreshSettings();
-		const words = args.split(/\s+/).filter(Boolean);
-		const argument = (words[0] ?? "").toLowerCase();
-		if (argument === "config") return configCommand(clm, words.slice(1));
-		// pi's shorthand: `/clm budget <value>` = `/clm config budget <value>`.
-		if (argument === "budget") return configCommand(clm, ["budget", ...words.slice(1)]);
-		const command = parseClmCommand(`/clm ${args}`);
-		if (args !== "" && command?.kind === "open") return pageCommand(clm, command.page);
-		if (words.length > 1) return `${STATUS_USAGE}\nUnknown argument: ${JSON.stringify(args)}`;
-		switch (argument) {
-			case "":
-			case "status": {
-				const text = statusText(clm.status());
-				toast(text.split("\n").slice(0, 3).join("\n"));
-				return text;
-			}
-			case "path":
-				if (clm.mirrorUnavailable !== undefined) return `CLM mirror: unavailable (${clm.mirrorUnavailable})`;
-				return clm.noticesOnly ? "CLM mirror: not used (mode notices-only)" : `CLM mirror: ${clm.mirrorPath}`;
-			case "on":
-			case "off": {
-				// The same override the TUI and `/clm config editing` write.
-				await setSetting(clm, "editing", argument);
-				toast(`CLM ${argument} for this session`);
-				if (clm.mirrorUnavailable !== undefined) {
-					return argument === "on"
-						? "CLM is on for this session. No mirror is available: requests carry the raw history plus the continuity annotations."
-						: "CLM is off for this session: requests carry the raw history.";
-				}
-				if (clm.noticesOnly) {
-					return argument === "on"
-						? "CLM is on for this session in notices-only mode: requests carry the raw history plus the budget notices; the model cannot edit its context."
-						: "CLM is off for this session: requests carry the raw history and no notices.";
-				}
-				return argument === "on"
-					? "CLM is on for this session: the mirror is refreshed before the next request."
-					: "CLM is off for this session: requests carry the raw history and the mirror is no longer read.";
-			}
-			case "reset": {
-				await dropRevision(clm);
-				return "CLM dropped the accepted revision: the next request carries the stored history, and the mirror is rewritten from it.";
-			}
-			default:
-				return `${STATUS_USAGE}\nUnknown argument: ${JSON.stringify(args)}`;
-		}
-	}
 
 	/** Session ids the server confirmed; a panel reload sends several requests per session. */
 	const knownSessions = new Set<string>();
@@ -669,82 +308,6 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 			.then(() => input.client?.tui?.publish?.({ body: { type: "tui.command.execute", properties: { command: encodeReply(value) } } as never }))
 			.catch(() => undefined);
 	};
-
-	/**
-	 * `/clm-compact [instructions]`: the compaction prompt, with the size of the context as
-	 * it would be sent now. pi's checks (pi src/index.ts compactCommand): CLM off and an empty
-	 * context are refused with a toast; the model then gets a short relay instead of the
-	 * prompt (the turn cannot be cancelled, see C14). OpenCode does not queue a command behind
-	 * a busy session: `SessionPrompt.command` fires `command.execute.before` at once and its
-	 * prompt joins the running loop (session/prompt.ts:1346, 1356-1466). Typed mid-run, the
-	 * size is therefore measured mid-run, without the rest of the current turn; the toast says
-	 * so. pi waits for idle instead; this port accepts the lag. A second invocation before the
-	 * model received the first prompt is refused like pi's (`compactPending`, below).
-	 */
-	async function compactCommand(clm: ClmSession, sessionID: string, argument: string): Promise<string> {
-		const waiting = compactPending.get(sessionID);
-		if (waiting && Date.now() - waiting.at < COMPACT_PENDING_MS) {
-			const message = "A /clm-compact is already queued and the model has not received it yet.";
-			toast(message, "info");
-			return relay(`[CLM] ${message}`);
-		}
-		// Reserved before the first await, so a second invocation in the meantime is refused.
-		const entry: { prompt?: string; at: number } = { at: Date.now() };
-		compactPending.set(sessionID, entry);
-		const refuse = (message: string) => {
-			if (compactPending.get(sessionID) === entry) compactPending.delete(sessionID);
-			toast(message, "warning");
-			return relay(`[CLM] ${message}`);
-		};
-		try {
-			return await compactPrompt(clm, sessionID, argument, entry, refuse);
-		} catch (error) {
-			if (compactPending.get(sessionID) === entry) compactPending.delete(sessionID);
-			throw error;
-		}
-	}
-
-	async function compactPrompt(
-		clm: ClmSession,
-		sessionID: string,
-		argument: string,
-		entry: { prompt?: string; at: number },
-		refuse: (message: string) => string,
-	): Promise<string> {
-		await clm.refreshSettings();
-		const template = loadCompactPrompt(clm.settings.compactPromptPath);
-		if (!clm.enabled) {
-			return refuse("CLM is off for this session, so there is no editable context to compact. Turn it on with /clm on.");
-		}
-		// Without a history (the client cannot list messages) the last request's estimate stands in.
-		const history = await sessionMessages(sessionID);
-		const current = history ? clm.idleEstimate(filterCompacted(history)) : clm.lastReading?.estimated ?? 0;
-		if (current === undefined) return refuse("Nothing to compact yet: the context is empty.");
-		const busy = await sessionBusy(sessionID);
-		toast(`Asked the model to compact its context (now about ${formatTokens(current)} tokens` +
-			`${busy ? ", measured before the current run finishes" : ""}).`);
-		const prompt = buildCompactPrompt(template, {
-			mirror: clm.mirrorPath,
-			current,
-			budget: clm.resolvedBudget()?.budget,
-			instructions: argument,
-		});
-		entry.prompt = prompt;
-		entry.at = Date.now();
-		return prompt;
-	}
-
-	/**
-	 * Sessions with a `/clm-compact` prompt the model has not received yet, and that prompt.
-	 * pi refuses a second `/clm-compact` while one waits (`compactPending`, pi src/index.ts:235,
-	 * 997-1000): set when the command is accepted (:1008), cleared once its prompt is sent
-	 * (:1046). OpenCode sends the prompt itself, into the running loop or a new one, so here
-	 * pending ends at the first model request whose history holds the prompt (the
-	 * `messages.transform` hook), or when the session goes idle or fails without one
-	 * (`session.idle`, session/status.ts:43; `session.error`). If OpenCode's prompt() fails after
-	 * the hook, neither event may come; an entry older than COMPACT_PENDING_MS no longer refuses.
-	 */
-	const compactPending = new Map<string, { prompt?: string; at: number }>();
 
 	const holdsPrompt = (raw: OcMessage[], prompt: string) =>
 		raw.some((message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === prompt));
@@ -1061,18 +624,18 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 				const clm = await session(hookInput.sessionID);
 				const argument = (hookInput.arguments ?? "").trim();
 				if (hookInput.command === STATUS_COMMAND) text = relay(await statusCommand(clm, argument));
-				else if (clm.mirrorUnavailable !== undefined) {
-					// pi-clm's compactCommand: nothing for the model to edit, so nothing is asked of it.
-					toast(`The context mirror is unavailable, so the model cannot edit its context (${clm.mirrorUnavailable}).`, "warning");
-					text = relay("[CLM] The context mirror is unavailable, so the model cannot edit its context.");
-				} else {
-					await clm.refreshSettings();
-					if (clm.noticesOnly) {
-						// The compaction prompt asks for a mirror edit; notices-only has no mirror.
-						const message = "CLM runs in notices-only mode for this session, so the model cannot edit its context. Switch with /clm config mode edit.";
-						toast(message, "warning");
-						text = relay(`[CLM] ${message}`);
-					} else text = await compactCommand(clm, hookInput.sessionID, argument);
+				else {
+					// OpenCode does not queue a command behind a busy session: `SessionPrompt.command`
+					// fires this hook at once and its prompt joins the running loop (session/prompt.ts:
+					// 1346, 1356-1466). Typed mid-run, the size is measured mid-run; the toast says so.
+					const result = await host.compactCommand(clm, hookInput.sessionID, argument, async () => {
+						// Without a history (the client cannot list messages) the last request's estimate stands in.
+						const history = await sessionMessages(hookInput.sessionID);
+						const current = history ? clm.idleEstimate(filterCompacted(history)) : clm.lastReading?.estimated ?? 0;
+						return { current, busy: current !== undefined && await sessionBusy(hookInput.sessionID) };
+					});
+					// The turn cannot be cancelled (C14): a refusal reaches the model as a relay.
+					text = "prompt" in result ? result.prompt : relay(result.refused);
 				}
 			} catch (error) {
 				const message = `/${hookInput.command} failed: ${describe(error)}`;
@@ -1096,4 +659,5 @@ export const server: Plugin = async (input: PluginInput, options?: PluginOptions
 	return hooks;
 };
 
-export default { id: PLUGIN_ID, server };
+/** One default export serves both plugin APIs: OpenCode 2 reads `id` + `setup` (src/v2.ts), OpenCode 1 calls `server`. */
+export default { id: PLUGIN_ID, setup, server };

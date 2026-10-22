@@ -79,6 +79,31 @@ the model-facing protocol, the ported strategy or the checkpoint semantics.
   `lastOutcome` (as it already did for `budgetCheck` and `sourceStamps`) and keeps the
   checkpoint; if a core field is invalid the warning names it.
 
+## OpenCode 2
+
+One package serves both hosts, as ponytail and superpowers do: `export default { id,
+setup, server }`. OpenCode 2 reads `id` + `setup` (src/v2.ts), OpenCode 1 calls `server`
+(index.ts). What the two share moved to src/host.ts (session registry and mirror
+fallbacks, fork stamps and persisted annotations, the `/clm` and `/clm-compact` texts);
+the core (src/clm.ts and below) is unchanged and still works on OpenCode 1's
+`{ info, parts }` messages. Checked against OpenCode 2.1.1.
+
+| OpenCode 1 | OpenCode 2 | notes |
+|---|---|---|
+| `experimental.chat.messages.transform`, `chat.system.transform`, `tool.definition` | `session.hook("context")` | one event: system parts, provider-level messages, tool definitions. src/opencode-v2.ts maps the messages to `{ info, parts }` and back: user and assistant messages carry the stored message id; an assistant message absorbs the `role: "tool"` messages after it; `system`, id-less (native compaction windows) and unconvertible messages stay out of the core's view and go back next to the message they followed. Untouched messages map back to the original objects. Fires for the agent loop only (no helper-prompt sniffing). |
+| `experimental.session.compacting` + compaction transform + `compaction.autocontinue` | `session.hook("compaction")` | commit, annotations as a system part, projection applied to the summarized history, and the rebase signal set here: OpenCode 2 starts the follow-up request before `session.compaction.ended` reaches the event stream. The summary arrives as a `<conversation-checkpoint>` user message, marked as the summary for `compactionSummaryId`. |
+| `command.execute.before` rewriting a template | `command.transform` with `execute` | `/clm` posts its reply with `session.synthetic` (`description` + `resume: false`: shown at once, no model turn; the model reads it at its next turn, as it reads OpenCode 1's relay). `/clm-compact` sends its prompt with `session.prompt`; its size reading is the last request's (no history in the core's form outside a request). |
+| `tool.execute.before` / `after` | `tool.hook("execute.before" / "execute.after")` | receipts and trailers go into `result.content`. Tool names: `shell` is `bash`, `patch` is `apply_patch`, paths arrive as `path`. |
+| `tool` (zod args) | `tool.transform` | the same zod schemas (Standard Schema) as `input`. |
+| `config` (`command`, `skills.paths`) | `command.transform`, `skill.transform` | the bundled skill is added as a `Skill.Info`. |
+| `session.idle` / `session.error` / `session.compacted` events, `info.tokens` | `event.subscribe` | `session.execution.*` end a pending `/clm-compact`; `session.step.ended` carries the provider count (`tokens`) per assistant message, attached as `info.tokens`. |
+| `client.session.get/update` | `session.get/update` | `fork.sessionID` names a fork's origin directly; the metadata stamp stays as the fallback. |
+| model `limit` in `chat.system.transform` | `model.list()` | read per request. |
+| `compaction.auto` flipped per request (K1) | budget kept under OpenCode's threshold | OpenCode 2's compaction settings are internal, but its threshold (window − max(15%, 16k), `calculateCeiling`) is measured on the provider's count of the request as sent, i.e. CLM's projected context. With `auto`, the core gets that reserve as its output share, so a `window` budget and the guard end below the threshold and threshold compaction never fires; overflow recovery stays OpenCode's, as in pi-clm. `on` skips the clamp; `off` is logged as impossible. A user `compaction.buffer` is not visible to plugins. |
+
+Not ported to OpenCode 2 yet: the TUI panel (OpenCode 2's TUI plugin API differs) and toasts
+(server plugins have no TUI channel; `<mirrorDir>/plugin.log` instead).
+
 Recommended paper-parity configuration for the plugin entry: `"budget": "window"`
 (upstream defaults to 50% of the window minus its output limit; the paper's harness
 budgets the window minus `max_tokens`), and for paper-faithful runs `/clm config

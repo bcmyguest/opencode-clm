@@ -162,4 +162,8 @@ describe("reminder cooldown", () => {
 		}
 		expect(() => resolveSettings({}, { CLM_REMINDER_COOLDOWN: "150%" }, project)).toThrow(/^reminderCooldown must be/);
 	});
+
+	test("a very long cooldown string is rejected, not backtracked over", () => {
+		expect(() => resolveSettings({ reminderCooldown: "9".repeat(20_000) }, {}, project)).toThrow(/^reminderCooldown must be/);
+	});
 });
