@@ -13,9 +13,9 @@
  *   compaction's own messages transform: the pending edit is committed, the accepted revision
  *   applied to the history being summarized, and the annotations go in as a system part.
  * - Commands registered through `command.transform` run plugin code instead of sending a
- *   template. Their text is posted with `session.synthetic` and `resume: true`: delivered at
- *   once, steered into a running turn, or waking an idle session (one model turn, as
- *   OpenCode 1's relay had it). `resume: false` would defer the reply to the next turn.
+ *   template. Their text is posted with `session.synthetic` and `resume: false`: shown at
+ *   once, with no model turn (the model reads it at its next turn, as it reads OpenCode 1's
+ *   relay). The `description` is what makes OpenCode 2 draw the message at all.
  * - `tool.hook("execute.after")` replaces `tool.execute.after`.
  * - Events come from `event.subscribe`: `session.step.ended` carries the provider's token
  *   count (OpenCode 1 kept it on the message), `session.compaction.ended` marks a compaction.
@@ -43,6 +43,9 @@ import { resolveSettings, SKILLS_DIR } from "./settings.ts";
 import { loadSteeringDocument, steeringPromptSection, type SteeringDocument } from "./steering.ts";
 
 const PLUGIN_ID = "opencode-clm";
+
+/** Longest description OpenCode 2's desktop draws (1024, kept under it with the ellipsis). */
+const DESCRIPTION_MAX = 1000;
 
 // Structural types for the parts of OpenCode 2's plugin context this module uses; the
 // `@opencode/plugin` package is not a dependency (OpenCode 1 installs do not have it).
@@ -82,7 +85,7 @@ export interface V2Context {
 		get(input: { sessionID: string }): Promise<any>;
 		update(input: { sessionID: string; metadata?: Record<string, unknown> }): Promise<unknown>;
 		prompt(input: Record<string, unknown>): Promise<unknown>;
-		synthetic(input: { sessionID: string; text: string; resume?: boolean; delivery?: string }): Promise<{ id?: string } | undefined>;
+		synthetic(input: { sessionID: string; text: string; description?: string; resume?: boolean; delivery?: string }): Promise<{ id?: string } | undefined>;
 		hook(name: "context" | "compaction", callback: (event: ContextEvent) => Promise<void> | void): Promise<Registration>;
 	};
 	readonly tool: {
@@ -182,8 +185,8 @@ export async function setup(ctx: V2Context): Promise<(() => void) | void> {
 	};
 	const host = createHost({ settings, steering, directory, toast, log, record, updateMetadata });
 
-	/** Provider-reported tokens per assistant message (`session.step.ended`). */
-	const usage = new Map<string, V2Tokens>();
+	/** Provider-reported tokens of the session's last assistant message (`session.step.ended`). */
+	const usage = new Map<string, { id: string; tokens: V2Tokens }>();
 	const openFailures = new Set<string>();
 	const toolCalls = new ToolCallCounter();
 
@@ -234,7 +237,8 @@ export async function setup(ctx: V2Context): Promise<(() => void) | void> {
 
 	/** The core's transform over the event's messages, written back in place. */
 	const transform = async (clm: ClmSession, event: ContextEvent) => {
-		const view = fromV2(event.messages, event.sessionID, (id) => usage.get(id));
+		const observed = usage.get(event.sessionID);
+		const view = fromV2(event.messages, event.sessionID, (id) => (observed?.id === id ? observed.tokens : undefined));
 		const result = await clm.transform(view.messages);
 		event.messages.splice(0, event.messages.length, ...toV2(view, result.messages));
 		if (clm.annotationsImported) {
@@ -327,12 +331,13 @@ export async function setup(ctx: V2Context): Promise<(() => void) | void> {
 	});
 
 	/**
-	 * Posts `text` to the session at once: steered into a running turn, or waking an idle
-	 * session (one model turn, as OpenCode 1's `/clm` relay had it read). `resume: false`
-	 * would defer the reply to the next turn instead.
+	 * Posts `text` to the session: shown at once, with no model turn (`resume: false` defers
+	 * only the model's reading to its next turn). OpenCode 2 draws a synthetic message only
+	 * when it carries a `description`, and its desktop drops that row past 1024 characters.
 	 */
 	const display = async (sessionID: string, text: string) => {
-		await ctx.session.synthetic({ sessionID, text, resume: true });
+		const description = text.length <= DESCRIPTION_MAX ? text : `${text.slice(0, DESCRIPTION_MAX - 1)}…`;
+		await ctx.session.synthetic({ sessionID, text, description, resume: false });
 	};
 
 	if (settings.commands) {
@@ -421,7 +426,7 @@ export async function setup(ctx: V2Context): Promise<(() => void) | void> {
 				const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined;
 				switch (event?.type) {
 					case "session.step.ended":
-						if (typeof data.assistantMessageID === "string" && data.tokens) usage.set(data.assistantMessageID, data.tokens);
+						if (sessionID && typeof data.assistantMessageID === "string" && data.tokens) usage.set(sessionID, { id: data.assistantMessageID, tokens: data.tokens });
 						break;
 					case "session.compaction.started":
 						if (sessionID) compactionReasons.set(sessionID, data.reason === "manual" ? "manual" : "auto");

@@ -19,7 +19,7 @@ interface Harness {
 	commands: Map<string, { execute(input: any): Promise<void> }>;
 	tools: Map<string, any>;
 	skills: any[];
-	synthetic: Array<{ sessionID: string; text: string; resume?: boolean }>;
+	synthetic: Array<{ sessionID: string; text: string; description?: string; resume?: boolean }>;
 	prompts: Array<Record<string, unknown>>;
 	metadata: Map<string, Record<string, unknown>>;
 	emit(event: { type: string; data: Record<string, unknown> }): Promise<void>;
@@ -113,6 +113,14 @@ async function request(h: Harness, messages: V2Message[], name = "context") {
 }
 
 const mirrorPath = (h: Harness) => join(h.directory, "mirrors", `clm-${SESSION}`, "LIVE_CONTEXT.md");
+
+/** The request rows of the session's events log. */
+const requestRows = (h: Harness) =>
+	readFileSync(join(h.directory, "mirrors", `clm-${SESSION}`, "events.jsonl"), "utf8")
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line))
+		.filter((row) => row.event === "request");
 
 describe("module shape", () => {
 	test("one default export serves OpenCode 1 (server) and OpenCode 2 (id + setup)", () => {
@@ -219,20 +227,44 @@ describe("context hook", () => {
 		const h = await load();
 		await h.emit({ type: "session.step.ended", data: { sessionID: SESSION, assistantMessageID: "msg_a2", tokens: { input: 5000, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } } });
 		await request(h, conversation());
-		await request(h, [...conversation(), { id: "msg_a3", role: "assistant", content: [{ type: "text", text: "Next." }] }]);
+		const last = requestRows(h).at(-1)!;
+		expect(last.observedMessage).toBe("msg_a2");
+		expect(last.observedPrevious).toBeGreaterThan(0);
+		if (typeof h.cleanup === "function") h.cleanup();
+	});
+
+	test("a count for a message outside the request is not used", async () => {
+		const h = await load();
+		await h.emit({ type: "session.step.ended", data: { sessionID: SESSION, assistantMessageID: "msg_gone", tokens: { input: 5000, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } } });
+		await request(h, conversation());
+		expect(requestRows(h).at(-1)!.observedPrevious).toBeUndefined();
 		if (typeof h.cleanup === "function") h.cleanup();
 	});
 });
 
 describe("commands", () => {
-	test("/clm posts its text and resumes the session", async () => {
+	test("/clm posts its text with a description and no model turn", async () => {
 		const h = await load();
 		await request(h, conversation());
 		await h.commands.get(STATUS_COMMAND)!.execute({ sessionID: SESSION, prompt: { text: "path" }, delivery: "steer" });
 		expect(h.synthetic).toHaveLength(1);
-		expect(h.synthetic[0]).toMatchObject({ sessionID: SESSION, resume: true });
+		expect(h.synthetic[0]).toMatchObject({ sessionID: SESSION, resume: false, description: expect.stringContaining("CLM mirror:") });
 		expect(h.synthetic[0]!.text).toContain("CLM mirror:");
 		expect(h.prompts).toHaveLength(0);
+	});
+
+	test("/clm caps the description at what OpenCode 2 draws", async () => {
+		const h = await load();
+		const many = Array.from({ length: 40 }, (_, i) => [
+			{ id: `msg_u${i}`, role: "user" as const, content: [{ type: "text" as const, text: `question ${i}` }] },
+			{ id: `msg_a${i}`, role: "assistant" as const, content: [{ type: "text" as const, text: `answer ${i}` }] },
+		]).flat();
+		await request(h, many);
+		await h.commands.get(STATUS_COMMAND)!.execute({ sessionID: SESSION, prompt: { text: "input" }, delivery: "steer" });
+		const posted = h.synthetic.at(-1)!;
+		expect(posted.text.length).toBeGreaterThan(1000);
+		expect(posted.description!.length).toBe(1000);
+		expect(posted.description!.endsWith("…")).toBe(true);
 	});
 
 	test("/clm-compact sends the compaction prompt as a user prompt; a second one waits", async () => {

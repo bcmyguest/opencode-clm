@@ -55,7 +55,7 @@ OpenCode 2 migrates); options are the same:
 ```
 
 On OpenCode 2, `/clm` never costs a model turn: its reply is posted to the session and
-delivered with the next turn. It works the same over ACP (editors such as Zed or Devin list
+shown at once (the model reads it at its next turn). It works the same over ACP (editors such as Zed or Devin list
 `/clm` and `/clm-compact`). Compaction behaves as in the paper (`compaction: auto`): OpenCode 2
 compacts on its own at about 85% of the model window, so CLM keeps its budget below that
 point and OpenCode only steps in when the provider rejects a request as too long.
