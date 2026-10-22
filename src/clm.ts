@@ -182,7 +182,9 @@ export function lastProviderReported(raw: readonly OcMessage[]): ObservedRequest
 export function compactionSummaryId(raw: readonly OcMessage[]): string | undefined {
 	for (let index = raw.length - 1; index >= 0; index--) {
 		const info = raw[index]!.info;
-		if (info.summary && !info.error) return info.id;
+		// OpenCode 1 marks an assistant message; OpenCode 2 marks its checkpoint user message,
+		// whose `summary` on an OpenCode 1 user message is the session diff, not a summary.
+		if ((info.role === "assistant" ? info.summary : info.summary === true) && !info.error) return info.id;
 	}
 	return undefined;
 }
