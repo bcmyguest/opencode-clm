@@ -115,9 +115,18 @@ describe("mirror tool-call classification", () => {
 		expect(bash(`cat ${MIRROR} 2>&1 > /tmp/copy.md`)).toBe("write");
 	});
 
-	test("patch and multiedit are not OpenCode 1.18 tools and are ignored", () => {
-		expect(classifyMirrorToolCall("patch", { filePath: MIRROR }, CWD, MIRROR)).toBe("none");
+	test("multiedit is not an OpenCode tool and is ignored", () => {
 		expect(classifyMirrorToolCall("multiedit", { filePath: MIRROR }, CWD, MIRROR)).toBe("none");
+	});
+
+	test("OpenCode 2 names: patch is apply_patch, shell is bash, paths arrive as `path`", () => {
+		const patch = ["*** Begin Patch", `*** Update File: ${MIRROR}`, "@@", "-old", "+new", "*** End Patch"].join("\n");
+		expect(classifyMirrorToolCall("patch", { patchText: patch }, CWD, MIRROR)).toBe("write");
+		expect(classifyMirrorToolCall("patch", { filePath: MIRROR }, CWD, MIRROR)).toBe("none");
+		expect(classifyMirrorToolCall("shell", { command: `sed -i s/a/b/ ${MIRROR}` }, CWD, MIRROR)).toBe("write");
+		expect(classifyMirrorToolCall("shell", { command: `head ${MIRROR}` }, CWD, MIRROR)).toBe("read");
+		expect(classifyMirrorToolCall("edit", { path: MIRROR, oldString: "a", newString: "b" }, CWD, MIRROR)).toBe("write");
+		expect(classifyMirrorToolCall("read", { path: MIRROR }, CWD, MIRROR)).toBe("read");
 	});
 
 	test("plain inspection of the mirror is a read", () => {

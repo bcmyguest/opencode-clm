@@ -80,10 +80,12 @@ export function classifyMirrorToolCall(
 		case "write":
 			return isMirror(pathArg(input)) ? "write" : "none";
 		case "apply_patch":
+		case "patch": // OpenCode 2's name for the same tool and input
 			return typeof input.patchText === "string" && patchPaths(input.patchText).some(isMirror) ? "write" : "none";
 		case "read":
 			return isMirror(pathArg(input)) ? "read" : "none";
-		case "bash": {
+		case "bash":
+		case "shell": { // OpenCode 2's name for bash, with the same `command` input
 			if (typeof input.command !== "string") return "none";
 			const command = input.command;
 			if (!referencesMirror(command, mirrorPath)) return "none";

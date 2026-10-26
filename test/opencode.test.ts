@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { digestSourcePrefix } from "../src/projection.ts";
+import { compactionSummaryId } from "../src/clm.ts";
 import {
 	CLEARED_TOOL_TEXT,
 	COMPACTION_USER_TEXT,
@@ -189,5 +190,22 @@ describe("unflatten", () => {
 		replaceInPlace(target, [raw[0]!]);
 		expect(same).toBe(target);
 		expect(target).toEqual([raw[0]!]);
+	});
+});
+
+describe("compactionSummaryId", () => {
+	test("takes an OpenCode 1 assistant summary and the OpenCode 2 checkpoint user message", () => {
+		const oc1 = assistant("msg_a3", "the summary");
+		(oc1.info as { summary?: boolean }).summary = true;
+		expect(compactionSummaryId([...conversation(), oc1])).toBe("msg_a3");
+		const checkpoint = user("msg_u4", "<conversation-checkpoint>…");
+		(checkpoint.info as { summary?: boolean }).summary = true;
+		expect(compactionSummaryId([...conversation(), checkpoint])).toBe("msg_u4");
+	});
+
+	test("ignores the session diff an OpenCode 1 user message carries as `summary`", () => {
+		const next = user("msg_u5", "next task");
+		(next.info as { summary?: unknown }).summary = { title: "Session diff", body: "2 files", diffs: [] };
+		expect(compactionSummaryId([...conversation(), next])).toBeUndefined();
 	});
 });
