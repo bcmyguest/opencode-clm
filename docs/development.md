@@ -47,6 +47,19 @@ Tested with OpenCode 1.18.34. Point both plugin lists at the checkout; edits app
 { "plugin": ["file:///path/to/opencode-clm/tui.ts"] }
 ```
 
+OpenCode 2.2 loads a local plugin only from a directory; a file path logs
+`configured plugin path must be a directory` and skips the plugin. Name the checkout
+itself, and OpenCode resolves `index.ts` through `package.json`:
+
+```jsonc
+// opencode.json
+{ "plugin": ["file:///path/to/opencode-clm"] }
+```
+
+The e2e harness (`test/e2e/harness.ts`) uses the directory form. The suite still drives
+OpenCode 1's CLI and HTTP API (`opencode run --command`, `POST /session`), so most cases
+fail on OpenCode 2.
+
 ## Reproducing the screenshots
 
 The README shows `.github/images/overview.png`, `edits.png` and `settings.png`.
